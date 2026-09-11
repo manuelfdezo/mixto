@@ -3,20 +3,27 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const names={codex:'Codex',claude:'Claude Code'};
 const symbols={codex:'✳',claude:'✺'};
 const effortNames={low:'Ligero',medium:'Equilibrado',high:'Alto',xhigh:'Muy alto',max:'Máximo',ultra:'Ultra'};
-let state,projectId,conversationId,mode='solo',leader='codex',busy=false,lastMessages='',lastAgents='',lastMemory='',toastTimer;
+const stageNames={queued:'En espera',running:'Trabajando',waiting:'Esperando tu respuesta',completed:'Completado',error:'Sin completar',cancelled:'Detenido',interrupted:'Interrumpido'};
+let state,projectId,conversationId,orchestrator='codex',busy=false,lastMessages='',lastAgents='',lastMemory='',lastRun='',toastTimer;
+let planChoices={},initRepo=false;
 let preferences;try{preferences=JSON.parse(localStorage.getItem('mixto-preferences')||'{}');}catch{preferences={};}
 const selections=preferences.models||{},efforts=preferences.efforts||{};
 projectId=preferences.projectId;conversationId=preferences.conversationId;
+if(['codex','claude'].includes(preferences.orchestrator))orchestrator=preferences.orchestrator;
 
 async function api(route,body,method=body===undefined?'GET':'POST'){
   const response=await fetch('/api/'+route,{method,headers:body===undefined?{}:{'Content-Type':'application/json','X-Mixto-Client':'1'},...(body!==undefined?{body:JSON.stringify(body)}:{})});
   const data=await response.json();if(!response.ok)throw new Error(data.error||'No se pudo completar la acción.');return data;
 }
-function remember(){try{localStorage.setItem('mixto-preferences',JSON.stringify({projectId,conversationId,models:selections,efforts}));}catch{}}
+function remember(){try{localStorage.setItem('mixto-preferences',JSON.stringify({projectId,conversationId,orchestrator,models:selections,efforts}));}catch{}}
 function toast(text){$('#toast').textContent=text;$('#toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').hidden=true,5500);}
 const project=()=>state?.projects.find(p=>p.id===projectId);
 const conversation=()=>state?.conversations.find(c=>c.id===conversationId);
-const activeRun=()=>state?.runs.find(r=>r.conversationId===conversationId&&['running','waiting','queued'].includes(r.status));
+const ACTIVE=['planning','awaiting-plan','running','waiting','reviewing','integrating','queued'];
+const activeRun=()=>state?.runs.find(r=>r.conversationId===conversationId&&ACTIVE.includes(r.status));
+const lastRunOf=()=>state?.runs.filter(r=>r.conversationId===conversationId).at(-1);
+const subtaskModel=s=>planChoices[s.id]?.model??s.model;
+const subtaskEffort=s=>planChoices[s.id]?.effort??s.effort;
 function scopedMemories(){return state.memories.filter(m=>!m.projectId||m.projectId===projectId);}
 function openModal(title,html,type=''){ $('#modal-title').textContent=title;$('#modal-content').innerHTML=html;$('#modal').dataset.type=type;if(!$('#modal').open)$('#modal').showModal();}
 function closeModal(){$('#modal').close();$('#modal').dataset.type='';}
@@ -38,12 +45,12 @@ function markdown(text){
   }).join('');
 }
 
-function welcome(){return `<div class="welcome"><div class="welcome-symbol"><span>✺</span><span>✳</span></div><div class="eyebrow">DOS INTELIGENCIAS. UN MISMO EQUIPO.</div><h1>Haz espacio a<br><em>lo que quieres crear.</em></h1><p>Trabaja con Claude y Codex en una misma conversación. Elige quién empieza; la memoria viaja con el equipo.</p><div class="suggestions"><button class="suggestion" data-suggestion="Explora este proyecto y explícame cómo está organizado y cuál sería el siguiente paso." data-suggestion-mode="solo"><span>⌁</span> Entender mi proyecto<small>Una visión clara para empezar</small></button><button class="suggestion" data-suggestion="Analiza este proyecto y propón tres mejoras concretas. El segundo agente debe revisar la propuesta." data-suggestion-mode="review"><span>⇄</span> Pensarlo entre los dos<small>Una propuesta, una segunda mirada</small></button></div></div>`;}
+function welcome(){return `<div class="welcome"><div class="welcome-symbol"><span>✺</span><span>✳</span></div><div class="eyebrow">UN EQUIPO QUE SE ARMA SOLO.</div><h1>Haz espacio a<br><em>lo que quieres crear.</em></h1><p>Elige quién orquesta. Ese agente estudia la tarea, decide cuántos agentes hacen falta y qué hace cada uno; tú apruebas el plan antes de que empiecen.</p><div class="suggestions"><button class="suggestion" data-suggestion="Explora este proyecto y explícame cómo está organizado y cuál sería el siguiente paso."><span>⌁</span> Entender mi proyecto<small>Una visión clara para empezar</small></button><button class="suggestion" data-suggestion="Analiza este proyecto y propón tres mejoras concretas, reparte el trabajo entre los agentes que haga falta."><span>⇄</span> Repartir el trabajo<small>Varios frentes a la vez</small></button></div></div>`;}
 
 function approvalHtml(a){
   const questions=a.details?.questions||[];
   const questionMode=a.kind==='question'||a.kind==='claude-question';
-  return `<section class="approval" data-approval="${esc(a.id)}"><h3>${esc(a.title)}</h3>${questionMode?questions.map((q,i)=>`<label class="question-label"><span>${esc(q.question||q.header)}</span>${q.options?.length?`<small class="muted">${q.options.map(o=>esc(o.label)).join(' · ')}</small>`:''}<input data-answer="${i}" placeholder="Tu respuesta" autocomplete="off"></label>`).join(''):`<pre>${esc(JSON.stringify(a.details,null,2))}</pre>`}<div class="approval-actions"><button class="primary-button" data-approval-allow="${esc(a.id)}">${questionMode?'Enviar respuesta':'Permitir esta vez'}</button><button class="secondary-button" data-approval-deny="${esc(a.id)}">${questionMode?'Omitir':'Rechazar'}</button></div></section>`;
+  return `<section class="approval" data-approval="${esc(a.id)}"><h3>${esc(a.title)}</h3>${a.label?`<div class="metadata">${esc(a.label)}</div>`:''}${questionMode?questions.map((q,i)=>`<label class="question-label"><span>${esc(q.question||q.header)}</span>${q.options?.length?`<small class="muted">${q.options.map(o=>esc(o.label)).join(' · ')}</small>`:''}<input data-answer="${i}" placeholder="Tu respuesta" autocomplete="off"></label>`).join(''):`<pre>${esc(JSON.stringify(a.details,null,2))}</pre>`}<div class="approval-actions"><button class="primary-button" data-approval-allow="${esc(a.id)}">${questionMode?'Enviar respuesta':'Permitir esta vez'}</button><button class="secondary-button" data-approval-deny="${esc(a.id)}">${questionMode?'Omitir':'Rechazar'}</button></div></section>`;
 }
 
 function renderMessages(){
@@ -56,16 +63,90 @@ function renderMessages(){
   if(!messages.length)area.scrollTop=0;
   else if(bottom||approvals.length||messages.length<2)area.scrollTop=area.scrollHeight;
 }
+const catalogOf=provider=>state.connections[provider]?.models||[];
+const effortLevels=(provider,model)=>catalogOf(provider).find(m=>m.id===model)?.efforts||[];
+function modelOptions(provider,selected){
+  const models=catalogOf(provider);
+  return models.map(m=>`<option value="${esc(m.id)}" ${m.id===selected?'selected':''}>${esc(m.name)}${m.hidden?' · oculto':''}</option>`).join('')
+    +(selected&&!models.some(m=>m.id===selected)?`<option value="${esc(selected)}" selected>${esc(selected)}${models.length?' · manual':''}</option>`:'');
+}
+const effortOptions=(provider,model,selected)=>effortLevels(provider,model)
+  .map(e=>`<option value="${e}" ${e===selected?'selected':''}>${effortNames[e]||e}</option>`).join('');
+function defaultEffort(provider,model){
+  const entry=catalogOf(provider).find(m=>m.id===model),levels=entry?.efforts||[];
+  return levels.includes(entry?.defaultEffort)?entry.defaultEffort:levels[0]||null;
+}
+
 function renderAgents(){
-  const key=JSON.stringify([state.connections,selections,efforts]);if(key===lastAgents)return;lastAgents=key;
-  $('#agent-cards').innerHTML=['codex','claude'].map(p=>{
-    const c=state.connections[p],models=c.models||[];
+  const key=JSON.stringify([state.connections,selections,efforts,orchestrator]);if(key===lastAgents)return;lastAgents=key;
+  for(const p of ['codex','claude']){
+    const models=catalogOf(p);
     if(models.length&&(!selections[p]||(p==='codex'&&selections[p]==='default'&&!models.some(m=>m.id==='default'))))selections[p]=(models.find(m=>m.default)||models.find(m=>!m.hidden))?.id;
-    const chosen=models.find(m=>m.id===selections[p]);
-    const levels=chosen?.efforts||[];
-    if(!levels.includes(efforts[p]))efforts[p]=levels.includes(chosen?.defaultEffort)?chosen.defaultEffort:levels[0]||'';
-    return `<div class="agent-card"><div class="agent-header"><span class="agent-avatar ${p}">${symbols[p]}</span><span class="agent-name">${names[p]}</span><span class="status-dot ${c.loading?'loading':c.connected?'':'off'}" title="${c.loading?'Conectando':c.connected?'Conectado':'Desconectado'}"></span></div><div class="agent-meta">${c.loading?'Consultando modelos…':c.connected?esc(c.plan||'Sesión conectada'):'Pendiente de conexión'}</div><select data-model="${p}" aria-label="Modelo de ${names[p]}">${models.map(m=>`<option value="${esc(m.id)}" ${m.id===selections[p]?'selected':''}>${esc(m.name)}${m.hidden?' · oculto':''}</option>`).join('')}${!chosen?`<option value="${esc(selections[p])}" selected>${esc(selections[p])}${models.length?' · manual':''}</option>`:''}<option value="__custom__">Otro identificador…</option></select>${levels.length?`<label class="effort-row">Razonamiento<select data-effort="${p}" aria-label="Razonamiento de ${names[p]}">${levels.map(e=>`<option value="${e}" ${e===efforts[p]?'selected':''}>${effortNames[e]||e}</option>`).join('')}</select></label>`:''}</div>`;
-  }).join('');remember();
+    const levels=effortLevels(p,selections[p]);
+    if(!levels.includes(efforts[p]))efforts[p]=defaultEffort(p,selections[p])||'';
+  }
+  const other=orchestrator==='codex'?'claude':'codex';
+  const connection=p=>{const c=state.connections[p];return `<span class="status-dot ${c.loading?'loading':c.connected?'':'off'}" title="${c.loading?'Conectando':c.connected?'Conectado':'Desconectado'}"></span>`;}
+  const c=state.connections[orchestrator],levels=effortLevels(orchestrator,selections[orchestrator]);
+  $('#agent-cards').innerHTML=`<div class="agent-card"><div class="agent-header"><span class="agent-avatar ${orchestrator}">${symbols[orchestrator]}</span><span class="agent-name">${names[orchestrator]}</span>${connection(orchestrator)}</div>
+  <div class="agent-meta">Orquesta: reparte el trabajo y revisa el resultado. ${c.loading?'Consultando modelos…':c.connected?esc(c.plan||'Sesión conectada'):'Pendiente de conexión'}</div>
+  <select data-model="${orchestrator}" aria-label="Modelo del orquestador">${modelOptions(orchestrator,selections[orchestrator])}<option value="__custom__">Otro identificador…</option></select>
+  ${levels.length?`<label class="effort-row">Razonamiento<select data-effort="${orchestrator}" aria-label="Razonamiento del orquestador">${effortOptions(orchestrator,selections[orchestrator],efforts[orchestrator])}</select></label>`:''}</div>
+  <div class="agent-card"><div class="agent-header"><span class="agent-avatar ${other}">${symbols[other]}</span><span class="agent-name">${names[other]}</span>${connection(other)}</div>
+  <div class="agent-meta">Disponible para las sub-tareas que le asigne el orquestador. ${state.connections[other].connected?`${catalogOf(other).length} modelos`:'Pendiente de conexión'}</div></div>`;
+  remember();
+}
+
+function planRowHtml(subtask){
+  const model=subtaskModel(subtask),levels=effortLevels(subtask.provider,model);
+  return `<div class="plan-row"><div class="plan-row-head"><span class="agent-avatar ${subtask.provider}">${symbols[subtask.provider]}</span><strong>${esc(subtask.title)}</strong>${subtask.readOnly?'<span class="pill">solo lectura</span>':''}</div>
+  <div class="metadata">${esc(subtask.role)}${subtask.scope?.length?` · ${esc(subtask.scope.join(', '))}`:''}</div>
+  ${subtask.justification?`<div class="metadata">${esc(subtask.justification)}</div>`:''}
+  <div class="plan-row-controls"><select data-plan-model="${esc(subtask.id)}" aria-label="Modelo de ${esc(subtask.title)}">${modelOptions(subtask.provider,model)}</select>
+  ${levels.length?`<select data-plan-effort="${esc(subtask.id)}" aria-label="Razonamiento de ${esc(subtask.title)}">${effortOptions(subtask.provider,model,subtaskEffort(subtask))}</select>`:''}</div></div>`;
+}
+
+function planHtml(run){
+  const writes=run.subtasks.some(s=>!s.readOnly);
+  const needsGit=writes&&run.isolation?.kind!=='worktree';
+  return `<div class="plan-card"><div class="plan-head"><strong>Plan propuesto</strong><span class="pill">${run.subtasks.length} sub-tarea${run.subtasks.length===1?'':'s'}</span></div>
+  ${run.plan.summary?`<p class="muted">${esc(run.plan.summary)}</p>`:''}
+  ${run.plan.status==='fallback'?'<div class="message-error">El orquestador no devolvió un plan legible; se ejecutará tu petición con un solo agente.</div>':''}
+  ${(run.plan.warnings||[]).map(w=>`<div class="metadata">⚠ ${esc(w)}</div>`).join('')}
+  ${run.subtasks.map(planRowHtml).join('')}
+  ${needsGit?`<div class="plan-git"><div class="metadata">Esta carpeta no es un repositorio git: sin eso, los agentes no pueden escribir sobre copias aisladas.</div>
+    <label><input type="radio" name="plan-git" value="serial" ${initRepo?'':'checked'}> Ejecutar las escrituras de una en una (no cambia tu carpeta)</label>
+    <label><input type="radio" name="plan-git" value="init" ${initRepo?'checked':''}> Convertirla en repositorio git para trabajar en paralelo</label></div>`:''}
+  <div class="approval-actions"><button class="primary-button" id="plan-approve">Empezar</button><button class="secondary-button" id="plan-reject">Descartar</button></div></div>`;
+}
+
+function teamHtml(run){
+  const opened=new Set([...document.querySelectorAll('#run-status details[open]')].map(d=>d.dataset.subtask));
+  const done=run.subtasks.filter(s=>['completed','error','cancelled'].includes(s.status)).length;
+  return `<div class="plan-card"><div class="plan-head"><strong>${esc(run.stage||'Trabajando')}</strong>${run.subtasks.length?`<span class="pill">${done}/${run.subtasks.length}</span>`:''}</div>
+  ${run.subtasks.length?run.subtasks.map(s=>`<details data-subtask="${esc(s.id)}" ${opened.has(s.id)?'open':''}><summary><span class="agent-avatar ${s.provider}">${symbols[s.provider]}</span> ${esc(s.title)} · ${esc(names[s.provider])} ${esc(s.model)} <span class="muted">· ${esc(stageNames[s.status]||s.stage||'')}</span></summary><div class="run-events">${s.events.map(e=>esc(e.text)).join('\n')||(s.status==='queued'?'En espera de su turno.':'Trabajando…')}</div>${s.error?`<div class="message-error">${esc(s.error)}</div>`:''}</details>`).join('')
+    :`<div class="run-events">${run.events.map(e=>esc(e.text)).join('\n')||'Conectando con la sesión local…'}</div>`}
+  ${(run.isolation?.warnings||[]).map(w=>`<div class="metadata">⚠ ${esc(w)}</div>`).join('')}</div>`;
+}
+
+function integrationHtml(run){
+  return `<div class="plan-card"><div class="plan-head"><strong>Cambios sin integrar</strong></div>
+  ${(run.review.integration.conflicts||[]).map(c=>`<div class="metadata">${esc(c.file)}: ${esc(c.reason)}</div>`).join('')}
+  <p class="muted">El trabajo de los agentes está guardado aparte; tu carpeta no se tocó.</p>
+  <div class="approval-actions"><button class="primary-button" id="integrate-apply">Aplicar cambios</button><button class="secondary-button" id="integrate-discard">Descartar</button></div></div>`;
+}
+
+function renderRun(){
+  const run=activeRun()||lastRunOf(),status=$('#run-status');
+  const signature=JSON.stringify([run?.id,run?.status,run?.stage,run?.plan,run?.isolation,run?.review?.integration,run?.error,
+    (run?.subtasks||[]).map(s=>[s.id,s.status,s.stage,s.model,s.effort,s.events.length,s.error]),run?.events.length,planChoices,initRepo]);
+  if(signature===lastRun)return;lastRun=signature;
+  if(!run){status.hidden=true;status.innerHTML='';return;}
+  if(run.status==='awaiting-plan'){status.hidden=false;status.innerHTML=planHtml(run);return;}
+  if(ACTIVE.includes(run.status)){status.hidden=false;status.innerHTML=teamHtml(run);return;}
+  if(run.review?.integration?.conflicts?.length&&!run.review.integration.discarded){status.hidden=false;status.innerHTML=integrationHtml(run);return;}
+  if(run.error){status.hidden=false;status.textContent=run.error;return;}
+  status.hidden=true;status.innerHTML='';
 }
 function renderMemory(){
   const sync=state.memorySync||{state:'pending'};
@@ -86,23 +167,17 @@ function render(){
   $('#project-folder').textContent=project()?.path||'';$('#project-folder').title=project()?.path||'';
   $('#project-name').textContent=project()?.name||'';$('#conversation-title').textContent=conversation()?.title||'Nueva conversación';
   $('#conversations').innerHTML=state.conversations.filter(c=>c.projectId===projectId).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)).map(c=>`<button class="conversation-link ${c.id===conversationId?'active':''}" data-conversation="${c.id}"><span>◷</span><span>${esc(c.title)}</span></button>`).join('');
-  renderAgents();renderMemory();renderMessages();
-  const run=activeRun(),latest=state.runs.filter(r=>r.conversationId===conversationId).at(-1);
+  renderAgents();renderMemory();renderMessages();renderRun();
+  const run=activeRun();
   $('#send').hidden=!!run;$('#cancel-run').hidden=!run;$('#send').disabled=busy;
-  const status=$('#run-status');
-  if(run){status.hidden=false;const opened=status.querySelector('details')?.open;status.innerHTML=`<details ${opened?'open':''}><summary>${esc(names[run.provider]||'Equipo')} · ${run.status==='waiting'?'Esperando tu respuesta':esc(run.stage)} <span class="muted"> · ver actividad</span></summary><div class="run-events">${run.events.map(e=>esc(e.text)).join('\n')||'Conectando con la sesión local…'}</div></details>`;}
-  else if(latest?.error){status.hidden=false;status.textContent=latest.error;}
-  else status.hidden=true;
-  updateMode();remember();
+  updateOrchestrator();remember();
 }
-function updateMode(){
-  document.querySelectorAll('[data-mode]').forEach(b=>b.classList.toggle('selected',b.dataset.mode===mode));
-  const other=leader==='codex'?'claude':'codex';
-  const text=mode==='solo'?`${names[leader]} trabaja con la memoria de tu proyecto.`:mode==='review'?`${names[leader]} trabaja → ${names[other]} revisa.`:'Los dos responden por separado. Sin modificar archivos.';
-  $('#mode-hint').textContent=text;$('#flow-explanation').textContent=text;
-  $('#leader-symbol').textContent=symbols[leader];
-  $('#read-only').disabled=mode==='compare';
-  if(mode==='compare')$('#read-only').checked=true;
+function updateOrchestrator(){
+  const text=`${names[orchestrator]} estudia la tarea, reparte el trabajo entre los agentes que haga falta y revisa el resultado. Tú apruebas el plan antes de empezar.`;
+  $('#mode-hint').textContent=`${names[orchestrator]} orquesta: verás el plan antes de que empiece nadie.`;
+  $('#flow-explanation').textContent=text;
+  $('#orchestrator-symbol').textContent=symbols[orchestrator];
+  const select=$('#orchestrator');if(select.value!==orchestrator)select.value=orchestrator;
 }
 async function load(){
   try{state=await api('state');$('#connection-error').hidden=true;render();}catch(e){$('#connection-error').hidden=false;}
@@ -111,8 +186,31 @@ $('#reload').onclick=()=>location.reload();
 $('#project-select').onchange=e=>{projectId=e.target.value;conversationId=null;lastMessages='';render();};
 $('#conversations').onclick=e=>{const b=e.target.closest('[data-conversation]');if(b){conversationId=b.dataset.conversation;lastMessages='';render();}};
 $('#new-conversation').onclick=()=>{conversationId=null;lastMessages='';render();$('#prompt').focus();};
-$('#leader').onchange=e=>{leader=e.target.value;updateMode();};
-document.querySelector('.mode-tabs').onclick=e=>{if(e.target.dataset.mode){mode=e.target.dataset.mode;updateMode();}};
+$('#orchestrator').onchange=e=>{orchestrator=e.target.value;lastAgents='';renderAgents();updateOrchestrator();remember();};
+
+$('#run-status').onchange=e=>{
+  const run=activeRun();if(!run)return;
+  if(e.target.name==='plan-git'){initRepo=e.target.value==='init';lastRun='';renderRun();return;}
+  const modelFor=e.target.dataset.planModel,effortFor=e.target.dataset.planEffort;
+  if(modelFor){
+    const subtask=run.subtasks.find(s=>s.id===modelFor);
+    // Al cambiar de modelo, el nivel anterior puede no existir en el nuevo: se reajusta al predeterminado.
+    planChoices[modelFor]={model:e.target.value,effort:defaultEffort(subtask.provider,e.target.value)};
+  } else if(effortFor)planChoices[effortFor]={...planChoices[effortFor],effort:e.target.value};
+  else return;
+  lastRun='';renderRun();
+};
+
+$('#run-status').onclick=async e=>{
+  const run=activeRun()||lastRunOf();if(!run||!e.target.id)return;
+  const act=async(route,body,done)=>{try{const result=await api(route,body);planChoices={};initRepo=false;lastRun='';await load();if(done)done(result);}catch(error){toast(error.message);}};
+  if(e.target.id==='plan-approve')await act('plan',{runId:run.id,approve:true,initRepo,
+    subtasks:run.subtasks.map(s=>({id:s.id,model:subtaskModel(s),effort:subtaskEffort(s)||null}))});
+  if(e.target.id==='plan-reject')await act('plan',{runId:run.id,approve:false});
+  if(e.target.id==='integrate-apply')await act('integrate',{runId:run.id},result=>
+    toast(result.conflicts?.length?'No se pudo integrar: sigue habiendo conflictos.':'Cambios integrados en tu carpeta.'));
+  if(e.target.id==='integrate-discard')await act('integrate',{runId:run.id,discard:true},()=>toast('Copias de trabajo descartadas.'));
+};
 $('#memory-toggle').onclick=()=>{if(matchMedia('(min-width:951px)').matches)memoryList();else $('#context-panel').classList.toggle('revealed');};
 $('#context-close').onclick=()=>$('#context-panel').classList.remove('revealed');
 
@@ -128,10 +226,13 @@ $('#agent-cards').onchange=e=>{
 $('#composer').onsubmit=async e=>{
   e.preventDefault();if(busy||activeRun())return;
   const input=$('#prompt'),prompt=input.value.trim();if(!prompt)return;
+  if(!selections[orchestrator]){toast(`Elige el modelo de ${names[orchestrator]} en el panel de tu equipo.`);return;}
   busy=true;$('#send').disabled=true;
   try{
     if(!conversationId){const c=await api('conversations',{projectId});conversationId=c.id;}
-    await api('run',{conversationId,prompt,mode,leader,models:{...selections},efforts:{...efforts},readOnly:$('#read-only').checked});
+    planChoices={};initRepo=false;lastRun='';
+    await api('run',{conversationId,prompt,readOnly:$('#read-only').checked,
+      orchestrator:{provider:orchestrator,model:selections[orchestrator],effort:efforts[orchestrator]||null}});
     input.value='';input.style.height='';lastMessages='';await load();$('#messages').scrollTop=$('#messages').scrollHeight;
   }catch(error){toast(error.message);await load();}finally{busy=false;$('#send').disabled=false;}
 };
@@ -139,7 +240,7 @@ $('#prompt').onkeydown=e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.prevent
 $('#prompt').oninput=e=>{e.target.style.height='auto';e.target.style.height=Math.min(e.target.scrollHeight,220)+'px';};
 $('#cancel-run').onclick=async()=>{try{await api('cancel',{id:activeRun().id});await load();}catch(e){toast(e.message);}};
 $('#messages').onclick=async e=>{
-  const suggestion=e.target.closest('[data-suggestion]');if(suggestion){$('#prompt').value=suggestion.dataset.suggestion;mode=suggestion.dataset.suggestionMode;updateMode();$('#prompt').focus();return;}
+  const suggestion=e.target.closest('[data-suggestion]');if(suggestion){$('#prompt').value=suggestion.dataset.suggestion;$('#prompt').focus();return;}
   const copy=e.target.closest('[data-copy]');if(copy){try{await navigator.clipboard.writeText(state.messages.find(m=>m.id===copy.dataset.copy).content);toast('Respuesta copiada.');}catch{toast('No se pudo copiar. Selecciona el texto y cópialo.');}return;}
   const save=e.target.closest('[data-remember]');if(save){const m=state.messages.find(m=>m.id===save.dataset.remember);memoryForm({title:'Nota de '+names[m.provider],content:m.content.slice(0,12000)});return;}
   const approve=e.target.closest('[data-approval-allow]'),deny=e.target.closest('[data-approval-deny]');

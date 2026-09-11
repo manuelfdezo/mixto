@@ -11,22 +11,28 @@ También puedes ejecutar `npm start` desde esta carpeta. Cierra esa terminal par
 ## Trabajar
 
 1. Añade una carpeta existente con el botón **+** de Espacio de trabajo.
-2. Elige el modelo de cada agente en el panel derecho. En pantallas pequeñas abre **Memoria** para mostrar el panel.
-3. Escoge **Un agente**, **Trabajo + revisión** o **Dos perspectivas**.
-4. **Solo consultar** viene activado. Desmárcalo cuando quieras que el agente principal modifique los archivos. El revisor y el modo Dos perspectivas solo permiten lectura. Las solicitudes de permisos compatibles aparecen dentro de la conversación.
-5. Envía tu petición. Puedes detener una ejecución y retomar la conversación después.
+2. Elige qué agente **orquesta** y con qué modelo. En pantallas pequeñas abre **Memoria** para mostrar el panel.
+3. **Solo consultar** viene activado. Desmárcalo cuando quieras que los agentes modifiquen archivos: es el techo de permisos de toda la tarea y el plan no puede ampliarlo, solo restringirlo. Las solicitudes de permisos compatibles aparecen dentro de la conversación, indicando de qué sub-tarea vienen.
+4. Envía tu petición. El orquestador estudia la carpeta sin modificar nada y propone un plan: cuántas sub-tareas hacen falta, qué agente y modelo se ocupa de cada una, con qué alcance y por qué.
+5. Revisa el plan antes de que empiece nadie. Puedes cambiar el modelo y el nivel de razonamiento de cada sub-tarea para ajustar el consumo, o descartarlo.
+6. Las sub-tareas se ejecutan, hasta tres a la vez. Cada una informa de su estado por separado. Puedes detener la tarea y retomar la conversación después.
+7. Al terminar, el mismo orquestador revisa el conjunto: busca trabajo duplicado, contradicciones y lo que falte, y decide si procede integrar.
+
+Cada sub-tarea que modifica archivos trabaja sobre una copia aislada de la carpeta, creada con `git worktree`, así que dos agentes nunca se escriben encima. Esa copia parte del estado real del proyecto, incluido el trabajo que todavía no has guardado en un commit. Los cambios vuelven a tu carpeta como parches, sin crear ramas ni commits: si todos aplican limpios se integran solos; si hay conflicto, o dos sub-tareas tocaron el mismo archivo, no se aplica nada y el informe dice qué ocurrió. `MIXTO_MAX_PARALLEL` cambia cuántas sub-tareas se ejecutan a la vez, tres por defecto.
+
+Si la carpeta no es un repositorio git no hay copias aisladas posibles, y Mixto te ofrece dos salidas: convertirla en repositorio, o ejecutar de una en una las sub-tareas que escriben.
 
 Los modelos se consultan a las instalaciones locales al arrancar y al actualizar conexiones. Se incluyen los modelos ocultos de Codex, identificados como tales; el catálogo no garantiza que todos puedan ejecutarse en tu cuenta. También puedes escribir otro identificador. No se desbloquean modelos ni se eluden límites del plan. Las sesiones y la facturación siguen las configuraciones de las herramientas oficiales; consulta Conexiones para conocer el tipo de cuenta detectado.
 
 ## Memoria
 
 - Los **recuerdos** son notas editables que tú decides guardar. Pueden ser de un proyecto o globales.
-- Los **registros automáticos** guardan un extracto de cada trabajo terminado (hasta 2.000 caracteres de petición y 8.000 de respuesta). Son registros, no resúmenes verificados por un segundo modelo.
+- Los **registros automáticos** guardan un extracto de cada tarea terminada: el plan, el resultado de cada sub-tarea y la revisión, en un único registro por tarea y hasta 12.000 caracteres. Son registros, no resúmenes verificados por un segundo modelo.
 - En cada turno se añaden recuerdos explícitos, hasta cinco registros relevantes de otras conversaciones y la conversación reciente. La selección tiene un límite de tamaño; no se carga todo el historial a la vez.
 - Las sesiones nativas se reanudan por agente y por modo de permisos. Cambiar de agente incluye el contexto reciente compartido. Engram permite recuperar los recuerdos también fuera de Mixto; no modifica el contexto ya cargado de una conversación abierta.
 - Todo se guarda en **data/mixto.json**, con escrituras atómicas y una copia anterior **data/mixto.json.bak**. Descarga una copia desde Memoria compartida. Para trasladar los datos, cierra Mixto y conserva la carpeta data completa. No hay importación desde la interfaz.
 
-Mixto permite una tarea activa por carpeta, incluso si se registra como dos proyectos. La revisión empieza cuando termina el primer agente. Dos perspectivas se ejecuta de forma secuencial y sin acceso de escritura. Un error no se presenta como éxito ni se guarda como recuerdo automático. Las tareas que quedan abiertas al cerrar la app aparecen como interrumpidas al reiniciar.
+Mixto permite una tarea orquestada activa por carpeta, incluso si se registra como dos proyectos; el paralelismo ocurre dentro de esa tarea, donde Mixto sabe qué sub-tarea trabaja sobre qué copia. Una sub-tarea que falla no detiene a las demás: su error queda registrado y la revisión lo tiene en cuenta. Un error no se presenta como éxito ni se guarda como recuerdo automático. Las tareas que quedan abiertas al cerrar la app aparecen como interrumpidas al reiniciar, igual que sus sub-tareas.
 
 ### Memoria compartida con Engram
 

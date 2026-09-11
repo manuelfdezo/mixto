@@ -5,7 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import {fileURLToPath} from 'node:url';
 import {Store,memoryContext} from '../lib/store.mjs';
-import {runProvider,executables} from '../lib/providers.mjs';
+import {runProvider,executables,resolveCommand} from '../lib/providers.mjs';
 
 test('La memoria y las conversaciones sobreviven al reinicio, con copia anterior',()=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mixto-test-store-'));
@@ -64,3 +64,34 @@ for(const provider of ['codex','claude']){
     try{await assert.rejects(running,/detenida/);}finally{clearTimeout(timer);}
   });
 }
+
+// Un CLI instalado con npm en Windows solo existe como atajo .cmd: Node no puede lanzarlo directamente.
+const enWindows={skip:process.platform!=='win32'?'solo aplica a Windows':false};
+
+test('resolveCommand pasa de largo cuando ya recibe un comando con argumentos',()=>{
+  const orden=[process.execPath,'agente.mjs','codex'];
+  assert.deepEqual(resolveCommand(orden),orden);
+});
+
+test('resolveCommand entrega los atajos .cmd al intérprete y deja los .exe en paz',enWindows,()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mixto-cmd-'));
+  const atajo=path.join(dir,'agente.cmd'),programa=path.join(dir,'agente.exe');
+  fs.writeFileSync(atajo,'@echo off\n');fs.writeFileSync(programa,'');
+  try{
+    assert.deepEqual(resolveCommand(atajo),[process.env.ComSpec||'cmd.exe','/d','/s','/c',atajo]);
+    assert.deepEqual(resolveCommand(programa),[programa]);
+  }finally{fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('resolveCommand encuentra el atajo por PATH, como haría una terminal',enWindows,()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mixto-path-'));
+  fs.writeFileSync(path.join(dir,'agentefalso.cmd'),'@echo off\n');
+  const anterior=process.env.PATH;
+  process.env.PATH=dir+path.delimiter+anterior;
+  try{
+    assert.deepEqual(resolveCommand('agentefalso'),
+      [process.env.ComSpec||'cmd.exe','/d','/s','/c',path.join(dir,'agentefalso.cmd')]);
+    // Un comando que no existe se devuelve tal cual, para que el fallo siga siendo un ENOENT claro.
+    assert.deepEqual(resolveCommand('no-existe-este-agente'),['no-existe-este-agente']);
+  }finally{process.env.PATH=anterior;fs.rmSync(dir,{recursive:true,force:true});}
+});
