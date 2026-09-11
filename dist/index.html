@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="es">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="Tu espacio local para trabajar con Claude Code y Codex, con memoria compartida."><title>Mixto · Tu equipo, un espacio</title><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<div id="app">
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="Mixto, inicio"><img src="/favicon.svg" width="34" height="34" alt=""><span>mixto<span class="brand-dot">.</span></span><span class="local-tag">LOCAL</span></a>
+    <button class="new-button" id="new-conversation"><span>＋</span> Nueva conversación <kbd>N</kbd></button>
+    <div class="section-label">ESPACIO DE TRABAJO <button id="new-project" class="icon-button" aria-label="Añadir proyecto">＋</button></div>
+    <label class="sr-only" for="project-select">Proyecto</label><select id="project-select"></select>
+    <div class="project-folder" id="project-folder"></div>
+    <div class="section-label conversation-label">CONVERSACIONES</div><nav id="conversations" aria-label="Conversaciones"></nav>
+    <div class="sidebar-bottom"><button id="open-memory" class="nav-button"><span>◇</span> Memoria compartida <span id="memory-count" class="count">0</span></button><button id="open-connections" class="nav-button"><span>⌘</span> Conexiones y agentes</button><div class="local-note"><span class="status-dot"></span> Guardado en este ordenador</div></div>
+  </aside>
+  <main>
+    <header class="topbar"><div class="breadcrumb"><span id="project-name">Mi espacio</span><span class="slash">/</span><span id="conversation-title">Nueva conversación</span></div><button class="quiet-button" id="memory-toggle">◇ <span>Memoria</span></button></header>
+    <div class="workbench">
+      <section class="conversation-panel">
+        <div id="messages" class="messages" aria-live="polite"></div>
+        <div id="run-status" class="run-status" hidden></div>
+        <div class="composer-area">
+          <div class="mode-tabs" role="group" aria-label="Forma de trabajar"><button data-mode="solo" class="selected">Un agente</button><button data-mode="review">Trabajo + revisión</button><button data-mode="compare">Dos perspectivas</button></div>
+          <form id="composer" class="composer"><label class="sr-only" for="prompt">Tu mensaje</label><textarea id="prompt" rows="3" placeholder="¿Qué vamos a hacer?" required></textarea><div class="composer-controls"><label class="provider-control"><span id="leader-symbol">✳</span><select id="leader" aria-label="Agente principal"><option value="codex">Codex</option><option value="claude">Claude Code</option></select></label><label class="readonly-control"><input id="read-only" type="checkbox" checked> Solo consultar</label><button type="button" id="cancel-run" class="stop-button" hidden>■ Detener</button><button type="submit" id="send" class="send-button" aria-label="Enviar mensaje">↑</button></div></form>
+          <div class="composer-hint"><span id="mode-hint">Un agente trabaja con la memoria de tu proyecto.</span><span>Ctrl ↵ enviar</span></div>
+        </div>
+      </section>
+      <aside class="context-panel" id="context-panel"><div class="section-label">TU EQUIPO <span class="tiny-label">2 AGENTES</span><button class="icon-button" id="context-close" aria-label="Cerrar panel">×</button></div><div id="agent-cards"></div><div id="flow-explanation" class="flow-explanation"></div><div class="context-heading"><h2>Memoria compartida</h2><button class="icon-button" id="add-memory" aria-label="Añadir recuerdo">＋</button></div><p class="muted context-copy">Lo que aprende el equipo, queda en tu proyecto.</p><div id="memory-preview"></div><button class="text-button" id="all-memory">Ver todos los recuerdos <span>↗</span></button><div class="memory-footer"><span>◇</span><p>Claude y Codex reciben tus recuerdos y el contexto reciente al empezar cada turno.</p></div></aside>
+    </div>
+  </main>
+</div>
+<dialog id="modal"><div class="modal-head"><h2 id="modal-title"></h2><button id="modal-close" class="icon-button" aria-label="Cerrar">×</button></div><div id="modal-content"></div></dialog>
+<div id="toast" role="status" hidden></div>
+<div id="connection-error" role="alert" hidden>No se puede conectar con Mixto. Comprueba que la app sigue abierta. <button id="reload">Reconectar</button></div>
+</body></html>
