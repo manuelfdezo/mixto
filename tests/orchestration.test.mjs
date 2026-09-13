@@ -12,9 +12,10 @@ const agent=path.join(here,'fake-agent.mjs');
 const git=(cwd,...args)=>execFileSync('git',['-C',cwd,...args],{windowsHide:true,encoding:'utf8'});
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
-async function boot(t,{delay=600}={}) {
+async function boot(t,{delay=600,scenario}={}) {
   const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'mixto-orq-')));
-  const work=path.join(dir,'proyecto');fs.mkdirSync(work);
+  const projectsRoot=path.join(dir,'projects');fs.mkdirSync(projectsRoot);
+  const work=path.join(projectsRoot,'proyecto');fs.mkdirSync(work);
   git(work,'init','-b','main');
   git(work,'config','user.name','Mixto Test');
   git(work,'config','user.email','test@example.invalid');
@@ -24,7 +25,9 @@ async function boot(t,{delay=600}={}) {
   const port=20000+Math.floor(Math.random()*20000);
   const child=spawn(process.execPath,['server.mjs'],{cwd:root,windowsHide:true,stdio:['ignore','pipe','pipe'],
     env:{...process.env,MIXTO_PORT:String(port),MIXTO_DATA_DIR:path.join(dir,'datos'),
+      MIXTO_PROJECTS_ROOT:projectsRoot,
       ENGRAM_DATA_DIR:path.join(dir,'engram'),FAKE_AGENT_DELAY:String(delay),MIXTO_MAX_PARALLEL:'3',
+      ...(scenario?{FAKE_AGENT_SCENARIO:scenario}:{}),
       // Esta prueba es del motor de orquestación: no debe tocar la memoria compartida real.
       MIXTO_ENGRAM_PATH:path.join(dir,'sin-engram.exe'),
       MIXTO_CODEX_PATH:JSON.stringify([process.execPath,agent,'codex']),
@@ -75,6 +78,18 @@ async function boot(t,{delay=600}={}) {
 }
 
 const runOf=state=>state.runs.at(-1);
+
+test('the API discovers and creates projects only inside the managed projects root',async t=>{
+  const {call,dir,project}=await boot(t,{delay:50});
+  const root=fs.realpathSync(path.join(dir,'projects'));
+  const state=await call('state');
+  assert.deepEqual(state.app.projectsRoot,{path:root,available:true});
+  assert.ok(state.projects.some(item=>item.id===project.id&&item.path===fs.realpathSync(path.join(root,'proyecto'))));
+  const created=await call('projects',{name:'Paper shop POS',directoryName:'tpv-papeleria',description:''});
+  assert.equal(created.path,fs.realpathSync(path.join(root,'tpv-papeleria')));
+  await assert.rejects(call('projects',{name:'Escape',directoryName:'../escape',description:''}),/Project folder/);
+  assert.equal(fs.existsSync(path.join(dir,'escape')),false);
+});
 
 test('un run orquestado planifica, espera tu aprobación, trabaja en paralelo e integra',async t=>{
   const delay=700;
@@ -139,6 +154,30 @@ test('un run orquestado planifica, espera tu aprobación, trabaja en paralelo e 
   assert.equal(automatic.length,1);
   assert.match(automatic[0].content,/Frente uno/);
   assert.match(automatic[0].content,/Frente dos/);
+});
+
+test('el arquitecto detiene una sub-tarea que colisiona con otra, sin tumbar el run',async t=>{
+  const delay=2200;
+  const {call,work,until,project}=await boot(t,{delay,scenario:'colision'});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Provoca una colisión',readOnly:false,
+    orchestrator:{provider:'claude',model:'claude-fake',effort:'medium'}});
+
+  let state=await until(s=>runOf(s).status==='awaiting-plan');
+  let run=runOf(state);
+  assert.equal(run.subtasks.length,2);
+  await call('plan',{runId:run.id,approve:true,subtasks:run.subtasks.map(s=>({id:s.id,model:s.model,effort:s.effort}))});
+
+  state=await until(s=>['completed','error'].includes(runOf(s).status));
+  run=runOf(state);
+  assert.equal(run.status,'completed',JSON.stringify(run.subtasks.map(s=>[s.status,s.error])));
+  assert.equal(run.subtasks[0].status,'stopped');
+  assert.equal(run.subtasks[0].stage,'Detenida por el arquitecto');
+  assert.match(run.subtasks[0].error,/compartido\.txt/);
+  assert.equal(run.subtasks[1].status,'completed');
+  assert.equal(fs.readFileSync(path.join(work,'compartido.txt'),'utf8'),'escrito por la sub-tarea compartido.txt\n');
+  // The architect kept the same session across the plan, the live supervision turn and the review.
+  assert.match(run.events.map(e=>e.text).join('\n'),/detiene la sub-tarea/);
 });
 
 test('descartar el plan no ejecuta ninguna sub-tarea',async t=>{

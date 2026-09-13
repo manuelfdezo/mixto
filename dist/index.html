@@ -6,14 +6,14 @@
   <aside class="sidebar">
     <a class="brand" href="/" aria-label="Mixto, inicio"><img src="/favicon.svg" width="34" height="34" alt=""><span>mixto<span class="brand-dot">.</span></span><span class="local-tag">LOCAL</span></a>
     <button class="new-button" id="new-conversation"><span>＋</span> Nueva conversación <kbd>N</kbd></button>
-    <div class="section-label">ESPACIO DE TRABAJO <button id="new-project" class="icon-button" aria-label="Añadir proyecto">＋</button></div>
+    <div class="section-label">PROYECTOS <button id="new-project" class="icon-button" aria-label="Crear proyecto">＋</button></div>
     <label class="sr-only" for="project-select">Proyecto</label><select id="project-select"></select>
     <div class="project-folder" id="project-folder"></div>
     <div class="section-label conversation-label">CONVERSACIONES</div><nav id="conversations" aria-label="Conversaciones"></nav>
-    <div class="sidebar-bottom"><button id="open-memory" class="nav-button"><span>◇</span> Memoria compartida <span id="memory-count" class="count">0</span></button><button id="open-connections" class="nav-button"><span>⌘</span> Conexiones y agentes</button><div class="local-note"><span class="status-dot"></span> Guardado en este ordenador</div></div>
+    <div class="sidebar-bottom"><button id="open-memory" class="nav-button"><span>◇</span> Memoria <span id="memory-count" class="count">0</span></button><button id="open-connections" class="nav-button"><span>⌘</span> Agentes</button><div class="local-note"><span class="status-dot"></span> Guardado en este ordenador</div></div>
   </aside>
   <main>
-    <header class="topbar"><div class="breadcrumb"><span id="project-name">Mi espacio</span><span class="slash">/</span><span id="conversation-title">Nueva conversación</span></div><button class="quiet-button" id="memory-toggle">◇ <span>Memoria</span></button></header>
+    <header class="topbar"><div class="breadcrumb"><span id="project-name">Mi espacio</span><span class="slash">/</span><span id="conversation-title">Nueva conversación</span></div></header>
     <div class="workbench">
       <section class="conversation-panel">
         <div id="messages" class="messages" aria-live="polite"></div>
@@ -23,7 +23,6 @@
           <div class="composer-hint"><span id="mode-hint">El orquestador reparte el trabajo entre los agentes necesarios.</span><span>Ctrl ↵ enviar</span></div>
         </div>
       </section>
-      <aside class="context-panel" id="context-panel"><div class="section-label">TU EQUIPO <span class="tiny-label" id="team-count">SEGÚN LA TAREA</span><button class="icon-button" id="context-close" aria-label="Cerrar panel">×</button></div><div id="agent-cards"></div><div id="flow-explanation" class="flow-explanation"></div><div class="context-heading"><h2>Memoria compartida</h2><button class="icon-button" id="add-memory" aria-label="Añadir recuerdo">＋</button></div><p class="muted context-copy">Lo que aprende el equipo, queda en tu proyecto.</p><div id="memory-preview"></div><button class="text-button" id="all-memory">Ver todos los recuerdos <span>↗</span></button><div class="memory-footer"><span>◇</span><p>Claude y Codex reciben tus recuerdos y el contexto reciente al empezar cada turno.</p></div></aside>
     </div>
   </main>
 </div>

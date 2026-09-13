@@ -10,8 +10,8 @@ También puedes ejecutar `npm start` desde esta carpeta. Cierra esa terminal par
 
 ## Trabajar
 
-1. Añade una carpeta existente con el botón **+** de Espacio de trabajo.
-2. Elige qué agente **orquesta** y con qué modelo. En pantallas pequeñas abre **Memoria** para mostrar el panel.
+1. Crea la carpeta de proyectos `mixto-projects` junto a la carpeta de Mixto. Cada subcarpeta directa aparece automáticamente en el selector **Proyectos**; también puedes crear una con el botón **+**.
+2. Elige qué agente **orquesta**. El modelo y el nivel de razonamiento predeterminados se configuran en **Agentes**.
 3. **Solo consultar** viene activado. Desmárcalo cuando quieras que los agentes modifiquen archivos: es el techo de permisos de toda la tarea y el plan no puede ampliarlo, solo restringirlo. Las solicitudes de permisos compatibles aparecen dentro de la conversación, indicando de qué sub-tarea vienen.
 4. Envía tu petición. El orquestador estudia la carpeta sin modificar nada y propone un plan: cuántas sub-tareas hacen falta, qué agente y modelo se ocupa de cada una, con qué alcance y por qué.
 5. Revisa el plan antes de que empiece nadie. Puedes cambiar el modelo y el nivel de razonamiento de cada sub-tarea para ajustar el consumo, o descartarlo.
@@ -22,7 +22,9 @@ Cada sub-tarea que modifica archivos trabaja sobre una copia aislada de la carpe
 
 Si la carpeta no es un repositorio git no hay copias aisladas posibles, y Mixto te ofrece dos salidas: convertirla en repositorio, o ejecutar de una en una las sub-tareas que escriben.
 
-Los modelos se consultan a las instalaciones locales al arrancar y al actualizar conexiones. Se incluyen los modelos ocultos de Codex, identificados como tales; el catálogo no garantiza que todos puedan ejecutarse en tu cuenta. También puedes escribir otro identificador. No se desbloquean modelos ni se eluden límites del plan. Las sesiones y la facturación siguen las configuraciones de las herramientas oficiales; consulta Conexiones para conocer el tipo de cuenta detectado.
+Mixto es únicamente el orquestador: el código de cada producto permanece fuera de su repositorio. La raíz gestionada se puede cambiar con `MIXTO_PROJECTS_ROOT`; debe ser una carpeta existente. Mixto solo descubre sus subcarpetas directas y la interfaz no acepta rutas arbitrarias. Las referencias antiguas guardadas se conservan para no perder conversaciones ni memoria, pero todo proyecto nuevo se crea dentro de la raíz gestionada. Mixto nunca mueve ni elimina automáticamente un proyecto existente.
+
+Los modelos se consultan a las instalaciones locales al arrancar y al actualizar conexiones. Se incluyen los modelos ocultos de Codex, identificados como tales; el catálogo no garantiza que todos puedan ejecutarse en tu cuenta. No se desbloquean modelos ni se eluden límites del plan. Las sesiones y la facturación siguen las configuraciones de las herramientas oficiales; consulta Agentes para conocer el tipo de cuenta detectado.
 
 ## Memoria
 
@@ -56,7 +58,7 @@ Si aparece un conflicto, compara la nota local con su versión en Engram y haz q
 
 ## Conexiones
 
-Si una sesión no está disponible, inicia sesión en la herramienta correspondiente (`codex login` o `claude auth login`) y pulsa **Actualizar conexiones**. La app nunca inicia sesión ni compra créditos automáticamente. Si las herramientas no están en PATH, se pueden indicar rutas mediante `MIXTO_CODEX_PATH` y `MIXTO_CLAUDE_PATH` al iniciar el servidor.
+Si una sesión no está disponible, inicia sesión en la herramienta correspondiente (`codex login` o `claude auth login`) y pulsa **Actualizar** en **Agentes**. La app nunca inicia sesión ni compra créditos automáticamente. Si las herramientas no están en PATH, se pueden indicar rutas mediante `MIXTO_CODEX_PATH` y `MIXTO_CLAUDE_PATH` al iniciar el servidor.
 
 La app escucha únicamente en la interfaz local. Comprueba Host y Origin, exige una cookie local y protege las mutaciones frente a solicitudes de otras páginas. El contenido de las respuestas se muestra con formato limitado y escapado; nunca ejecuta HTML generado por los agentes.
 

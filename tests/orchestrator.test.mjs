@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {buildPlanPrompt,parsePlan,assignWaves,buildReviewPrompt,readVerdict,PlanError} from '../lib/orchestrator.mjs';
+import {buildPlanPrompt,parsePlan,assignWaves,buildReviewPrompt,readVerdict,PlanError,buildSupervisionPrompt,parseDecision} from '../lib/orchestrator.mjs';
 
 const connections={
   codex:{connected:true,models:[{id:'gpt-5-codex',name:'Codex',efforts:['low','medium','high'],default:true}]},
@@ -110,6 +110,50 @@ test('readVerdict se queda con el último veredicto y distingue NO INTEGRAR',()=
   // El instructivo del prompt menciona ambos; vale el último, que es el del revisor.
   assert.deepEqual(readVerdict('Escribe VEREDICTO: INTEGRAR o no.\n\nVEREDICTO: NO INTEGRAR'),{integrate:false,explicit:true});
   assert.deepEqual(readVerdict('me quedé sin responder'),{integrate:false,explicit:false});
+});
+
+test('parseDecision acepta un "seguir" válido',()=>{
+  assert.deepEqual(parseDecision('```json\n{"accion":"seguir"}\n```'),{action:'seguir'});
+});
+
+test('parseDecision acepta un "detener" válido con número y motivo',()=>{
+  const decision=parseDecision('Reviso el aviso.\n\n```json\n{"accion":"detener","subtarea":2,"motivo":"Pisa el mismo archivo"}\n```');
+  assert.deepEqual(decision,{action:'detener',subtask:2,reason:'Pisa el mismo archivo'});
+});
+
+test('parseDecision recorta el motivo a 300 caracteres',()=>{
+  const decision=parseDecision(`\`\`\`json\n{"accion":"detener","subtarea":1,"motivo":"${'x'.repeat(400)}"}\n\`\`\``);
+  assert.equal(decision.reason.length,300);
+});
+
+test('parseDecision nunca detiene por una respuesta ilegible: falla hacia "seguir"',()=>{
+  assert.deepEqual(parseDecision('esto no es JSON en absoluto'),{action:'seguir'});
+  assert.deepEqual(parseDecision('```json\n{"accion":"detener"\n```'),{action:'seguir'});
+  assert.deepEqual(parseDecision('```json\n{"accion":"cancelar"}\n```'),{action:'seguir'});
+  assert.deepEqual(parseDecision('```json\n{"accion":"detener","motivo":"sin número"}\n```'),{action:'seguir'});
+  assert.deepEqual(parseDecision('```json\n{"accion":"detener","subtarea":0,"motivo":"cero no vale"}\n```'),{action:'seguir'});
+  assert.deepEqual(parseDecision('```json\n{"accion":"detener","subtarea":"dos","motivo":"no es número"}\n```'),{action:'seguir'});
+});
+
+test('buildSupervisionPrompt no repite la petición del usuario ni el plan',()=>{
+  const subtasks=[{index:0,title:'Frente uno'},{index:1,title:'Frente dos'}];
+  const events=[{type:'colision',file:'uno.txt',indexes:[0,1]}];
+  const prompt=buildSupervisionPrompt({events,subtasks});
+  assert.doesNotMatch(prompt,/PETICIÓN (DEL USUARIO|ORIGINAL DEL USUARIO):/i);
+  assert.doesNotMatch(prompt,/resumen|subtareas|justificacion/i);
+  assert.match(prompt,/Frente uno/);
+  assert.match(prompt,/uno\.txt/);
+  assert.match(prompt,/```json/);
+  assert.match(prompt,/"accion":"seguir"/);
+  assert.match(prompt,/"accion":"detener"/);
+  assert.match(prompt,/descarta/i);
+});
+
+test('buildSupervisionPrompt describe una invasión con la sub-tarea implicada',()=>{
+  const subtasks=[{index:0,title:'Frente uno'}];
+  const prompt=buildSupervisionPrompt({events:[{type:'invasion',index:0,file:'fuera.txt'}],subtasks});
+  assert.match(prompt,/Frente uno/);
+  assert.match(prompt,/fuera\.txt/);
 });
 
 test('buildPlanPrompt ofrece el catálogo real y exige un único bloque JSON',()=>{

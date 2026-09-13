@@ -10,6 +10,7 @@ import {runProvider,executables,resolveCommand} from '../lib/providers.mjs';
 test('La memoria y las conversaciones sobreviven al reinicio, con copia anterior',()=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mixto-test-store-'));
   const a=new Store(dir,dir);
+  assert.deepEqual(a.data.projects,[],'a new Mixto store must not treat the orchestrator repository as a product project');
   a.data.memories.push({id:'saved',content:'Recuerdo persistente'});
   a.data.runs.push({status:'running'});a.data.messages.push({status:'streaming'});a.save();
   const b=new Store(dir,dir);

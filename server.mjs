@@ -6,11 +6,15 @@ import {randomBytes} from 'node:crypto';
 import {Store,id,now,memoryContext,sessionKey,rememberSession} from './lib/store.mjs';
 import {discover,runProvider} from './lib/providers.mjs';
 import {EngramBridge,sharedMemories,cleanupOrphanTransfers} from './lib/engram.mjs';
-import {buildPlanPrompt,parsePlan,assignWaves,buildReviewPrompt,readVerdict,PlanError} from './lib/orchestrator.mjs';
+import {buildPlanPrompt,parsePlan,assignWaves,buildReviewPrompt,readVerdict,PlanError,buildSupervisionPrompt,parseDecision} from './lib/orchestrator.mjs';
 import {inspect,initRepository,createWorkspaces,capturePatch,checkPatches,applyPatches,removeWorkspaces,cleanupOrphanWorkspaces} from './lib/isolation.mjs';
+import {createManagedProject,managedProjectPath,projectsRoot,syncDiscoveredProjects} from './lib/projects.mjs';
+import {listPersonas,personaBody} from './lib/personas.mjs';
+import {Watcher} from './lib/supervisor.mjs';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
 const dataDir=path.resolve(process.env.MIXTO_DATA_DIR||path.join(root,'data'));
+const managedProjectsRoot=projectsRoot(root);
 const port=Number(process.env.MIXTO_PORT||4317);
 const origin=`http://127.0.0.1:${port}`;
 const secret=randomBytes(32).toString('hex');
@@ -27,13 +31,15 @@ try{
 }catch(e){console.error(e.message);process.exit(1);}
 process.on('exit',()=>{try{if(fs.readFileSync(lockFile,'utf8')===String(process.pid))fs.unlinkSync(lockFile);}catch{}});
 const store=new Store(dataDir,root);
+const initialProjects=syncDiscoveredProjects(store.data,managedProjectsRoot);
+if(initialProjects.added.length)store.save();
 cleanupOrphanTransfers();
 void cleanupOrphanWorkspaces({dataDir,projectPaths:store.data.projects.map(project=>project.path)}).catch(()=>{});
 const active=new Map(),approvals=new Map(),planGates=new Map();
 const MAX_SUBTASKS=8;
 const maxParallel=()=>Math.max(1,Math.min(6,Number(process.env.MIXTO_MAX_PARALLEL)||3));
 const memoryBridge=new EngramBridge(store);
-const syncMemory=()=>active.size?Promise.resolve():memoryBridge.sync();
+const syncMemory=()=>active.size||!store.data.projects.length?Promise.resolve():memoryBridge.sync();
 const memoryTimer=setInterval(()=>void syncMemory(),15000);
 memoryTimer.unref();
 const connections=Object.fromEntries(['codex','claude'].map(provider=>[provider,{connected:false,loading:true,models:store.data.catalogs?.[provider]||[]}]));
@@ -65,7 +71,14 @@ function str(value,label,max=10000,empty=false){
 function getRun(runId){const r=store.data.runs.find(r=>r.id===runId);if(!r)throw new Error('Tarea no encontrada.');return r;}
 function sameFolder(a,b){return process.platform==='win32'?a.toLowerCase()===b.toLowerCase():a===b;}
 function folder(value){const p=str(value,'Carpeta',2000);if(!path.isAbsolute(p))throw new Error('Escribe la ruta completa de una carpeta.');const real=fs.realpathSync(p);if(!fs.statSync(real).isDirectory())throw new Error('La ruta debe ser una carpeta.');return real;}
-function snapshot(){const {engram,...data}=store.data;return {...data,memories:sharedMemories(store.data),memorySync:memoryBridge.status,connections,approvals:[...approvals.values()].map(a=>a.public),app:{version:'1.0.0',workspace:root}};}
+function snapshot(){
+  const managed=syncDiscoveredProjects(store.data,managedProjectsRoot);
+  if(managed.added.length)flush();
+  const {engram,...data}=store.data;
+  return {...data,memories:sharedMemories(store.data),memorySync:memoryBridge.status,connections,personas:listPersonas(),
+    approvals:[...approvals.values()].map(a=>a.public),app:{version:'1.0.0',workspace:root,
+      projectsRoot:{path:managed.root,available:managed.available}}};
+}
 function message(conversationId,role,content,extra={}){const m={id:id(),conversationId,role,content,createdAt:now(),...extra};store.data.messages.push(m);return m;}
 
 const agentName=provider=>provider==='claude'?'Claude Code':'Codex';
@@ -129,7 +142,9 @@ function orchestratorRun(run,{prompt,sessionId,controller,onText}){
   const project=store.project(store.conversation(run.conversationId).projectId);
   return runProvider(run.orchestrator.provider,{
     cwd:project.path,model:run.orchestrator.model,effort:run.orchestrator.effort,prompt,readOnly:true,
-    sessionId,signal:controller.signal,onSession:()=>{},onText,
+    // The architect's session is kept alive across plan, supervision and review turns: it never re-explains itself.
+    sessionId:sessionId??run.orchestrator.sessionId,signal:controller.signal,
+    onSession:sid=>{run.orchestrator.sessionId=sid;dirty=true;},onText,
     onEvent:text=>pushEvent(run,text),
     approve:()=>Promise.resolve({allow:false})
   });
@@ -144,8 +159,11 @@ async function planPhase(run,controller){
   const current=message(conv.id,'assistant','',{provider:run.orchestrator.provider,model:run.orchestrator.model,
     status:'streaming',runId:run.id,subtaskId:null,kind:'plan',stage:'Plan'});
   flush();
+  // La persona da el enfoque; las preferencias del usuario van después para que, si chocan, ganen las suyas.
+  const instructions=[personaBody(store.data.settings.orchestratorPersona),
+    store.data.settings[run.orchestrator.provider+'Instructions']||''].filter(Boolean).join('\n\n');
   let prompt=buildPlanPrompt({request:run.prompt,connections,memory,history,
-    instructions:store.data.settings[run.orchestrator.provider+'Instructions']||'',maxSubtasks:MAX_SUBTASKS,maxParallel:maxParallel()});
+    instructions,maxSubtasks:MAX_SUBTASKS,maxParallel:maxParallel()});
   let parsed=null,sessionId,lastError;
   for(let attempt=0;attempt<2&&!parsed;attempt++){
     const result=await orchestratorRun(run,{prompt,sessionId,controller,onText:text=>{current.content=text;dirty=true;}});
@@ -244,10 +262,12 @@ async function runSubtask(run,subtask,controller){
     if(workspace&&!subtask.readOnly)subtask.patch=await capturePatch({worktreeRoot:workspace,
       patchPath:path.join(dataDir,'patches',run.id,`${subtask.index}.patch`)});
   }catch(error){
-    subtask.status=controller.signal.aborted?'cancelled':'error';
-    subtask.error=noteAuthFailure(subtask.provider,error.message)||error.message;
-    subtask.stage='Sin completar';
-    current.status=subtask.status;current.error=subtask.error;current.stage='Sin completar';
+    // A subtask-specific abort carries a reason object; a run-wide cancel or a real failure does not.
+    const byArchitect=controller.signal.aborted&&controller.signal.reason?.architect===true;
+    subtask.status=byArchitect?'stopped':controller.signal.aborted?'cancelled':'error';
+    subtask.stage=byArchitect?'Detenida por el arquitecto':'Sin completar';
+    subtask.error=byArchitect?controller.signal.reason.motivo:(noteAuthFailure(subtask.provider,error.message)||error.message);
+    current.status=subtask.status;current.error=subtask.error;current.stage=subtask.stage;
     if(current.content.trim()===error.message.trim())current.content='';
   }finally{subtask.finishedAt=now();rollup(run);flush();}
 }
@@ -304,15 +324,59 @@ async function finishWorkspaces(run){
   }catch(error){console.error('No se pudieron limpiar las copias de trabajo:',error.message);}
 }
 
+const MAX_SUPERVISION=()=>Math.max(1,Number(process.env.MIXTO_MAX_SUPERVISION)||12);
+
+// One architect turn at a time, never overlapping and never while planning or reviewing: `state.chain`
+// serializes every call this run makes, and `state.turns` caps how many of them reach the architect.
+async function superviseWave(run,events,writers,controllers,runController,state){
+  if(runController.signal.aborted||run.phase!=='work')return;
+  for(const event of events)pushEvent(run,event.type==='colision'
+    ?`Aviso: varias sub-tareas han modificado «${event.file}».`
+    :`Aviso: la sub-tarea #${event.index+1} ha tocado «${event.file}», fuera de su alcance.`);
+  if(state.turns>=MAX_SUPERVISION()){pushEvent(run,'Se alcanzó el límite de consultas al arquitecto; se sigue vigilando sin preguntarle.');return;}
+  state.turns++;
+  try{
+    const result=await orchestratorRun(run,{controller:runController,onText:()=>{},
+      prompt:buildSupervisionPrompt({events,subtasks:writers})});
+    const decision=parseDecision(result.text);
+    if(decision.action!=='detener'){pushEvent(run,'El arquitecto revisó el aviso y decidió seguir.');return;}
+    const target=writers.find(subtask=>subtask.index+1===decision.subtask);
+    const abort=target?.status==='running'&&controllers.get(target.id);
+    if(!abort){pushEvent(run,`El arquitecto pidió detener la sub-tarea #${decision.subtask}, pero ya no está en marcha.`);return;}
+    pushEvent(run,`El arquitecto detiene la sub-tarea #${target.index+1} (${target.title}): ${decision.reason||'sin motivo indicado.'}`);
+    abort.abort({architect:true,motivo:decision.reason||'El arquitecto detuvo esta sub-tarea.'});
+  }catch(error){pushEvent(run,'La supervisión del arquitecto falló: '+error.message);}
+}
+
 async function execute(run,controller){
   try{
     const decision=await planPhase(run,controller);
     if(!decision){run.status='cancelled';run.stage='Plan descartado';return;}
     await prepare(run,decision);
     run.phase='work';rollup(run);flush();
+    const controllers=new Map(),supervision={chain:Promise.resolve(),turns:0};
     for(const wave of run.waves){
       if(controller.signal.aborted)throw new Error('Tarea detenida.');
-      await Promise.allSettled(wave.map(subtaskId=>runSubtask(run,run.subtasks.find(subtask=>subtask.id===subtaskId),controller)));
+      const tasks=wave.map(subtaskId=>run.subtasks.find(subtask=>subtask.id===subtaskId));
+      for(const subtask of tasks){
+        const sub=new AbortController();
+        controller.signal.addEventListener('abort',()=>sub.abort(controller.signal.reason),{once:true});
+        controllers.set(subtask.id,sub);
+      }
+      const writers=tasks.filter(subtask=>!subtask.readOnly);
+      const isolated=run.isolation?.kind==='worktree'&&Object.keys(run.isolation.roots||{}).length>0;
+      let watcher=null;
+      // Live supervision only makes sense when several writers share isolated copies to step on each other's toes.
+      if(isolated&&writers.length>1){
+        const roots=new Map(writers.map(subtask=>[subtask.index,run.isolation.roots[subtask.index]]));
+        watcher=new Watcher({roots,subtasks:writers,onEvents:events=>{
+          supervision.chain=supervision.chain.then(()=>superviseWave(run,events,writers,controllers,controller,supervision));
+        }});
+        watcher.start();
+      }
+      await Promise.allSettled(tasks.map(subtask=>runSubtask(run,subtask,controllers.get(subtask.id))));
+      watcher?.stop();
+      await supervision.chain.catch(()=>{});
     }
     if(controller.signal.aborted)throw new Error('Tarea detenida.');
     await reviewPhase(run,controller);
@@ -364,7 +428,7 @@ function startRun(body){
   const chosen=modelChoice(provider,body.orchestrator?.model,body.orchestrator?.effort);
   if(conv.title==='Nueva conversación')conv.title=prompt.slice(0,70);
   conv.updatedAt=now();
-  const run={id:id(),conversationId:conv.id,prompt,orchestrator:{provider,...chosen},
+  const run={id:id(),conversationId:conv.id,prompt,orchestrator:{provider,...chosen,sessionId:null},
     readOnly:body.readOnly!==false,phase:'plan',status:'planning',stage:'Planificando',createdAt:now(),
     plan:{status:'pending',summary:'',warnings:[]},isolation:null,subtasks:[],waves:[],review:null,events:[]};
   message(conv.id,'user',prompt,{runId:run.id});store.data.runs.push(run);
@@ -400,8 +464,15 @@ const server=http.createServer(async(req,res)=>{
         void syncMemory();return json(res,202,{ok:true});
       }
       if(route==='/api/projects'&&req.method==='POST'){
-        const p={id:id(),name:str(b.name,'Nombre',80),path:folder(b.path),description:str(b.description||'','Descripción',2000,true),createdAt:now()};
-        store.data.projects.push(p);flush();return json(res,201,p);
+        let directoryName=b.directoryName;
+        if(!directoryName&&b.path){
+          const supplied=folder(b.path),managed=managedProjectPath(managedProjectsRoot,path.basename(supplied));
+          if(!sameFolder(supplied,managed))throw new Error('La carpeta del proyecto debe estar dentro de la carpeta de proyectos gestionada.');
+          directoryName=path.basename(managed);
+        }
+        const p=createManagedProject(store.data,managedProjectsRoot,{name:str(b.name,'Nombre',80),directoryName,
+          description:str(b.description||'','Descripción',2000,true)});
+        flush();return json(res,201,p);
       }
       if(route==='/api/conversations'&&req.method==='POST'){
         store.project(b.projectId);const c={id:id(),projectId:b.projectId,title:'Nueva conversación',sessions:{},createdAt:now(),updatedAt:now()};store.data.conversations.push(c);flush();return json(res,201,c);
@@ -418,6 +489,10 @@ const server=http.createServer(async(req,res)=>{
       }
       if(route==='/api/settings'&&req.method==='POST'){
         for(const provider of ['codex','claude'])if(b[provider+'Instructions']!==undefined)store.data.settings[provider+'Instructions']=str(b[provider+'Instructions'],'Instrucciones',8000,true);
+        if(b.orchestratorPersona!==undefined){
+          const persona=str(b.orchestratorPersona,'Persona',80,true);
+          store.data.settings.orchestratorPersona=listPersonas().some(item=>item.id===persona)?persona:'';
+        }
         flush();return json(res,200,{ok:true});
       }
       if(route==='/api/shutdown'&&req.method==='POST'){json(res,200,{ok:true});stop();return;}

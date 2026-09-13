@@ -3,7 +3,7 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const names={codex:'Codex',claude:'Claude Code'};
 const symbols={codex:'✳',claude:'✺'};
 const effortNames={low:'Ligero',medium:'Equilibrado',high:'Alto',xhigh:'Muy alto',max:'Máximo',ultra:'Ultra'};
-const stageNames={queued:'En espera',running:'Trabajando',waiting:'Esperando tu respuesta',completed:'Completado',error:'Sin completar',cancelled:'Detenido',interrupted:'Interrumpido'};
+const stageNames={queued:'En espera',running:'Trabajando',waiting:'Esperando tu respuesta',completed:'Completado',error:'Sin completar',cancelled:'Detenido',stopped:'Detenida por el arquitecto',interrupted:'Interrumpido'};
 let state,projectId,conversationId,orchestrator='codex',busy=false,lastMessages='',lastAgents='',lastMemory='',lastRun='',toastTimer;
 let planChoices={},initRepo=false;
 let preferences;try{preferences=JSON.parse(localStorage.getItem('mixto-preferences')||'{}');}catch{preferences={};}
@@ -85,15 +85,6 @@ function renderAgents(){
     const levels=effortLevels(p,selections[p]);
     if(!levels.includes(efforts[p]))efforts[p]=defaultEffort(p,selections[p])||'';
   }
-  const other=orchestrator==='codex'?'claude':'codex';
-  const connection=p=>{const c=state.connections[p];return `<span class="status-dot ${c.loading?'loading':c.connected?'':'off'}" title="${c.loading?'Conectando':c.connected?'Conectado':'Desconectado'}"></span>`;}
-  const c=state.connections[orchestrator],levels=effortLevels(orchestrator,selections[orchestrator]);
-  $('#agent-cards').innerHTML=`<div class="agent-card"><div class="agent-header"><span class="agent-avatar ${orchestrator}">${symbols[orchestrator]}</span><span class="agent-name">${names[orchestrator]}</span>${connection(orchestrator)}</div>
-  <div class="agent-meta">Orquesta: reparte el trabajo y revisa el resultado. ${c.loading?'Consultando modelos…':c.connected?esc(c.plan||'Sesión conectada'):'Pendiente de conexión'}</div>
-  <select data-model="${orchestrator}" aria-label="Modelo del orquestador">${modelOptions(orchestrator,selections[orchestrator])}<option value="__custom__">Otro identificador…</option></select>
-  ${levels.length?`<label class="effort-row">Razonamiento<select data-effort="${orchestrator}" aria-label="Razonamiento del orquestador">${effortOptions(orchestrator,selections[orchestrator],efforts[orchestrator])}</select></label>`:''}</div>
-  <div class="agent-card"><div class="agent-header"><span class="agent-avatar ${other}">${symbols[other]}</span><span class="agent-name">${names[other]}</span>${connection(other)}</div>
-  <div class="agent-meta">Disponible para las sub-tareas que le asigne el orquestador. ${state.connections[other].connected?`${catalogOf(other).length} modelos`:'Pendiente de conexión'}</div></div>`;
   remember();
 }
 
@@ -157,8 +148,6 @@ function renderMemory(){
   if($('#memory-sync-status'))$('#memory-sync-status').textContent=label+(sync.error?' · '+sync.error:'');
   const memories=scopedMemories();const key=JSON.stringify(memories);if(key===lastMemory)return;lastMemory=key;
   $('#memory-count').textContent=memories.length;
-  const previews=[...memories.filter(m=>!m.automatic).reverse(),...memories.filter(m=>m.automatic).reverse()].slice(0,3);
-  $('#memory-preview').innerHTML=previews.length?previews.map(m=>`<div class="memory-mini"><strong>${esc(m.title)}</strong><p>${esc(m.content)}</p></div>`).join(''):'<div class="memory-empty">Todavía no hay recuerdos.<br>Añade una preferencia o empieza una conversación.</div>';
 }
 function render(){
   if(!state.projects.some(p=>p.id===projectId))projectId=state.projects[0]?.id;
@@ -175,7 +164,6 @@ function render(){
 function updateOrchestrator(){
   const text=`${names[orchestrator]} estudia la tarea, reparte el trabajo entre los agentes que haga falta y revisa el resultado. Tú apruebas el plan antes de empezar.`;
   $('#mode-hint').textContent=`${names[orchestrator]} orquesta: verás el plan antes de que empiece nadie.`;
-  $('#flow-explanation').textContent=text;
   $('#orchestrator-symbol').textContent=symbols[orchestrator];
   const select=$('#orchestrator');if(select.value!==orchestrator)select.value=orchestrator;
 }
@@ -211,22 +199,11 @@ $('#run-status').onclick=async e=>{
     toast(result.conflicts?.length?'No se pudo integrar: sigue habiendo conflictos.':'Cambios integrados en tu carpeta.'));
   if(e.target.id==='integrate-discard')await act('integrate',{runId:run.id,discard:true},()=>toast('Copias de trabajo descartadas.'));
 };
-$('#memory-toggle').onclick=()=>{if(matchMedia('(min-width:951px)').matches)memoryList();else $('#context-panel').classList.toggle('revealed');};
-$('#context-close').onclick=()=>$('#context-panel').classList.remove('revealed');
-
-$('#agent-cards').onchange=e=>{
-  if(e.target.dataset.effort){efforts[e.target.dataset.effort]=e.target.value;remember();return;}
-  const p=e.target.dataset.model;if(!p)return;
-  if(e.target.value==='__custom__'){
-    openModal('Elegir otro modelo',`<form id="custom-model"><p class="modal-note">Escribe un identificador que admita tu cuenta. Mixto lo enviará al proveedor; la disponibilidad se comprobará al utilizarlo.</p><label class="form-field"><span>Identificador de ${names[p]}</span><input id="custom-model-value" required maxlength="200" placeholder="Identificador del modelo"></label><div class="form-footer"><button class="primary-button">Usar modelo</button></div></form>`);
-    $('#custom-model').onsubmit=event=>{event.preventDefault();selections[p]=$('#custom-model-value').value.trim();efforts[p]='';closeModal();lastAgents='';renderAgents();};
-  }else{selections[p]=e.target.value;lastAgents='';renderAgents();}
-};
-
 $('#composer').onsubmit=async e=>{
   e.preventDefault();if(busy||activeRun())return;
   const input=$('#prompt'),prompt=input.value.trim();if(!prompt)return;
-  if(!selections[orchestrator]){toast(`Elige el modelo de ${names[orchestrator]} en el panel de tu equipo.`);return;}
+  if(!projectId){toast('Crea o añade un proyecto antes de empezar.');return;}
+  if(!selections[orchestrator]){toast(`Conecta ${names[orchestrator]} desde Agentes antes de empezar.`);return;}
   busy=true;$('#send').disabled=true;
   try{
     if(!conversationId){const c=await api('conversations',{projectId});conversationId=c.id;}
@@ -257,15 +234,16 @@ $('#messages').onclick=async e=>{
 };
 
 $('#new-project').onclick=()=>{
-  openModal('Añadir un proyecto',`<form id="project-form"><label class="form-field"><span>Nombre</span><input name="name" required maxlength="80" placeholder="Mi próximo proyecto" autofocus></label><label class="form-field"><span>Carpeta del proyecto</span><input name="path" required placeholder="C:\\Users\\Usuario\\Desktop\\mi-proyecto"><small>Usa una carpeta existente de tu ordenador. Ambos agentes trabajarán en ella.</small></label><label class="form-field"><span>Descripción (opcional)</span><textarea name="description" rows="2" maxlength="2000"></textarea></label><div class="form-footer"><button class="primary-button">Crear proyecto</button></div></form>`);
+  const managed=state.app.projectsRoot;
+  if(!managed.available){openModal('Carpeta de proyectos no disponible',`<p class="modal-note">Crea esta carpeta fuera del repositorio de Mixto y vuelve a abrir la aplicación:</p><p><code>${esc(managed.path)}</code></p><p class="modal-note">Mixto detectará automáticamente cada carpeta de proyecto que haya dentro.</p>`);return;}
+  openModal('Crear proyecto',`<form id="project-form"><label class="form-field"><span>Nombre</span><input name="name" required maxlength="80" placeholder="Paper shop POS" autofocus></label><label class="form-field"><span>Nombre de carpeta</span><input name="directoryName" required maxlength="80" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="tpv-papeleria"><small>Se creará dentro de ${esc(managed.path)}. Las carpetas que ya existan ahí se detectan automáticamente.</small></label><label class="form-field"><span>Descripción (opcional)</span><textarea name="description" rows="2" maxlength="2000"></textarea></label><div class="form-footer"><button class="primary-button">Crear proyecto</button></div></form>`);
   $('#project-form').onsubmit=async e=>{e.preventDefault();try{const p=await api('projects',Object.fromEntries(new FormData(e.target)));projectId=p.id;conversationId=null;closeModal();await load();toast('Proyecto añadido.');}catch(error){toast(error.message);}};
 };
 
 function memoryForm(existing={}){
-  openModal(existing.id?'Editar recuerdo':'Añadir un recuerdo',`<form id="memory-form"><label class="form-field"><span>Título</span><input name="title" required maxlength="100" value="${esc(existing.title||'')}" placeholder="Una preferencia, una decisión…"></label><label class="form-field"><span>Qué deben recordar los dos agentes</span><textarea name="content" required rows="7" maxlength="12000" placeholder="Por ejemplo: este proyecto usa TypeScript y prefiero explicaciones breves.">${esc(existing.content||'')}</textarea></label>${!existing.id?`<label class="form-field"><span>Disponible en</span><select name="scope"><option value="project">${esc(project().name)}</option><option value="global">Todos mis proyectos</option></select></label>`:''}<div class="form-footer"><button class="primary-button">Guardar recuerdo</button></div></form>`);
+  openModal(existing.id?'Editar recuerdo':'Añadir un recuerdo',`<form id="memory-form"><label class="form-field"><span>Título</span><input name="title" required maxlength="100" value="${esc(existing.title||'')}" placeholder="Una preferencia, una decisión…"></label><label class="form-field"><span>Qué deben recordar los dos agentes</span><textarea name="content" required rows="7" maxlength="12000" placeholder="Por ejemplo: este proyecto usa TypeScript y prefiero explicaciones breves.">${esc(existing.content||'')}</textarea></label>${!existing.id?`<label class="form-field"><span>Disponible en</span><select name="scope">${project()?`<option value="project">${esc(project().name)}</option>`:''}<option value="global">Todos mis proyectos</option></select></label>`:''}<div class="form-footer"><button class="primary-button">Guardar recuerdo</button></div></form>`);
   $('#memory-form').onsubmit=async e=>{e.preventDefault();const values=Object.fromEntries(new FormData(e.target));try{if(existing.id)await api('memories/'+existing.id,values,'PATCH');else await api('memories',{...values,projectId:values.scope==='global'?null:projectId});closeModal();await load();toast('Recuerdo guardado para los dos agentes.');}catch(error){toast(error.message);}};
 }
-$('#add-memory').onclick=()=>memoryForm();
 function memoryList(){
   openModal('Memoria compartida',`<p class="modal-note">Los recuerdos que guardas tienen prioridad. Los registros de trabajo se guardan automáticamente y se recuperan por relevancia y fecha. El historial completo permanece en tus conversaciones.</p><div class="memory-toolbar"><input id="memory-search" placeholder="Buscar en la memoria" aria-label="Buscar en la memoria"><button class="primary-button" id="memory-create">＋ Recuerdo</button></div><div id="memory-records"></div><div class="form-footer"><a href="/api/export" download="mixto-copia.json" class="text-button">Descargar copia de mis datos ↗</a></div>`,'memory');
   const status=document.createElement('p');status.id='memory-sync-status';status.className='modal-note';status.setAttribute('role','status');
@@ -289,9 +267,14 @@ function memoryList(){
     if(b.dataset.memoryDelete){try{await api('memories/'+b.dataset.memoryDelete,{},'DELETE');await load();draw();toast('Recuerdo eliminado.');}catch(error){toast(error.message);}}
   };
 }
-$('#open-memory').onclick=memoryList;$('#all-memory').onclick=memoryList;
+$('#open-memory').onclick=memoryList;
 function connectionsModal(){
-  openModal('Conexiones y agentes',`<p class="modal-note">Mixto utiliza las sesiones de tus aplicaciones instaladas. Los límites y el acceso a modelos dependen de cada cuenta.</p>${['codex','claude'].map(p=>{const c=state.connections[p];return `<section class="connection-card"><h3><span class="agent-avatar ${p}">${symbols[p]}</span> ${names[p]}</h3><p>${c.loading?'Consultando conexión…':c.connected?'Conectado · '+esc(c.plan||c.authType):'Sin conexión'}</p>${c.error?`<div class="message-error">${esc(c.error)}</div>`:''}${!c.connected?`<p>Abre una terminal e inicia sesión con <code>${p==='codex'?'codex login':'claude auth login'}</code>. Después pulsa Actualizar.</p>`:''}<details><summary>${c.models.length} modelos detectados · ver catálogo</summary><ul>${c.models.map(m=>`<li><strong>${esc(m.name)}</strong> · ${esc(m.resolved||m.id)}${m.hidden?' (oculto en el selector oficial)':''}</li>`).join('')}</ul></details></section>`;}).join('')}<form id="agent-settings">${['codex','claude'].map(p=>`<label class="form-field"><span>Preferencias para ${names[p]}</span><textarea name="${p}Instructions" rows="3" maxlength="8000" placeholder="Cómo quieres que trabaje este agente…">${esc(state.settings[p+'Instructions'])}</textarea></label>`).join('')}<div class="form-footer"><button type="button" class="secondary-button" id="refresh-connections">Actualizar conexiones</button><button class="primary-button">Guardar preferencias</button></div></form>`,'connections');
+  openModal('Agentes',`<p class="modal-note">Mixto usa las sesiones de las herramientas instaladas. Aquí solo configuras lo necesario para orquestar.</p>${['codex','claude'].map(p=>{const c=state.connections[p],levels=effortLevels(p,selections[p]);return `<section class="connection-card"><h3><span class="agent-avatar ${p}">${symbols[p]}</span> ${names[p]}</h3><p>${c.loading?'Consultando conexión…':c.connected?'Conectado · '+esc(c.plan||c.authType):'Sin conexión'}</p>${c.error?`<div class="message-error">${esc(c.error)}</div>`:''}${!c.connected?`<p>Inicia sesión con <code>${p==='codex'?'codex login':'claude auth login'}</code> y pulsa Actualizar.</p>`:''}${c.models.length?`<label class="form-field compact-field"><span>Modelo predeterminado</span><select data-agent-model="${p}">${modelOptions(p,selections[p])}</select></label>${levels.length?`<label class="form-field compact-field"><span>Razonamiento</span><select data-agent-effort="${p}">${effortOptions(p,selections[p],efforts[p])}</select></label>`:''}`:''}</section>`;}).join('')}<form id="agent-settings"><label class="form-field"><span>Persona del arquitecto</span><select name="orchestratorPersona"><option value="">Sin persona</option>${state.personas.map(p=>`<option value="${esc(p.id)}" ${p.id===state.settings.orchestratorPersona?'selected':''}>${esc(p.name)}</option>`).join('')}</select></label>${['codex','claude'].map(p=>`<label class="form-field"><span>Preferencias para ${names[p]}</span><textarea name="${p}Instructions" rows="3" maxlength="8000" placeholder="Cómo quieres que trabaje este agente…">${esc(state.settings[p+'Instructions'])}</textarea></label>`).join('')}<div class="form-footer"><button type="button" class="secondary-button" id="refresh-connections">Actualizar</button><button class="primary-button">Guardar</button></div></form>`,'connections');
+  $('#modal-content').onchange=e=>{
+    const model=e.target.dataset.agentModel,effort=e.target.dataset.agentEffort;
+    if(model){selections[model]=e.target.value;efforts[model]=defaultEffort(model,e.target.value)||'';lastAgents='';renderAgents();connectionsModal();}
+    if(effort){efforts[effort]=e.target.value;remember();}
+  };
   $('#agent-settings').onsubmit=async e=>{e.preventDefault();try{await api('settings',Object.fromEntries(new FormData(e.target)));await load();toast('Preferencias guardadas.');}catch(error){toast(error.message);}};
   $('#refresh-connections').onclick=async()=>{
     const button=$('#refresh-connections');button.disabled=true;button.textContent='Consultando…';
@@ -303,6 +286,6 @@ document.addEventListener('keydown',e=>{if(e.key.toLowerCase()==='n'&&!e.ctrlKey
 
 const webContext=document.modelContext;
 if(webContext?.registerTool){
-  try{Promise.resolve(webContext.registerTool({name:'read_mixto_project_memory',title:'Consultar memoria de Mixto',description:'Lee los recuerdos guardados del proyecto seleccionado en Mixto. No ejecuta agentes ni modifica datos.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true,untrustedContentHint:true},execute:input=>{if(!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).length)throw new Error('No se admiten parámetros.');if(!state)throw new Error('Mixto aún está cargando.');return {project:project().name,memories:scopedMemories().map(m=>({title:m.title,content:m.content,automatic:m.automatic}))};}})).catch(()=>{});}catch{}
+  try{Promise.resolve(webContext.registerTool({name:'read_mixto_project_memory',title:'Consultar memoria de Mixto',description:'Lee los recuerdos guardados del proyecto seleccionado en Mixto. No ejecuta agentes ni modifica datos.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true,untrustedContentHint:true},execute:input=>{if(!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).length)throw new Error('No se admiten parámetros.');if(!state)throw new Error('Mixto aún está cargando.');if(!project())throw new Error('No hay ningún proyecto seleccionado.');return {project:project().name,memories:scopedMemories().map(m=>({title:m.title,content:m.content,automatic:m.automatic}))};}})).catch(()=>{});}catch{}
 }
 load();setInterval(()=>{if(!document.hidden)load();},1200);document.addEventListener('visibilitychange',()=>{if(!document.hidden)load();});

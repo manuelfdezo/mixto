@@ -16,20 +16,31 @@ const MODELS={codex:[{model:'codex-fake',displayName:'Codex de prueba',isDefault
     {value:'claude-fake-rapido',displayName:'Claude de prueba rápido',supportedEffortLevels:['low','medium']}]};
 
 // Scripted answers for an orchestrated run: the plan, then each sub-task, then the review.
+const scenario=process.env.FAKE_AGENT_SCENARIO||'base';
 const PLAN='```json\n'+JSON.stringify({resumen:'Dos frentes en paralelo',subtareas:[
   {titulo:'Frente uno',proveedor:'claude',modelo:'claude-fake',esfuerzo:'medium',justificacion:'trabajo mecánico',
     rol:'Escribir uno.txt',instrucciones:'ARCHIVO:uno.txt',alcance:['uno.txt'],soloLectura:false,orden:1},
   {titulo:'Frente dos',proveedor:'claude',modelo:'claude-fake',esfuerzo:'medium',justificacion:'trabajo mecánico',
     rol:'Escribir dos.txt',instrucciones:'ARCHIVO:dos.txt',alcance:['dos.txt'],soloLectura:false,orden:2}]})+'\n```';
+// Both sub-tasks deliberately write the same relative path from their own isolated worktree, so the
+// supervisor sees a collision even though nothing on disk actually overlaps yet.
+const PLAN_COLISION='```json\n'+JSON.stringify({resumen:'Dos frentes que chocan a propósito',subtareas:[
+  {titulo:'Frente colisión uno',proveedor:'claude',modelo:'claude-fake',esfuerzo:'medium',justificacion:'trabajo mecánico',
+    rol:'Escribir compartido.txt',instrucciones:'ARCHIVO:compartido.txt',alcance:['compartido.txt'],soloLectura:false,orden:1},
+  {titulo:'Frente colisión dos',proveedor:'claude',modelo:'claude-fake',esfuerzo:'medium',justificacion:'trabajo mecánico',
+    rol:'Escribir compartido.txt',instrucciones:'ARCHIVO:compartido.txt',alcance:['compartido.txt'],soloLectura:false,orden:2}]})+'\n```';
+const SUPERVISION_DETENER='```json\n'+JSON.stringify({accion:'detener',subtarea:1,motivo:'Las dos sub-tareas tocan compartido.txt'})+'\n```';
 
 function scripted(text){
-  if(text.includes('AGENTES Y MODELOS DISPONIBLES'))return PLAN;
+  if(text.includes('AGENTES Y MODELOS DISPONIBLES'))return scenario==='colision'?PLAN_COLISION:PLAN;
+  if(text.includes('"accion":"seguir"'))return scenario==='colision'?SUPERVISION_DETENER:'```json\n{"accion":"seguir"}\n```';
   if(text.includes('VEREDICTO'))return 'Sin duplicados ni contradicciones.\n\nVEREDICTO: INTEGRAR';
   const file=/ARCHIVO:([\w.-]+)/.exec(text);
   if(file){
-    // Deliberately slow: the test measures whether sub-tasks really overlap in time.
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,Number(process.env.FAKE_AGENT_DELAY||600));
+    // Written up front, then a slow "thinking" pause: this leaves a real window where the file is
+    // visible on disk before the sub-task reports back, which is what the live supervisor polls for.
     fs.writeFileSync(file[1],`escrito por la sub-tarea ${file[1]}\n`);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,Number(process.env.FAKE_AGENT_DELAY||600));
     return `Escribí ${file[1]}`;
   }
   return null;
