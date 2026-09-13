@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
-import {inspect,createWorkspaces,capturePatch,checkPatches,applyPatches,removeWorkspaces,cleanupOrphanWorkspaces} from '../lib/isolation.mjs';
+import {inspect,initRepository,createWorkspaces,capturePatch,checkPatches,applyPatches,removeWorkspaces,cleanupOrphanWorkspaces,ignoredPaths,isIgnored} from '../lib/isolation.mjs';
 
 const git=(cwd,...args)=>execFileSync('git',['-C',cwd,...args],{windowsHide:true,encoding:'utf8'});
 const read=file=>fs.readFileSync(file,'utf8');
@@ -119,4 +119,63 @@ test('cleanupOrphanWorkspaces limpia copias que quedaron de un cierre forzado',a
   await cleanupOrphanWorkspaces({dataDir:data,projectPaths:[work]});
   assert.doesNotMatch(git(work,'worktree','list'),/run-huerfano/);
   assert.equal(fs.existsSync(path.join(data,'wt')),false);
+});
+
+test('initRepository inicializa una carpeta vacía y deja un HEAD resoluble',async t=>{
+  const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'mixto-iso-vacia-')));
+  t.after(()=>{try{fs.rmSync(dir,{recursive:true,force:true});}catch{}});
+  await initRepository(dir);
+  assert.equal(inspect(dir).kind,'worktree');
+  assert.doesNotThrow(()=>git(dir,'rev-parse','HEAD'));
+});
+
+test('isIgnored: reconoce .atl, su contenido, mayúsculas y backslash de Windows',()=>{
+  assert.equal(isIgnored('.atl'),true);
+  assert.equal(isIgnored('.atl/skill-registry.md'),true);
+  assert.equal(isIgnored('.atl/sub/cache.json'),true);
+  assert.equal(isIgnored('.ATL/Cache.JSON'),true);
+  assert.equal(isIgnored('.atl\\skill-registry.md'),true);
+  assert.equal(isIgnored('real.txt'),false);
+  assert.equal(isIgnored('src/.atlantico/archivo.js'),false,'un prefijo parecido no cuenta como .atl');
+});
+
+test('isIgnored: MIXTO_PATCH_EXCLUDE suma rutas adicionales separadas por comas',()=>{
+  const previous=process.env.MIXTO_PATCH_EXCLUDE;
+  process.env.MIXTO_PATCH_EXCLUDE='.cache, tmp/scratch ,,';
+  try {
+    assert.deepEqual(ignoredPaths(),['.atl','.cache','tmp/scratch']);
+    assert.equal(isIgnored('.cache/archivo.json'),true);
+    assert.equal(isIgnored('tmp/scratch/x.txt'),true);
+    assert.equal(isIgnored('.atl/x.txt'),true,'la lista por defecto se conserva');
+  } finally {
+    if(previous===undefined)delete process.env.MIXTO_PATCH_EXCLUDE;
+    else process.env.MIXTO_PATCH_EXCLUDE=previous;
+  }
+});
+
+test('capturePatch excluye el ruido de .atl y conserva solo el trabajo real',async t=>{
+  const {work,data}=repo(t);
+  const spaces=await createWorkspaces({projectPath:work,dataDir:data,runId:'run-atl-mixto',indexes:[0]});
+  const root=spaces.cwds.get(0);
+  fs.mkdirSync(path.join(root,'.atl'),{recursive:true});
+  fs.writeFileSync(path.join(root,'.atl','.skill-registry.cache.json'),'{}');
+  fs.writeFileSync(path.join(root,'.atl','skill-registry.md'),'# registro\n');
+  fs.writeFileSync(path.join(root,'real.txt'),'trabajo real\n');
+  const patch=await capturePatch({worktreeRoot:spaces.roots.get(0),patchPath:path.join(data,'atl-mixto.patch')});
+  assert.ok(patch,'hay trabajo real, así que se captura un parche');
+  assert.equal(patch.files,1);
+  const content=read(patch.file);
+  assert.match(content,/real\.txt/);
+  assert.doesNotMatch(content,/\.atl/);
+  await removeWorkspaces({projectPath:work,dataDir:data,runId:'run-atl-mixto'});
+});
+
+test('capturePatch devuelve null cuando lo único que cambió es ruido de .atl',async t=>{
+  const {work,data}=repo(t);
+  const spaces=await createWorkspaces({projectPath:work,dataDir:data,runId:'run-atl-solo',indexes:[0]});
+  const root=spaces.cwds.get(0);
+  fs.mkdirSync(path.join(root,'.atl'),{recursive:true});
+  fs.writeFileSync(path.join(root,'.atl','.skill-registry.cache.json'),'{}');
+  assert.equal(await capturePatch({worktreeRoot:spaces.roots.get(0),patchPath:path.join(data,'atl-solo.patch')}),null);
+  await removeWorkspaces({projectPath:work,dataDir:data,runId:'run-atl-solo'});
 });
