@@ -3,7 +3,14 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const names={codex:'Codex',claude:'Claude Code'};
 const symbols={codex:'✳',claude:'✺'};
 const effortNames={low:'Ligero',medium:'Equilibrado',high:'Alto',xhigh:'Muy alto',max:'Máximo',ultra:'Ultra'};
-const stageNames={queued:'En espera',running:'Trabajando',waiting:'Esperando tu respuesta',completed:'Completado',error:'Sin completar',cancelled:'Detenido',stopped:'Detenida por el arquitecto',interrupted:'Interrumpido'};
+const stageNames={queued:'En espera',running:'Trabajando',waiting:'Esperando tu respuesta',completed:'Completado',error:'Sin completar',cancelled:'Detenido',stopped:'Detenida por el arquitecto',interrupted:'Interrumpido',pendiente:'Pendiente','en-curso':'En curso',hecha:'Hecha'};
+// Personas reales del equipo: se les asignan sub-tareas que Mixto no ejecuta; tú anotas su estado.
+const HUMAN='persona';
+const humanStatuses=[['pendiente','Pendiente'],['en-curso','En curso'],['hecha','Hecha']];
+const peopleOf=p=>state?state.people.filter(person=>(p?.members||[]).includes(person.id)):[];
+const personName=s=>state?.people.find(p=>p.id===s.personId)?.name||s.personName||'persona';
+const assigneeLabel=s=>s.human?`${personName(s)} · persona`:`${names[s.provider]} ${s.model}`;
+const avatar=s=>s.human?'<span class="agent-avatar human" title="Persona del equipo">👤</span>':`<span class="agent-avatar ${s.provider}">${symbols[s.provider]}</span>`;
 const fmtTokens=n=>n>=1e6?(n/1e6).toFixed(1).replace('.',',')+' M':n>=1000?(n/1000).toFixed(1).replace('.',',')+' k':String(n);
 const fmtCost=c=>c?(Math.round(c*1000)/1000).toString().replace('.',',')+' $':'';
 const usageText=u=>u?.total?`${fmtTokens(u.total)} tokens${u.costUsd?' · '+fmtCost(u.costUsd):''}`:'';
@@ -113,15 +120,25 @@ function renderAgents(){
 }
 
 // Cada fila del plan se puede reasignar al otro agente, cambiar de modelo o limitar a solo lectura.
+// Opciones de asignación: los agentes conectados y las personas del equipo del proyecto.
+function assigneeOptions(selectedProvider,selectedPersonId,keepProvider){
+  const providers=['codex','claude'].filter(p=>p===keepProvider||state.connections[p]?.connected);
+  const people=peopleOf(project());
+  return providers.map(p=>`<option value="${p}" ${p===selectedProvider?'selected':''}>${names[p]}</option>`).join('')
+    +(people.length?`<optgroup label="Personas del equipo">${people.map(person=>`<option value="persona:${esc(person.id)}" ${selectedProvider===HUMAN&&person.id===selectedPersonId?'selected':''}>${esc(person.name)}${person.role?` · ${esc(person.role)}`:''}</option>`).join('')}</optgroup>`:'')
+    +(selectedProvider===HUMAN&&!people.some(person=>person.id===selectedPersonId)?`<option value="persona:${esc(selectedPersonId||'')}" selected>${esc(selectedPersonId?'persona fuera del equipo':'persona')}</option>`:'');
+}
 function planRowHtml(subtask,run){
   const provider=subtaskProvider(subtask),model=subtaskModel(subtask),levels=effortLevels(provider,model);
-  const readOnly=subtask.readOnly||planChoices[subtask.id]?.readOnly===true,moved=provider!==subtask.provider;
-  const providers=['codex','claude'].filter(p=>p===provider||state.connections[p]?.connected);
-  return `<div class="plan-row"><div class="plan-row-head"><span class="agent-avatar ${provider}">${symbols[provider]}</span><strong>${esc(subtask.title)}</strong>${readOnly?'<span class="pill">solo lectura</span>':''}${moved?'<span class="pill">reasignada</span>':''}</div>
+  const human=provider===HUMAN,personId=planChoices[subtask.id]?.personId??subtask.personId;
+  const readOnly=!human&&(subtask.readOnly||planChoices[subtask.id]?.readOnly===true);
+  const moved=provider!==subtask.provider||(human&&personId!==subtask.personId);
+  const shown=human?{human:true,personId,personName:state.people.find(p=>p.id===personId)?.name||subtask.personName}:{provider};
+  return `<div class="plan-row"><div class="plan-row-head">${avatar(shown)}<strong>${esc(subtask.title)}</strong>${readOnly?'<span class="pill">solo lectura</span>':''}${moved?'<span class="pill">reasignada</span>':''}${human?'<span class="pill">persona: Mixto no la ejecuta</span>':''}</div>
   <div class="metadata">${esc(subtask.role)}${subtask.scope?.length?` · ${esc(subtask.scope.join(', '))}`:''}</div>
   ${subtask.justification?`<div class="metadata">${esc(subtask.justification)}</div>`:''}
-  <div class="plan-row-controls"><select data-plan-provider="${esc(subtask.id)}" aria-label="Agente de ${esc(subtask.title)}">${providers.map(p=>`<option value="${p}" ${p===provider?'selected':''}>${names[p]}</option>`).join('')}</select><select data-plan-model="${esc(subtask.id)}" aria-label="Modelo de ${esc(subtask.title)}">${modelOptions(provider,model)}</select>
-  ${levels.length?`<select data-plan-effort="${esc(subtask.id)}" aria-label="Razonamiento de ${esc(subtask.title)}">${effortOptions(provider,model,subtaskEffort(subtask))}</select>`:''}${!subtask.readOnly&&!run?.readOnly?`<label class="readonly-control"><input type="checkbox" data-plan-readonly="${esc(subtask.id)}" ${readOnly?'checked':''}> Solo lectura</label>`:''}</div></div>`;
+  <div class="plan-row-controls"><select data-plan-provider="${esc(subtask.id)}" aria-label="Asignar ${esc(subtask.title)}">${assigneeOptions(provider,personId,subtask.provider)}</select>${human?'':`<select data-plan-model="${esc(subtask.id)}" aria-label="Modelo de ${esc(subtask.title)}">${modelOptions(provider,model)}</select>
+  ${levels.length?`<select data-plan-effort="${esc(subtask.id)}" aria-label="Razonamiento de ${esc(subtask.title)}">${effortOptions(provider,model,subtaskEffort(subtask))}</select>`:''}${!subtask.readOnly&&!run?.readOnly?`<label class="readonly-control"><input type="checkbox" data-plan-readonly="${esc(subtask.id)}" ${readOnly?'checked':''}> Solo lectura</label>`:''}`}</div></div>`;
 }
 
 function planHtml(run){
@@ -142,11 +159,52 @@ function planHtml(run){
 
 function teamHtml(run){
   const opened=new Set([...document.querySelectorAll('#run-status details[open]')].map(d=>d.dataset.subtask));
-  const done=run.subtasks.filter(s=>['completed','error','cancelled','stopped'].includes(s.status)).length;
-  return `<div class="plan-card"><div class="plan-head"><strong>${esc(run.stage||'Trabajando')}</strong><span>${run.usage?.total?`<span class="pill" title="Consumo acumulado de la tarea">${usageText(run.usage)}</span> `:''}${run.subtasks.length?`<span class="pill">${done}/${run.subtasks.length}</span>`:''}</span></div>
-  ${run.subtasks.length?run.subtasks.map(s=>`<details data-subtask="${esc(s.id)}" ${opened.has(s.id)?'open':''}><summary><span class="agent-avatar ${s.provider}">${symbols[s.provider]}</span> ${esc(s.title)} · ${esc(names[s.provider])} ${esc(s.model)} <span class="muted">· ${esc(stageNames[s.status]||s.stage||'')}</span>${s.usage?.total?`<span class="muted"> · ${fmtTokens(s.usage.total)}</span>`:''}</summary><div class="run-events">${s.events.map(e=>esc(e.text)).join('\n')||(s.status==='queued'?'En espera de su turno.':'Trabajando…')}</div>${s.error?`<div class="message-error">${esc(s.error)}</div>`:''}</details>`).join('')
+  const agents=run.subtasks.filter(s=>!s.human),humans=run.subtasks.filter(s=>s.human);
+  const done=agents.filter(s=>['completed','error','cancelled','stopped'].includes(s.status)).length;
+  return `<div class="plan-card"><div class="plan-head"><strong>${esc(run.stage||'Trabajando')}</strong><span>${run.usage?.total?`<span class="pill" title="Consumo acumulado de la tarea">${usageText(run.usage)}</span> `:''}${agents.length?`<span class="pill">${done}/${agents.length}</span>`:''}${humans.length?` <span class="pill">${humans.filter(h=>h.status==='hecha').length}/${humans.length} personas</span>`:''}</span></div>
+  ${run.subtasks.length?run.subtasks.map(s=>`<details data-subtask="${esc(s.id)}" ${opened.has(s.id)?'open':''}><summary>${avatar(s)} ${esc(s.title)} · ${esc(assigneeLabel(s))} <span class="muted">· ${esc(stageNames[s.status]||s.stage||'')}</span>${s.usage?.total?`<span class="muted"> · ${fmtTokens(s.usage.total)}</span>`:''}</summary>${s.human?humanControlsHtml(run,s):`<div class="run-events">${s.events.map(e=>esc(e.text)).join('\n')||(s.status==='queued'?'En espera de su turno.':'Trabajando…')}</div>`}${s.error?`<div class="message-error">${esc(s.error)}</div>`:''}</details>`).join('')
     :`<div class="run-events">${run.events.map(e=>esc(e.text)).join('\n')||'Conectando con la sesión local…'}</div>`}
   ${(run.isolation?.warnings||[]).map(w=>`<div class="metadata">⚠ ${esc(w)}</div>`).join('')}</div>`;
+}
+
+// Una parte asignada a una persona: estado, fecha límite y resultado los anota el usuario; el encargo se copia.
+function humanControlsHtml(run,s){
+  return `<div class="human-controls" data-human="${esc(s.id)}" data-run="${esc(run.id)}"><select data-human-status aria-label="Estado de ${esc(s.title)}">${humanStatuses.map(([v,l])=>`<option value="${v}" ${s.status===v?'selected':''}>${l}</option>`).join('')}</select><input type="date" data-human-due value="${esc(s.due||'')}" aria-label="Fecha límite"><input data-human-result placeholder="Resultado o enlace (PR, nota)" value="${esc(s.result||'')}" aria-label="Resultado"><button type="button" class="secondary-button" data-human-save>Guardar</button><button type="button" class="secondary-button" data-human-brief="${esc(s.id)}">Copiar encargo</button></div><div class="metadata">${esc(s.role)}${s.scope?.length?` · ${esc(s.scope.join(', '))}`:''}</div><p class="human-instructions">${inline(s.instructions||'')}</p>`;
+}
+function conversationOf(run){return state.conversations.find(c=>c.id===run.conversationId);}
+// Todas las partes asignadas a una persona en las tareas de este proyecto.
+function assignmentsOf(personId){
+  const convs=new Map(state.conversations.filter(c=>c.projectId===projectId).map(c=>[c.id,c]));
+  const items=[];
+  for(const run of state.runs)if(convs.has(run.conversationId))for(const subtask of run.subtasks||[])if(subtask.human&&subtask.personId===personId)items.push({run,subtask,conversation:convs.get(run.conversationId)});
+  return items;
+}
+function briefFor(person,items){
+  const lines=[`# Encargo para ${person.name}${project()?` · ${project().name}`:''}`,'',`Preparado con Mixto el ${new Date().toLocaleDateString('es')}.`,''];
+  for(const {run,subtask,conversation} of items){
+    lines.push(`## ${subtask.title}`,`Tarea: ${run.prompt.slice(0,300)}${conversation?` (conversación «${conversation.title}»)`:''}`,`Estado: ${stageNames[subtask.status]||subtask.status}${subtask.due?` · fecha límite ${subtask.due}`:''}`,`Rol: ${subtask.role}`,'',subtask.instructions||'','');
+    if(subtask.scope?.length)lines.push(`Archivos o rutas: ${subtask.scope.join(', ')}`,'');
+    if(run.plan?.context)lines.push('Contexto del proyecto según el arquitecto:',run.plan.context,'');
+  }
+  return lines.join('\n');
+}
+async function copyText(text,okMessage){try{await navigator.clipboard.writeText(text);toast(okMessage);}catch{toast('No se pudo copiar. Descárgalo o selecciona el texto.');}}
+function downloadText(name,text){const url=URL.createObjectURL(new Blob([text],{type:'text/markdown;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+function humanSubtaskById(runId,subtaskId){const run=state.runs.find(r=>r.id===runId);const subtask=run?.subtasks.find(s=>s.id===subtaskId);return run&&subtask?{run,subtask}:null;}
+// Guardar estado, fecha y resultado de una parte humana desde cualquier tarjeta que muestre sus controles.
+async function saveHuman(container){
+  const found=humanSubtaskById(container.dataset.run,container.dataset.human);if(!found)return false;
+  try{await api('subtask',{runId:found.run.id,subtaskId:found.subtask.id,status:container.querySelector('[data-human-status]').value,due:container.querySelector('[data-human-due]').value,result:container.querySelector('[data-human-result]').value});toast(`Anotado para ${personName(found.subtask)}.`);lastRun='';await load();return true;}
+  catch(error){toast(error.message);return false;}
+}
+function humansBlockHtml(run){
+  const humans=run.subtasks.filter(s=>s.human);
+  if(!humans.length)return '';
+  const done=humans.filter(h=>h.status==='hecha').length;
+  const canReview=run.mode!=='directo'&&state.connections[run.orchestrator.provider]?.connected;
+  return `<div class="plan-card"><div class="plan-head"><strong>Partes asignadas a personas</strong><span class="pill">${done}/${humans.length} hechas</span></div>
+  ${humans.map(s=>`<details data-subtask="${esc(s.id)}" ${s.status!=='hecha'?'open':''}><summary>${avatar(s)} ${esc(s.title)} · ${esc(personName(s))} <span class="muted">· ${esc(stageNames[s.status]||s.status)}</span></summary>${humanControlsHtml(run,s)}</details>`).join('')}
+  ${canReview?`<div class="approval-actions"><button type="button" class="secondary-button" id="review-again">Revisar de nuevo con ${esc(names[run.orchestrator.provider])}</button></div><p class="muted">Cuando las personas terminen, el revisor comprueba el conjunto en la carpeta del proyecto. Cuesta un turno.</p>`:''}</div>`;
 }
 
 // Corregir reanuda la sesión de esa sub-tarea con la revisión del arquitecto; no replanifica ni repite las demás.
@@ -160,9 +218,9 @@ function afterRunHtml(run){
   const integration=run.review?.integration,conflicts=integration?.conflicts||[];
   const pending=!!run.review&&run.subtasks.some(s=>s.patch)&&!integration?.applied?.length&&!integration?.discarded;
   const rejected=run.review?.status==='no-integrar';
-  const fixable=run.subtasks.some(s=>s.fixable);
-  if(!pending&&!rejected)return fixable?`<div class="after-run">${run.usage?.total?`<span class="pill" title="Consumo total de la tarea">${usageText(run.usage)} · ${run.usage.turns} turnos</span>`:''}${fixFormHtml(run,false)}</div>`:'';
-  return `<div class="plan-card"><div class="plan-head"><strong>${pending?'Cambios sin integrar':'El revisor no autorizó la integración'}</strong>${run.usage?.total?`<span class="pill" title="Consumo total de la tarea">${usageText(run.usage)} · ${run.usage.turns} turnos</span>`:''}</div>
+  const fixable=run.subtasks.some(s=>s.fixable),humansBlock=humansBlockHtml(run);
+  if(!pending&&!rejected)return humansBlock+(fixable?`<div class="after-run">${run.usage?.total?`<span class="pill" title="Consumo total de la tarea">${usageText(run.usage)} · ${run.usage.turns} turnos</span>`:''}${fixFormHtml(run,false)}</div>`:'');
+  return humansBlock+`<div class="plan-card"><div class="plan-head"><strong>${pending?'Cambios sin integrar':'El revisor no autorizó la integración'}</strong>${run.usage?.total?`<span class="pill" title="Consumo total de la tarea">${usageText(run.usage)} · ${run.usage.turns} turnos</span>`:''}</div>
   ${conflicts.map(c=>`<div class="metadata">${esc(c.file)}: ${esc(c.reason)}</div>`).join('')}
   ${pending?'<p class="muted">El trabajo de los agentes está guardado aparte; tu carpeta no se tocó.</p>':'<p class="muted">Los cambios ya están en tu carpeta; lee la revisión antes de darlos por buenos.</p>'}
   ${fixFormHtml(run,true)}
@@ -172,7 +230,7 @@ function afterRunHtml(run){
 function renderRun(){
   const run=activeRun()||lastRunOf(),status=$('#run-status');
   const signature=JSON.stringify([run?.id,run?.status,run?.stage,run?.plan,run?.isolation,run?.review?.status,run?.review?.integration,run?.error,run?.usage,
-    (run?.subtasks||[]).map(s=>[s.id,s.status,s.stage,s.model,s.effort,s.events.length,s.error,s.fixable,s.usage?.total]),run?.events.length,planChoices,initRepo]);
+    (run?.subtasks||[]).map(s=>[s.id,s.status,s.stage,s.model,s.effort,s.events.length,s.error,s.fixable,s.usage?.total,s.human,s.personId,s.result,s.due]),run?.events.length,planChoices,initRepo,state?.people?.map(p=>p.name)]);
   if(signature===lastRun)return;lastRun=signature;
   if(!run){status.hidden=true;status.innerHTML='';return;}
   if(run.status==='awaiting-plan'){status.hidden=false;status.innerHTML=planHtml(run);return;}
@@ -196,20 +254,22 @@ function defaultModel(provider){return (catalogOf(provider).find(m=>m.default)||
 function newManualRow(provider){const model=defaultModel(provider);return {title:'',provider,model,effort:defaultEffort(provider,model)||'',instructions:'',scope:'',readOnly:false};}
 function seedManualRows(){manualRows=[newManualRow('codex'),newManualRow('claude')];manualVersion++;}
 function manualRowHtml(row,i){
-  const levels=effortLevels(row.provider,row.model);
-  return `<div class="manual-row" data-row="${i}"><div class="manual-row-head"><span class="agent-avatar ${row.provider}">${symbols[row.provider]}</span><input data-field="title" placeholder="Sub-tarea ${i+1}: título" maxlength="120" value="${esc(row.title||'')}" aria-label="Título de la sub-tarea ${i+1}"><button type="button" class="icon-button" data-remove="${i}" aria-label="Quitar sub-tarea ${i+1}">×</button></div>
-  <div class="manual-row-grid"><select data-field="provider" aria-label="Agente">${['codex','claude'].map(p=>`<option value="${p}" ${p===row.provider?'selected':''}>${names[p]}${state?.connections[p]?.connected?'':' · sin conexión'}</option>`).join('')}</select><select data-field="model" aria-label="Modelo">${modelOptions(row.provider,row.model)}</select>${levels.length?`<select data-field="effort" aria-label="Razonamiento">${effortOptions(row.provider,row.model,row.effort)}</select>`:''}<input data-field="scope" placeholder="Alcance: rutas separadas por comas (opcional)" value="${esc(row.scope||'')}" aria-label="Alcance"><label class="readonly-control"><input type="checkbox" data-field="readOnly" ${row.readOnly?'checked':''}> Solo lectura</label></div>
+  const human=row.provider===HUMAN,levels=effortLevels(row.provider,row.model);
+  const shown=human?{human:true,personId:row.personId,personName:''}:{provider:row.provider};
+  return `<div class="manual-row" data-row="${i}"><div class="manual-row-head">${avatar(shown)}<input data-field="title" placeholder="Sub-tarea ${i+1}: título" maxlength="120" value="${esc(row.title||'')}" aria-label="Título de la sub-tarea ${i+1}"><button type="button" class="icon-button" data-remove="${i}" aria-label="Quitar sub-tarea ${i+1}">×</button></div>
+  <div class="manual-row-grid"><select data-field="provider" aria-label="Asignar a">${assigneeOptions(row.provider,row.personId,row.provider)}</select>${human?'<span class="human-note">Persona del equipo: Mixto no ejecuta esta parte; tú anotas su estado.</span>':`<select data-field="model" aria-label="Modelo">${modelOptions(row.provider,row.model)}</select>${levels.length?`<select data-field="effort" aria-label="Razonamiento">${effortOptions(row.provider,row.model,row.effort)}</select>`:''}`}<input data-field="scope" placeholder="Alcance: rutas separadas por comas (opcional)" value="${esc(row.scope||'')}" aria-label="Alcance">${human?'':`<label class="readonly-control"><input type="checkbox" data-field="readOnly" ${row.readOnly?'checked':''}> Solo lectura</label>`}</div>
   <textarea data-field="instructions" rows="2" maxlength="12000" placeholder="Qué debe hacer, con detalle suficiente para trabajar sin verte" aria-label="Instrucciones de la sub-tarea ${i+1}">${esc(row.instructions||'')}</textarea></div>`;
 }
 function renderManual(){
   const panel=$('#manual-panel');panel.hidden=mode!=='manual';
   if(panel.hidden)return;
-  const key=JSON.stringify([manualVersion,orchestrator,state?.connections,manualOptions]);if(key===lastManual)return;lastManual=key;
-  panel.innerHTML=`<div class="manual-head"><strong>Reparto a mano</strong><span class="muted">Arriba, el objetivo de la tarea; aquí, quién hace cada parte. Hasta 8 sub-tareas; las que escriben sobre archivos distintos trabajan a la vez.</span></div>${manualRows.map(manualRowHtml).join('')}<div class="manual-actions"><button type="button" class="secondary-button" id="manual-add">＋ Sub-tarea</button><label class="readonly-control"><input type="checkbox" id="manual-review" ${manualOptions.review!==false?'checked':''}> ${names[orchestrator]} revisa al terminar</label><label class="readonly-control"><input type="checkbox" id="manual-git" ${manualOptions.initRepo?'checked':''}> Convertir la carpeta en repositorio git si hace falta para trabajar en paralelo</label></div>`;
+  const key=JSON.stringify([manualVersion,orchestrator,state?.connections,manualOptions,peopleOf(project()).map(p=>[p.id,p.name,p.role])]);if(key===lastManual)return;lastManual=key;
+  panel.innerHTML=`<div class="manual-head"><strong>Reparto a mano</strong><span class="muted">Arriba, el objetivo de la tarea; aquí, quién hace cada parte: Codex, Claude Code o una persona del equipo. Hasta 8 sub-tareas; los agentes que escriben sobre archivos distintos trabajan a la vez.</span></div>${manualRows.map(manualRowHtml).join('')}<div class="manual-actions"><button type="button" class="secondary-button" id="manual-add">＋ Sub-tarea</button><label class="readonly-control"><input type="checkbox" id="manual-review" ${manualOptions.review!==false?'checked':''}> ${names[orchestrator]} revisa al terminar</label><label class="readonly-control"><input type="checkbox" id="manual-git" ${manualOptions.initRepo?'checked':''}> Convertir la carpeta en repositorio git si hace falta para trabajar en paralelo</label></div>`;
 }
 $('#manual-panel').oninput=e=>{
   const rowEl=e.target.closest('[data-row]');if(!rowEl)return;
   const row=manualRows[Number(rowEl.dataset.row)],field=e.target.dataset.field;if(!row||!field)return;
+  if(field==='provider'||field==='model')return;
   row[field]=e.target.type==='checkbox'?e.target.checked:e.target.value;
   remember();
 };
@@ -218,7 +278,11 @@ $('#manual-panel').onchange=e=>{
   if(e.target.id==='manual-git'){manualOptions.initRepo=e.target.checked;remember();return;}
   const rowEl=e.target.closest('[data-row]');if(!rowEl)return;
   const row=manualRows[Number(rowEl.dataset.row)],field=e.target.dataset.field;if(!row||!field)return;
-  if(field==='provider'){row.provider=e.target.value;row.model=defaultModel(row.provider);row.effort=defaultEffort(row.provider,row.model)||'';}
+  if(field==='provider'){
+    const value=e.target.value;
+    if(value.startsWith('persona:')){row.provider=HUMAN;row.personId=value.slice(8);row.model='';row.effort='';row.readOnly=false;}
+    else{row.provider=value;row.personId=null;row.model=defaultModel(row.provider);row.effort=defaultEffort(row.provider,row.model)||'';}
+  }
   else if(field==='model'){row.model=e.target.value;row.effort=defaultEffort(row.provider,row.model)||'';}
   else return;
   manualVersion++;remember();renderManual();
@@ -233,6 +297,7 @@ function render(){
   const select=$('#project-select');if(document.activeElement!==select)select.innerHTML=state.projects.map(p=>`<option value="${p.id}" ${p.id===projectId?'selected':''}>${esc(p.name)}</option>`).join('');
   $('#project-folder').textContent=project()?.path||'';$('#project-folder').title=project()?.path||'';
   const quota=quotaText('codex');$('#quota-hint').textContent=quota?`Codex: ${quota}`:'';
+  $('#team-count').textContent=peopleOf(project()).length;
   $('#project-name').textContent=project()?.name||'';$('#conversation-title').textContent=conversation()?.title||'Nueva conversación';
   $('#conversations').innerHTML=state.conversations.filter(c=>c.projectId===projectId).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)).map(c=>`<button class="conversation-link ${c.id===conversationId?'active':''}" data-conversation="${c.id}"><span>◷</span><span>${esc(c.title)}</span></button>`).join('');
   renderAgents();renderMemory();renderMessages();renderRun();renderManual();
@@ -271,9 +336,13 @@ $('#run-status').onchange=e=>{
   const subtask=run.subtasks.find(s=>s.id===id);if(!subtask)return;
   const current=planChoices[id]||{};
   if(planProvider){
-    // Al reasignar, el modelo y el nivel pasan a los predeterminados del otro agente.
-    const provider=e.target.value,model=defaultModel(provider);
-    planChoices[id]={...current,provider,model,effort:defaultEffort(provider,model)};
+    const value=e.target.value;
+    if(value.startsWith('persona:'))planChoices[id]={...current,provider:HUMAN,personId:value.slice(8),model:null,effort:null,readOnly:false};
+    else{
+      // Al reasignar, el modelo y el nivel pasan a los predeterminados del otro agente.
+      const provider=value,model=defaultModel(provider);
+      planChoices[id]={...current,provider,personId:null,model,effort:defaultEffort(provider,model)};
+    }
   } else if(planModel){
     // Al cambiar de modelo, el nivel anterior puede no existir en el nuevo: se reajusta al predeterminado.
     planChoices[id]={...current,model:e.target.value,effort:defaultEffort(subtaskProvider(subtask),e.target.value)};
@@ -283,10 +352,15 @@ $('#run-status').onchange=e=>{
 };
 
 $('#run-status').onclick=async e=>{
-  const run=activeRun()||lastRunOf();if(!run||!e.target.id)return;
+  const run=activeRun()||lastRunOf();if(!run)return;
+  if(e.target.closest('[data-human-save]')){await saveHuman(e.target.closest('[data-human]'));return;}
+  const brief=e.target.closest('[data-human-brief]');
+  if(brief){const found=humanSubtaskById(brief.closest('[data-human]').dataset.run,brief.dataset.humanBrief);if(found){const person=state.people.find(p=>p.id===found.subtask.personId)||{name:found.subtask.personName};await copyText(briefFor(person,[{run:found.run,subtask:found.subtask,conversation:conversationOf(found.run)}]),`Encargo de ${person.name} copiado.`);}return;}
+  if(e.target.id==='review-again'){try{await api('review',{runId:run.id});lastRun='';await load();toast('Revisando de nuevo el conjunto.');}catch(error){toast(error.message);}return;}
+  if(!e.target.id)return;
   const act=async(route,body,done)=>{try{const result=await api(route,body);planChoices={};initRepo=false;lastRun='';await load();if(done)done(result);}catch(error){toast(error.message);}};
   if(e.target.id==='plan-approve')await act('plan',{runId:run.id,approve:true,initRepo,
-    subtasks:run.subtasks.map(s=>({id:s.id,provider:subtaskProvider(s),model:subtaskModel(s),effort:subtaskEffort(s)||null,readOnly:planChoices[s.id]?.readOnly===true}))});
+    subtasks:run.subtasks.map(s=>({id:s.id,provider:subtaskProvider(s),personId:planChoices[s.id]?.personId??s.personId??null,model:subtaskModel(s),effort:subtaskEffort(s)||null,readOnly:planChoices[s.id]?.readOnly===true}))});
   if(e.target.id==='plan-reject')await act('plan',{runId:run.id,approve:false});
   if(e.target.id==='integrate-apply')await act('integrate',{runId:run.id},result=>
     toast(result.conflicts?.length?'No se pudo integrar: sigue habiendo conflictos.':'Cambios integrados en tu carpeta.'));
@@ -302,7 +376,7 @@ $('#composer').onsubmit=async e=>{
   if(!projectId){toast('Crea o añade un proyecto antes de empezar.');return;}
   const body={prompt,readOnly:$('#read-only').checked,mode,orchestrator:{provider:orchestrator,model:selections[orchestrator],effort:efforts[orchestrator]||null}};
   if(mode==='manual'){
-    const rows=manualRows.map(r=>({title:(r.title||'').trim(),provider:r.provider,model:r.model,effort:r.effort||null,instructions:(r.instructions||'').trim(),scope:r.scope||'',readOnly:!!r.readOnly}));
+    const rows=manualRows.map(r=>({title:(r.title||'').trim(),provider:r.provider,personId:r.personId||null,model:r.model,effort:r.effort||null,instructions:(r.instructions||'').trim(),scope:r.scope||'',readOnly:!!r.readOnly}));
     if(!rows.length||rows.some(r=>!r.title||!r.instructions)){toast('Cada sub-tarea necesita título e instrucciones.');return;}
     body.plan={subtasks:rows,review:manualOptions.review!==false,initRepo:!!manualOptions.initRepo};
   }
@@ -372,6 +446,45 @@ function memoryList(){
   };
 }
 $('#open-memory').onclick=memoryList;
+// Equipo del proyecto: personas, sus partes en cada tarea, y el encargo listo para enviar.
+function teamModal(){
+  const p=project();if(!p){toast('Crea o añade un proyecto antes.');return;}
+  const members=peopleOf(p),others=state.people.filter(person=>!(p.members||[]).includes(person.id));
+  const board=members.map(person=>{
+    const items=assignmentsOf(person.id),pending=items.filter(i=>i.subtask.status!=='hecha');
+    return `<section class="person-card" data-person="${esc(person.id)}"><header><span class="agent-avatar human">👤</span><div><h3>${esc(person.name)}</h3><div class="metadata">${esc(person.role||'sin rol')}${person.email?` · ${esc(person.email)}`:''}${person.notes?` · ${esc(person.notes)}`:''}</div></div><span class="pill">${items.length-pending.length}/${items.length} hechas</span></header>
+    ${items.length?items.map(({run,subtask,conversation})=>`<details data-subtask="${esc(subtask.id)}" ${subtask.status!=='hecha'?'open':''}><summary>${esc(subtask.title)} <span class="muted">· ${esc(stageNames[subtask.status]||subtask.status)}${subtask.due?` · límite ${esc(subtask.due)}`:''}</span></summary><div class="metadata">Tarea: ${esc(run.prompt.slice(0,120))} · <button type="button" class="text-link" data-open-conversation="${esc(conversation.id)}">ir a la conversación</button></div>${humanControlsHtml(run,subtask)}</details>`).join(''):'<p class="muted">Sin partes asignadas todavía. Asígnale una desde el reparto a mano o desde el plan del arquitecto.</p>'}
+    <footer>${pending.length?`<button type="button" class="secondary-button" data-brief-copy="${esc(person.id)}">Copiar encargo (${pending.length})</button><button type="button" class="secondary-button" data-brief-download="${esc(person.id)}">Descargar .md</button>${person.email?`<button type="button" class="secondary-button" data-brief-mail="${esc(person.id)}">Enviar por correo</button>`:''}`:''}<button type="button" class="secondary-button" data-person-edit="${esc(person.id)}">Editar</button><button type="button" class="danger-button" data-person-remove="${esc(person.id)}">Quitar del proyecto</button></footer></section>`;
+  }).join('');
+  openModal(`Equipo de ${p.name}`,`<p class="modal-note">Personas reales que trabajan en este proyecto. Asígnales partes desde el reparto a mano o desde el plan del arquitecto; aquí anotas su estado y su resultado y les preparas el encargo. Mixto no ejecuta sus partes, y el arquitecto las tiene en cuenta al planificar y al revisar.</p>
+    <div id="team-board">${board||'<div class="memory-empty">Todavía no hay nadie en el equipo.</div>'}</div>
+    <form id="person-form" class="person-form"><h3 id="person-form-title">Añadir persona</h3><input type="hidden" name="id"><div class="person-grid"><label class="form-field"><span>Nombre</span><input name="name" required maxlength="80" placeholder="Ana"></label><label class="form-field"><span>Rol</span><input name="role" maxlength="80" placeholder="frontend, QA, producto…"></label><label class="form-field"><span>Correo (opcional)</span><input name="email" type="email" maxlength="200" placeholder="ana@ejemplo.com"></label></div><label class="form-field"><span>Notas (lo que el arquitecto debe saber para asignarle trabajo)</span><textarea name="notes" rows="2" maxlength="2000" placeholder="Sabe React; no tiene acceso al servidor; disponible por las tardes"></textarea></label><div class="form-footer">${others.length?`<select id="person-existing" aria-label="Añadir una persona de otro proyecto"><option value="">Añadir de otro proyecto…</option>${others.map(person=>`<option value="${esc(person.id)}">${esc(person.name)}${person.role?` · ${esc(person.role)}`:''}</option>`).join('')}</select>`:''}<button type="button" class="secondary-button" id="person-cancel" hidden>Cancelar</button><button class="primary-button" id="person-save">Añadir al equipo</button></div></form>`,'team');
+  const form=$('#person-form');
+  const resetForm=()=>{form.reset();form.elements.id.value='';$('#person-form-title').textContent='Añadir persona';$('#person-save').textContent='Añadir al equipo';$('#person-cancel').hidden=true;};
+  $('#person-cancel').onclick=resetForm;
+  form.onsubmit=async e=>{
+    e.preventDefault();const values=Object.fromEntries(new FormData(form));
+    try{
+      if(values.id)await api('people/'+values.id,{name:values.name,role:values.role,email:values.email,notes:values.notes},'PATCH');
+      else await api('people',{...values,projectId});
+      await load();teamModal();toast(values.id?'Persona actualizada.':'Persona añadida al equipo.');
+    }catch(error){toast(error.message);}
+  };
+  if($('#person-existing'))$('#person-existing').onchange=async e=>{if(!e.target.value)return;try{await api('members',{projectId,personId:e.target.value});await load();teamModal();}catch(error){toast(error.message);}};
+  $('#team-board').onclick=async e=>{
+    const b=e.target.closest('button');if(!b)return;
+    if(b.dataset.personEdit){const person=state.people.find(x=>x.id===b.dataset.personEdit);if(!person)return;form.elements.id.value=person.id;form.elements.name.value=person.name;form.elements.role.value=person.role||'';form.elements.email.value=person.email||'';form.elements.notes.value=person.notes||'';$('#person-form-title').textContent=`Editar a ${person.name}`;$('#person-save').textContent='Guardar';$('#person-cancel').hidden=false;form.elements.name.focus();return;}
+    if(b.dataset.personRemove){try{await api('members',{projectId,personId:b.dataset.personRemove,remove:true});await load();teamModal();toast('Persona quitada del proyecto; sus partes ya asignadas se conservan.');}catch(error){toast(error.message);}return;}
+    if(b.dataset.openConversation){conversationId=b.dataset.openConversation;closeModal();lastMessages='';lastRun='';render();return;}
+    const personFor=id=>state.people.find(x=>x.id===id);
+    if(b.dataset.briefCopy){const person=personFor(b.dataset.briefCopy);await copyText(briefFor(person,assignmentsOf(person.id).filter(i=>i.subtask.status!=='hecha')),`Encargo de ${person.name} copiado.`);return;}
+    if(b.dataset.briefDownload){const person=personFor(b.dataset.briefDownload);downloadText(`encargo-${person.name.replace(/[^\w.-]+/g,'-').toLowerCase()}.md`,briefFor(person,assignmentsOf(person.id).filter(i=>i.subtask.status!=='hecha')));return;}
+    if(b.dataset.briefMail){const person=personFor(b.dataset.briefMail);const brief=briefFor(person,assignmentsOf(person.id).filter(i=>i.subtask.status!=='hecha'));location.href=`mailto:${encodeURIComponent(person.email)}?subject=${encodeURIComponent(`Encargo · ${project()?.name||'Mixto'}`)}&body=${encodeURIComponent(brief.slice(0,1800))}`;return;}
+    if(b.hasAttribute('data-human-save')){if(await saveHuman(b.closest('[data-human]')))teamModal();return;}
+    if(b.dataset.humanBrief){const container=b.closest('[data-human]');const found=humanSubtaskById(container.dataset.run,b.dataset.humanBrief);if(found){const person=personFor(found.subtask.personId)||{name:found.subtask.personName};await copyText(briefFor(person,[{run:found.run,subtask:found.subtask,conversation:conversationOf(found.run)}]),`Encargo de ${person.name} copiado.`);}}
+  };
+}
+$('#open-team').onclick=teamModal;
 function connectionsModal(){
   openModal('Agentes',`<p class="modal-note">Mixto usa las sesiones de las herramientas instaladas. Aquí solo configuras lo necesario para orquestar.</p>${['codex','claude'].map(p=>{const c=state.connections[p],levels=effortLevels(p,selections[p]);return `<section class="connection-card"><h3><span class="agent-avatar ${p}">${symbols[p]}</span> ${names[p]}</h3><p>${c.loading?'Consultando conexión…':c.connected?'Conectado · '+esc(c.plan||c.authType):'Sin conexión'}</p>${limitsHtml(p,c)}${c.error?`<div class="message-error">${esc(c.error)}</div>`:''}${!c.connected?`<p>Inicia sesión con <code>${p==='codex'?'codex login':'claude auth login'}</code> y pulsa Actualizar.</p>`:''}${c.models.length?`<label class="form-field compact-field"><span>Modelo predeterminado</span><select data-agent-model="${p}">${modelOptions(p,selections[p])}</select><small>Cuando ${names[p]} orquesta, este modelo planifica y revisa: uno rápido abarata cada tarea. Los modelos potentes se eligen por sub-tarea en el plan.</small></label>${levels.length?`<label class="form-field compact-field"><span>Razonamiento</span><select data-agent-effort="${p}">${effortOptions(p,selections[p],efforts[p])}</select></label>`:''}`:''}</section>`;}).join('')}<form id="agent-settings"><label class="form-field"><span>Persona del arquitecto</span><select name="orchestratorPersona"><option value="">Sin persona</option>${state.personas.map(p=>`<option value="${esc(p.id)}" ${p.id===state.settings.orchestratorPersona?'selected':''}>${esc(p.name)}</option>`).join('')}</select><small>Añade unos 7.000 tokens de texto genérico a cada plan. Déjala en «Sin persona» salvo que la necesites.</small></label><label class="check-field"><input type="checkbox" name="autoApproveSingle" ${state.settings.autoApproveSingle?'checked':''}> Empezar sin pedir aprobación cuando el plan tiene una sola sub-tarea</label><label class="check-field"><input type="checkbox" name="autoApproveReadOnly" ${state.settings.autoApproveReadOnly?'checked':''}> Empezar sin pedir aprobación cuando todas las sub-tareas son de solo lectura</label><label class="form-field"><span>Tope de tokens por tarea (0 = sin tope)</span><input type="number" name="tokenBudget" min="0" step="1000" value="${Number(state.settings.tokenBudget)||0}"><small>Se comprueba al cerrar cada turno, así que puede excederse por un turno. Al superarlo la tarea se detiene y te lo dice; una corrección la reanuda.</small></label>${['codex','claude'].map(p=>`<label class="form-field"><span>Preferencias para ${names[p]}</span><textarea name="${p}Instructions" rows="3" maxlength="8000" placeholder="Cómo quieres que trabaje este agente…">${esc(state.settings[p+'Instructions'])}</textarea></label>`).join('')}<div class="form-footer"><button type="button" class="secondary-button" id="refresh-connections">Actualizar</button><button class="primary-button">Guardar</button></div></form>`,'connections');
   $('#modal-content').onchange=e=>{

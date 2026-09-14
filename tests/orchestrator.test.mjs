@@ -282,3 +282,46 @@ test('buildDirectPrompt solo lleva historial cuando no hay sesión que reanudar;
   assert.match(self,/tests\//);
   assert.doesNotMatch(self,/PETICIÓN ORIGINAL|MEMORIA COMPARTIDA/);
 });
+
+const people=[{id:'p-ana',name:'Ana',role:'QA',notes:'tiene un móvil de pruebas'},{id:'p-luis',name:'Luis',role:'backend'}];
+
+test('el plan del arquitecto puede asignar una sub-tarea a una persona del equipo, por nombre y sin distinguir mayúsculas',()=>{
+  const text=plan([subtask(),{titulo:'Probar en móvil',proveedor:'persona',persona:'ana',rol:'QA',instrucciones:'Prueba el flujo',orden:2}]);
+  const result=parsePlan(text,{connections,people});
+  assert.equal(result.subtasks[1].human,true);
+  assert.equal(result.subtasks[1].personId,'p-ana');
+  assert.equal(result.subtasks[1].personName,'Ana');
+  assert.equal(result.subtasks[1].provider,'persona');
+  assert.equal(result.subtasks[1].model,null);
+  assert.equal(result.subtasks[0].human,false);
+  assert.throws(()=>parsePlan(plan([{...subtask(),proveedor:'persona',persona:'Nadie'}]),{connections,people}),/no está en el equipo/);
+  assert.throws(()=>parsePlan(plan([{...subtask(),proveedor:'persona',persona:'Ana'}]),{connections}),/no está en el equipo/,'sin equipo no hay a quién asignar');
+});
+
+test('parseManualPlan acepta personas por identificador y buildPlanPrompt presenta el equipo',()=>{
+  const result=parseManualPlan({subtasks:[{title:'Probar',provider:'persona',personId:'p-luis',instructions:'Prueba el despliegue'}]},{connections,people});
+  assert.equal(result.subtasks[0].human,true);
+  assert.equal(result.subtasks[0].personName,'Luis');
+  assert.throws(()=>parseManualPlan({subtasks:[{title:'Probar',provider:'persona',personId:'p-x',instructions:'x'}]},{connections,people}),/no está en el equipo/);
+  const prompt=buildPlanPrompt({request:'Saca la versión',connections,people});
+  assert.match(prompt,/EQUIPO HUMANO DEL PROYECTO/);
+  assert.match(prompt,/Ana · QA · tiene un móvil de pruebas/);
+  assert.match(prompt,/codex\|claude\|persona/);
+  assert.doesNotMatch(buildPlanPrompt({request:'Saca la versión',connections}),/EQUIPO HUMANO/);
+});
+
+test('la revisión y el trabajo de los agentes tienen en cuenta las partes de las personas',()=>{
+  const subtasks=[
+    {id:'a',index:0,title:'Código',role:'Programar',provider:'claude',model:'sonnet',status:'completed',text:'Hecho',patch:null,readOnly:false,human:false},
+    {id:'h',index:1,title:'Probar en móvil',role:'QA',provider:'persona',personName:'Ana',status:'hecha',result:'Probado en un Pixel; falla el scroll',due:'2026-10-01',human:true}
+  ];
+  const review=buildReviewPrompt({request:'Haz X',subtasks,workspace:'project'});
+  assert.match(review,/asignada a Ana \(persona\)/);
+  assert.match(review,/Estado: Hecha · fecha límite 2026-10-01/);
+  assert.match(review,/Probado en un Pixel/);
+  assert.match(review,/no las ejecuta Mixto/);
+  assert.match(review,/tal como está ahora/);
+  const work=buildWorkPrompt({request:'Haz X',subtask:subtasks[0],teamNote:'- Ana: Probar en móvil'});
+  assert.match(work,/ASIGNADAS A PERSONAS DEL EQUIPO/);
+  assert.match(work,/Ana: Probar en móvil/);
+});

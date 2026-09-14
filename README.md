@@ -19,7 +19,7 @@ Junto al cuadro de escritura eliges el **agente principal** y el **modo**:
 1. Crea la carpeta de proyectos `mixto-projects` junto a la carpeta de Mixto. Cada subcarpeta directa aparece automáticamente en el selector **Proyectos**; también puedes crear una con el botón **+**.
 2. Elige qué agente **orquesta**. El modelo y el nivel de razonamiento predeterminados se configuran en **Agentes**.
 3. **Solo consultar** viene activado. Desmárcalo cuando quieras que los agentes modifiquen archivos: es el techo de permisos de toda la tarea y el plan no puede ampliarlo, solo restringirlo. Las solicitudes de permisos compatibles aparecen dentro de la conversación, indicando de qué sub-tarea vienen.
-4. Envía tu petición. El orquestador estudia la carpeta sin modificar nada. Si es una pregunta o algo que puede resolver con lo que acaba de ver, **responde directamente** y la tarea termina ahí, en un solo turno. Si hace falta trabajar, propone un plan: cuántas sub-tareas hacen falta, qué agente y modelo se ocupa de cada una, con qué alcance y por qué, más un **contexto** con lo que descubrió para que ninguna sub-tarea tenga que volver a explorarlo.
+4. Envía tu petición. El orquestador estudia la carpeta sin modificar nada y conoce al equipo del proyecto. Si es una pregunta o algo que puede resolver con lo que acaba de ver, **responde directamente** y la tarea termina ahí, en un solo turno. Si hace falta trabajar, propone un plan: cuántas sub-tareas hacen falta, qué agente y modelo se ocupa de cada una, con qué alcance y por qué, más un **contexto** con lo que descubrió para que ninguna sub-tarea tenga que volver a explorarlo.
 5. Revisa el plan antes de que empiece nadie. En cada sub-tarea puedes **reasignarla al otro agente**, cambiar el modelo y el nivel de razonamiento para ajustar el consumo, o limitarla a solo lectura; o descartar el plan. En **Agentes** puedes activar que los planes de una sola sub-tarea, o los de solo lectura, arranquen sin pedirte aprobación. Si el plan tiene una sola sub-tarea asignada al mismo agente que planificó, la hace él en su propia sesión, que ya conoce el proyecto, sin arrancar otro proceso en frío.
 6. Las sub-tareas se ejecutan, hasta tres a la vez. Cada una informa de su estado y de su consumo por separado. Puedes detener la tarea y retomar la conversación después.
 7. Al terminar, el mismo orquestador revisa el conjunto desde una copia con todos los cambios ya aplicados: busca trabajo duplicado, contradicciones y lo que falte, puede ejecutar los tests del proyecto para comprobarlo, y decide si procede integrar. Una sola sub-tarea de consulta no se revisa: su respuesta ya es la respuesta.
@@ -28,6 +28,18 @@ Junto al cuadro de escritura eliges el **agente principal** y el **modo**:
 Cuando **una sola** sub-tarea modifica archivos, trabaja directamente en tu carpeta y reanuda su sesión nativa, igual que si usaras el agente por tu cuenta; el revisor ve el diff desde el punto en que empezó. Cuando escriben **dos o más**, cada una trabaja sobre una copia aislada de la carpeta, creada con `git worktree`, así que nunca se escriben encima. Esa copia parte del estado real del proyecto, incluido el trabajo que todavía no has guardado en un commit. Los cambios vuelven a tu carpeta como parches, sin crear ramas ni commits: si todos aplican limpios se integran solos; si hay conflicto, o dos sub-tareas tocaron el mismo archivo, no se aplica nada y el informe dice qué ocurrió. `MIXTO_MAX_PARALLEL` cambia cuántas sub-tareas se ejecutan a la vez, tres por defecto.
 
 Si la carpeta no es un repositorio git no hay copias aisladas posibles, y cuando varias sub-tareas escriben Mixto te ofrece dos salidas: convertirla en repositorio, o ejecutarlas de una en una.
+
+### Equipo: personas reales
+
+En **Equipo** añades a las personas que trabajan en cada proyecto: nombre, rol, correo opcional y notas con lo que el arquitecto debe saber para asignarles trabajo. Una misma persona puede estar en varios proyectos.
+
+- En el **reparto a mano**, cada sub-tarea se asigna a Codex, a Claude Code o a una persona del equipo. En el **plan del arquitecto**, el propio arquitecto puede asignar una parte a una persona cuando requiera criterio humano, accesos o dispositivos que los agentes no tienen, o cuando se lo pidas; y tú puedes reasignar cualquier sub-tarea a una persona, o de una persona a un agente, antes de aprobar.
+- Mixto **no ejecuta** las partes de las personas: quedan asignadas y pendientes. La tarea termina cuando los agentes acaban y muestra cuántas partes siguen en manos de personas. Los agentes saben qué partes son de personas para no hacerlas ellos.
+- En la tarjeta de la tarea y en el tablero de **Equipo** anotas el estado de cada parte (pendiente, en curso, hecha), una fecha límite y el resultado o enlace que la persona entregó. Nada de esto consume turnos.
+- **Copiar encargo**, **Descargar .md** o **Enviar por correo** preparan para cada persona un documento con sus partes pendientes: tarea, instrucciones, alcance y el contexto que descubrió el arquitecto.
+- Cuando las personas terminen, **Revisar de nuevo** hace que el revisor compruebe el conjunto en la carpeta del proyecto, con lo que ellas hayan integrado y lo que tú hayas anotado. Cuesta un turno. Una tarea que solo tiene partes de personas no se revisa hasta que lo pidas.
+
+Mixto sigue siendo una app local de un solo usuario: tú coordinas, las personas reciben su encargo por el medio que prefieras y tú registras lo que entregan. No hay acceso por red ni cuentas para ellas.
 
 ### Consumo y cuota
 

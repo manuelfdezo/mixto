@@ -30,6 +30,9 @@ const PLAN=fence({resumen:'Dos frentes en paralelo',contexto:'El proyecto es una
 const PLAN_COLISION=fence({resumen:'Dos frentes que chocan a propósito',
   subtareas:[writer('Frente colisión uno','compartido.txt',1),writer('Frente colisión dos','compartido.txt',2)]});
 const PLAN_UNICA=fence({resumen:'Un solo escritor',contexto:'Trabaja en la carpeta real.',subtareas:[writer('Frente único','solo.txt',1)]});
+// A plan that hands one part to a real person of the team (the test creates «Ana» before running).
+const PLAN_EQUIPO=fence({resumen:'Un agente y una persona',contexto:'Ana prueba en móvil.',subtareas:[writer('Parte de agente','uno.txt',1),
+  {titulo:'Probar en móvil',proveedor:'persona',persona:'ana',rol:'QA en dispositivo real',instrucciones:'Prueba el flujo en un móvil real y anota lo que falle.',alcance:[],soloLectura:false,orden:2}]});
 const PLAN_UNICA_CODEX=fence({resumen:'Un solo escritor, en Codex',subtareas:[{...writer('Frente único','solo.txt',1),proveedor:'codex',modelo:'codex-fake'}]});
 const PLAN_LECTURA=fence({resumen:'Una sola consulta',subtareas:[{titulo:'Consulta',proveedor:'claude',modelo:'claude-fake',esfuerzo:'medium',
   justificacion:'solo leer',rol:'Investigar',instrucciones:'CONSULTA: describe base.txt',alcance:[],soloLectura:true,orden:1}]});
@@ -48,6 +51,7 @@ function scripted(text){
     if(scenario==='colision')return PLAN_COLISION;
     if(scenario==='unica'||scenario==='auto')return PLAN_UNICA;
     if(scenario==='unica-codex')return PLAN_UNICA_CODEX;
+    if(scenario==='equipo')return PLAN_EQUIPO;
     if(scenario==='lectura')return PLAN_LECTURA;
     if(scenario==='directa')return RESPUESTA;
     return PLAN;

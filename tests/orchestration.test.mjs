@@ -490,3 +490,120 @@ test('el servidor empuja el estado por SSE en cuanto cambia, sin sondeo',async t
   const unauthenticated=await fetch(origin+'/api/events');
   assert.equal(unauthenticated.status,401);
 });
+
+test('el equipo del proyecto: alta, edición, pertenencia a varios proyectos y baja',async t=>{
+  const {call,project}=await boot(t,{delay:50});
+  const ana=await call('people',{name:'Ana',role:'QA',email:'ana@example.invalid',notes:'móvil de pruebas',projectId:project.id});
+  let state=await call('state');
+  assert.ok(state.people.some(p=>p.id===ana.id&&p.name==='Ana'));
+  assert.deepEqual(state.projects.find(p=>p.id===project.id).members,[ana.id]);
+  await assert.rejects(call('people',{name:'Luis',email:'no-es-correo',projectId:project.id}),/Correo/);
+  await call('people/'+ana.id,{name:'Ana G.',role:'QA móvil'},'PATCH');
+  const other=await call('projects',{name:'Otro',directoryName:'otro',description:''});
+  await call('members',{projectId:other.id,personId:ana.id});
+  state=await call('state');
+  assert.equal(state.people.find(p=>p.id===ana.id).name,'Ana G.');
+  assert.equal(state.people.find(p=>p.id===ana.id).email,'ana@example.invalid','los campos no enviados se conservan');
+  assert.deepEqual(state.projects.find(p=>p.id===other.id).members,[ana.id]);
+  await call('members',{projectId:other.id,personId:ana.id,remove:true});
+  await call('people/'+ana.id,{},'DELETE');
+  state=await call('state');
+  assert.equal(state.people.length,0);
+  assert.deepEqual(state.projects.find(p=>p.id===project.id).members,[]);
+});
+
+test('reparto a mano entre un agente y una persona: la parte humana queda pendiente, se anota y se revisa de nuevo',async t=>{
+  const {call,work,until,project}=await boot(t,{delay:50});
+  const ana=await call('people',{name:'Ana',role:'QA',projectId:project.id});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Saca la versión',readOnly:false,mode:'manual',
+    orchestrator:{provider:'claude',model:'claude-fake',effort:'medium'},
+    plan:{review:true,subtasks:[
+      {title:'Código',provider:'codex',model:'codex-fake',instructions:'ARCHIVO:uno.txt'},
+      {title:'Probar en móvil',provider:'persona',personId:ana.id,instructions:'Prueba el flujo en un móvil real.',scope:'app/'}]}});
+  let state=await until(s=>['completed','error'].includes(runOf(s).status));
+  let run=runOf(state);
+  assert.equal(run.status,'completed',run.error);
+  assert.equal(run.stage,'Pendiente de 1 persona');
+  const human=run.subtasks[1];
+  assert.equal(human.human,true);assert.equal(human.personName,'Ana');assert.equal(human.status,'pendiente');
+  assert.equal(human.cwd,null,'una persona no tiene copia ni carpeta de trabajo');
+  assert.equal(human.fixable,false);
+  assert.deepEqual(run.waves,[[run.subtasks[0].id]],'solo el agente entra en las olas');
+  assert.equal(fs.readFileSync(path.join(work,'uno.txt'),'utf8'),'escrito por la sub-tarea uno.txt\n');
+  assert.equal(run.review.status,'integrar');
+  assert.equal(run.usage.turns,2,'agente y revisión; la persona no consume');
+  assert.match(state.messages.find(m=>m.runId===run.id&&m.kind==='manual').content,/Probar en móvil · Ana \(persona\)/);
+  // La persona termina: se anota su resultado y la etapa de la tarea cambia sin gastar ningún turno.
+  await assert.rejects(call('subtask',{runId:run.id,subtaskId:run.subtasks[0].id,status:'hecha'}),/asignadas a personas/);
+  await assert.rejects(call('subtask',{runId:run.id,subtaskId:human.id,status:'terminada'}),/Estado no válido/);
+  await assert.rejects(call('subtask',{runId:run.id,subtaskId:human.id,due:'mañana'}),/AAAA-MM-DD/);
+  await call('subtask',{runId:run.id,subtaskId:human.id,status:'hecha',result:'Probado en un Pixel; todo bien',due:'2026-10-01'});
+  state=await call('state');run=runOf(state);
+  assert.equal(run.stage,'Completado');
+  assert.equal(run.subtasks[1].status,'hecha');assert.equal(run.subtasks[1].due,'2026-10-01');assert.ok(run.subtasks[1].finishedAt);
+  assert.equal(run.usage.turns,2);
+  const memory=state.memories.find(m=>m.automatic&&m.conversationId===conversation.id);
+  assert.match(memory.content,/Ana \(persona\) · Hecha/);
+  assert.match(memory.content,/Probado en un Pixel/);
+  // Revisar de nuevo con lo que la persona entregó: un turno más, otro mensaje de revisión.
+  await call('review',{runId:run.id});
+  state=await until(s=>['completed','error'].includes(runOf(s).status)&&runOf(s).usage.turns>2);
+  run=runOf(state);
+  assert.equal(run.status,'completed',run.error);
+  assert.equal(run.usage.turns,3);
+  assert.equal(run.review.workspace,'project-direct');
+  assert.deepEqual(state.messages.filter(m=>m.runId===run.id).map(m=>m.kind||m.role),['manual','work','review','review-request','review']);
+  await assert.rejects(call('review',{runId:run.id,model:'--no'}),/Identificador de modelo no válido/);
+  await assert.rejects(call('review',{runId:run.id,effort:'ultra-mega'}),/nivel de razonamiento/);
+});
+
+test('el arquitecto puede asignar una parte a una persona del equipo, y la tarea la espera',async t=>{
+  const {call,work,until,project}=await boot(t,{delay:50,scenario:'equipo'});
+  const ana=await call('people',{name:'Ana',role:'QA',notes:'móvil de pruebas',projectId:project.id});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Saca la versión y pruébala',readOnly:false,
+    orchestrator:{provider:'claude',model:'claude-fake',effort:'medium'}});
+  let run=runOf(await until(s=>runOf(s).status==='awaiting-plan'));
+  assert.equal(run.subtasks.length,2);
+  assert.equal(run.subtasks[1].human,true);
+  assert.equal(run.subtasks[1].personId,ana.id,'la persona se resolvió por nombre, sin distinguir mayúsculas');
+  await call('plan',{runId:run.id,approve:true,subtasks:[]});
+  const state=await until(s=>['completed','error'].includes(runOf(s).status));
+  run=runOf(state);
+  assert.equal(run.status,'completed',run.error);
+  assert.equal(run.stage,'Pendiente de 1 persona');
+  assert.equal(run.subtasks[0].self,true,'la única sub-tarea de agente la hace el arquitecto en su sesión');
+  assert.equal(fs.readFileSync(path.join(work,'uno.txt'),'utf8'),'escrito por la sub-tarea uno.txt\n');
+  assert.equal(run.review.status,'integrar');
+  assert.equal(run.subtasks[1].status,'pendiente');
+});
+
+test('en el plan del arquitecto se puede pasar una sub-tarea a una persona, y de vuelta a un agente',async t=>{
+  const {call,work,until,project}=await boot(t,{delay:50});
+  const ana=await call('people',{name:'Ana',role:'QA',projectId:project.id});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Reparte este trabajo',readOnly:false,
+    orchestrator:{provider:'claude',model:'claude-fake',effort:'medium'}});
+  let run=runOf(await until(s=>runOf(s).status==='awaiting-plan'));
+  await call('plan',{runId:run.id,approve:true,subtasks:[
+    {id:run.subtasks[1].id,provider:'persona',personId:ana.id},
+    {id:run.subtasks[0].id,provider:'persona',personId:'nadie'}]});
+  const state=await until(s=>['completed','error'].includes(runOf(s).status));
+  run=runOf(state);
+  assert.equal(run.status,'completed',run.error);
+  assert.equal(run.subtasks[1].human,true);assert.equal(run.subtasks[1].personName,'Ana');
+  assert.equal(run.subtasks[0].human,false,'una persona desconocida no se aplica; la sub-tarea sigue con su agente');
+  const events=run.events.map(e=>e.text).join('\n');
+  assert.match(events,/asignada a Ana \(persona\)/);
+  assert.match(events,/no está en el equipo/);
+  assert.equal(fs.readFileSync(path.join(work,'uno.txt'),'utf8'),'escrito por la sub-tarea uno.txt\n');
+  assert.equal(fs.existsSync(path.join(work,'dos.txt')),false,'la parte de Ana no la ejecuta nadie');
+  assert.equal(run.stage,'Pendiente de 1 persona');
+  // Una tarea solo de personas no se revisa hasta que ellas terminen.
+  await call('run',{conversationId:conversation.id,prompt:'Solo Ana',readOnly:false,mode:'manual',orchestrator:{provider:'claude',model:'claude-fake'},
+    plan:{review:true,subtasks:[{title:'Probar',provider:'persona',personId:ana.id,instructions:'Prueba todo'}]}});
+  const only=runOf(await until(s=>s.runs.length===2&&['completed','error'].includes(runOf(s).status)));
+  assert.equal(only.status,'completed');assert.equal(only.review,null);assert.equal(only.usage,null);
+  assert.equal(only.stage,'Pendiente de 1 persona');
+});

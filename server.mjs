@@ -6,7 +6,7 @@ import {randomBytes} from 'node:crypto';
 import {Store,id,now,memoryContext,sessionKey,rememberSession} from './lib/store.mjs';
 import {discover,runProvider,readLimits} from './lib/providers.mjs';
 import {EngramBridge,sharedMemories,cleanupOrphanTransfers} from './lib/engram.mjs';
-import {buildPlanPrompt,parsePlan,parseManualPlan,assignWaves,buildReviewPrompt,readVerdict,PlanError,buildSupervisionPrompt,parseDecision,buildWorkPrompt,buildFixPrompt,buildDirectPrompt,buildSelfPrompt} from './lib/orchestrator.mjs';
+import {buildPlanPrompt,parsePlan,parseManualPlan,assignWaves,buildReviewPrompt,readVerdict,PlanError,buildSupervisionPrompt,parseDecision,buildWorkPrompt,buildFixPrompt,buildDirectPrompt,buildSelfPrompt,HUMAN,HUMAN_STATUSES,humanStatusLabel,findPerson} from './lib/orchestrator.mjs';
 import {inspect,initRepository,createWorkspaces,createReviewWorkspace,capturePatch,checkPatches,applyPatches,removeWorkspaces,cleanupOrphanWorkspaces,snapshotProject,diffSince} from './lib/isolation.mjs';
 import {createManagedProject,managedProjectPath,projectsRoot,syncDiscoveredProjects} from './lib/projects.mjs';
 import {listPersonas,personaBody} from './lib/personas.mjs';
@@ -63,7 +63,8 @@ const touch=()=>{dirty=true;notify();};
 const flush=()=>{store.save();dirty=false;notify();};
 const keepalive=setInterval(()=>{for(const client of clients){try{client.write(': ping\n\n');}catch{clients.delete(client);}}},20000);
 keepalive.unref();
-const toSubtask=(item,index)=>({id:id(),index,...item,cwd:null,patch:null,diff:null,text:'',status:'queued',stage:'En espera',
+const toSubtask=(item,index)=>({id:id(),index,human:false,personId:null,personName:null,...item,cwd:null,patch:null,diff:null,text:'',
+  status:item.human?'pendiente':'queued',stage:item.human?`Asignada a ${item.personName}`:'En espera',result:'',due:null,
   events:[],messageId:null,sessionKey:null,sessionId:null,usage:null,error:null,startedAt:null,finishedAt:null,fixable:false,self:false});
 const checkpoint=setInterval(()=>{if(dirty)try{flush();}catch(e){console.error('No se pudo guardar:',e.message);}},2000);
 checkpoint.unref();
@@ -100,6 +101,19 @@ function getRun(runId){const r=store.data.runs.find(r=>r.id===runId);if(!r)throw
 function sameFolder(a,b){return process.platform==='win32'?a.toLowerCase()===b.toLowerCase():a===b;}
 function folder(value){const p=str(value,'Carpeta',2000);if(!path.isAbsolute(p))throw new Error('Escribe la ruta completa de una carpeta.');const real=fs.realpathSync(p);if(!fs.statSync(real).isDirectory())throw new Error('La ruta debe ser una carpeta.');return real;}
 function projectOf(run){return store.project(store.conversation(run.conversationId).projectId);}
+const membersOf=project=>store.data.people.filter(person=>(project.members||[]).includes(person.id));
+const assigneeName=subtask=>subtask.human?`${subtask.personName} (persona)`:`${agentName(subtask.provider)} ${subtask.model}`;
+// Con personas en la tarea, la etapa de una tarea terminada dice cuántas partes siguen en sus manos.
+function humansRollup(run){
+  if(run.status!=='completed')return;
+  const pending=run.subtasks.filter(subtask=>subtask.human&&subtask.status!=='hecha').length;
+  run.stage=pending?`Pendiente de ${pending} persona${pending===1?'':'s'}`:'Completado';
+}
+function personFields(source,base={}){
+  const email=str(source.email||'','Correo',200,true);
+  if(email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))throw new Error('Correo: escribe una dirección válida o déjalo vacío.');
+  return {...base,name:str(source.name,'Nombre',80),role:str(source.role||'','Rol',80,true),email,notes:str(source.notes||'','Notas',2000,true)};
+}
 function snapshot(){
   const managed=syncDiscoveredProjects(store.data,managedProjectsRoot);
   if(managed.added.length)flush();
@@ -175,17 +189,29 @@ function modelChoice(provider,model,effort){
 // The user may reassign a sub-task to the other agent, trade a model down or tighten it to read-only;
 // everything else in the plan stays as the orchestrator wrote it. One bad choice never blocks the rest.
 function applyPlanChoices(run,choices){
+  const people=membersOf(projectOf(run));
   for(const choice of Array.isArray(choices)?choices:[]){
     const subtask=run.subtasks.find(candidate=>candidate.id===choice?.id);
     if(!subtask)continue;
     try{
-      const provider=PROVIDERS.includes(choice.provider)?choice.provider:subtask.provider;
-      const moved=provider!==subtask.provider;
+      if(choice.provider===HUMAN){
+        const person=findPerson(people,choice.personId||choice.person);
+        if(!person)throw new Error('Esa persona no está en el equipo del proyecto.');
+        if(subtask.human&&subtask.personId===person.id)continue;
+        Object.assign(subtask,{provider:HUMAN,personId:person.id,personName:person.name,human:true,model:null,effort:null,readOnly:false,
+          status:'pendiente',stage:`Asignada a ${person.name}`,cwd:null,self:false});
+        pushEvent(run,`Sub-tarea #${subtask.index+1} asignada a ${person.name} (persona).`);
+        continue;
+      }
+      const wasHuman=subtask.human===true;
+      const provider=PROVIDERS.includes(choice.provider)?choice.provider:(wasHuman?run.orchestrator.provider:subtask.provider);
+      const moved=wasHuman||provider!==subtask.provider;
       if(moved&&!connections[provider].connected)throw new Error(`${agentName(provider)} no está conectado.`);
       const fallbackModel=moved?(connections[provider].models.find(m=>m.default)||connections[provider].models[0])?.id:subtask.model;
       const chosen=modelChoice(provider,choice.model||fallbackModel,choice.effort===undefined?(moved?null:subtask.effort):choice.effort);
       if(moved)pushEvent(run,`Sub-tarea #${subtask.index+1} reasignada a ${agentName(provider)} (${chosen.model}).`);
-      subtask.provider=provider;subtask.model=chosen.model;subtask.effort=chosen.effort;
+      Object.assign(subtask,{provider,model:chosen.model,effort:chosen.effort,human:false,personId:null,personName:null});
+      if(wasHuman){subtask.status='queued';subtask.stage='En espera';subtask.readOnly=run.readOnly===true;}
       if(choice.readOnly===true&&!subtask.readOnly){subtask.readOnly=true;pushEvent(run,`Sub-tarea #${subtask.index+1} limitada a solo lectura.`);}
     }catch(error){pushEvent(run,`No se pudo aplicar tu elección en la sub-tarea #${subtask.index+1}: ${error.message}`);}
   }
@@ -217,14 +243,15 @@ async function planPhase(run,controller){
   // La persona da el enfoque; las preferencias del usuario van después para que, si chocan, ganen las suyas.
   const instructions=[personaBody(store.data.settings.orchestratorPersona),
     store.data.settings[run.orchestrator.provider+'Instructions']||''].filter(Boolean).join('\n\n');
+  const people=membersOf(project);
   let prompt=buildPlanPrompt({request:run.prompt,connections,memory,history,
-    instructions,maxSubtasks:MAX_SUBTASKS,maxParallel:maxParallel(),readOnly:run.readOnly});
+    instructions,maxSubtasks:MAX_SUBTASKS,maxParallel:maxParallel(),readOnly:run.readOnly,people});
   let parsed=null,sessionId,lastError;
   for(let attempt=0;attempt<2&&!parsed;attempt++){
     const result=await orchestratorRun(run,{prompt,sessionId,controller,onText:text=>{current.content=text;touch();}});
     sessionId=result.sessionId||sessionId;
     current.content=result.text||current.content;current.usage=result.usage;
-    try {parsed=parsePlan(result.text,{connections,maxSubtasks:MAX_SUBTASKS,runReadOnly:run.readOnly});}
+    try {parsed=parsePlan(result.text,{connections,maxSubtasks:MAX_SUBTASKS,runReadOnly:run.readOnly,people});}
     catch(error) {
       if(!(error instanceof PlanError))throw error;
       lastError=error.message;
@@ -270,7 +297,9 @@ async function planPhase(run,controller){
 
 async function prepare(run,decision){
   const project=projectOf(run);
-  const writers=run.subtasks.filter(subtask=>!subtask.readOnly);
+  // Las partes asignadas a personas no se ejecutan: ni copia aislada, ni ola, ni sesión.
+  const agents=run.subtasks.filter(subtask=>!subtask.human);
+  const writers=agents.filter(subtask=>!subtask.readOnly);
   let info=inspect(project.path);
   // Solo hace falta aislar cuando dos o más sub-tareas escriben. Una sola trabaja en la carpeta real,
   // reanuda su sesión nativa y no necesita parche: exactamente como si el agente trabajara por su cuenta.
@@ -287,17 +316,17 @@ async function prepare(run,decision){
     run.isolation.warnings=spaces.warnings;
     run.isolation.roots=Object.fromEntries([...spaces.roots]);
     run.isolation.base=spaces.base;
-    for(const subtask of run.subtasks)subtask.cwd=spaces.cwds.get(subtask.index)||project.path;
+    for(const subtask of agents)subtask.cwd=spaces.cwds.get(subtask.index)||project.path;
   } else {
-    for(const subtask of run.subtasks)subtask.cwd=project.path;
+    for(const subtask of agents)subtask.cwd=project.path;
     // Con el escritor en la carpeta real, el diff desde este punto es la evidencia que verá el revisor.
     run.snapshot=writers.length?snapshotProject(project.path):null;
   }
   if(wantsIsolation&&!isolated)pushEvent(run,'La carpeta no es un repositorio git: las sub-tareas que escriben se ejecutan de una en una.');
   // Una sola sub-tarea para el mismo agente que planificó: la hace él en su sesión, que ya conoce el proyecto.
-  const only=run.subtasks.length===1?run.subtasks[0]:null;
+  const only=agents.length===1?agents[0]:null;
   if(only&&only.provider===run.orchestrator.provider&&run.orchestrator.sessionId&&only.cwd===project.path)only.self=true;
-  run.waves=assignWaves(run.subtasks,{isolated,maxParallel:maxParallel()});
+  run.waves=assignWaves(agents,{isolated,maxParallel:maxParallel()});
   flush();
 }
 
@@ -329,7 +358,10 @@ async function runSubtask(run,subtask,controller,options=null){
       const prior=store.data.messages.filter(m=>m.conversationId===conv.id&&m.runId!==run.id&&m.status!=='error').slice(-12);
       const history=prior.map(m=>`${m.provider||m.role}: ${m.content}`).join('\n\n').slice(-24000);
       prompt=buildDirectPrompt({request:run.prompt,memory,instructions,history,readOnly:subtask.readOnly,resumed:!!sessionId});
-    } else prompt=buildWorkPrompt({request:run.prompt,subtask,memory,instructions,context:run.plan.context,direct});
+    } else {
+      const teamNote=run.subtasks.filter(other=>other.human).map(other=>`- ${other.personName}: ${other.title}`).join('\n');
+      prompt=buildWorkPrompt({request:run.prompt,subtask,memory,instructions,context:run.plan.context,direct,teamNote});
+    }
   }
   try{
     const result=await runProvider(subtask.provider,{
@@ -371,20 +403,22 @@ async function reviewPhase(run,controller){
   // Una única sub-tarea de consulta ya es la respuesta: revisarla sería pagar un turno por repetirla.
   if(run.subtasks.length===1&&run.subtasks[0].readOnly){run.review=null;return;}
   run.phase='review';run.status='reviewing';run.stage='Revisando';flush();
-  const patches=run.subtasks.map(subtask=>subtask.patch).filter(Boolean);
+  // Al revisar de nuevo tras una integración, los parches ya están en la carpeta: no se vuelven a comprobar.
+  const alreadyApplied=(run.review?.integration?.applied?.length||0)>0;
+  const patches=alreadyApplied?[]:run.subtasks.map(subtask=>subtask.patch).filter(Boolean);
   const verified=patches.length?await checkPatches({projectPath:project.path,patches}):{ok:true,failures:[],overlaps:[]};
   const patchText={};
-  for(const subtask of run.subtasks){const change=subtask.patch||subtask.diff;if(change?.file){try{patchText[subtask.id]=fs.readFileSync(change.file,'utf8');}catch{}}}
+  if(!alreadyApplied)for(const subtask of run.subtasks){const change=subtask.patch||subtask.diff;if(change?.file){try{patchText[subtask.id]=fs.readFileSync(change.file,'utf8');}catch{}}}
   // El revisor juzga el resultado integrado: una copia con todos los parches aplicados, o la carpeta
   // real si el trabajo ya está ahí. Solo si nada de eso es posible juzga desde el informe.
-  let cwd=project.path,workspace='project-clean';
+  let cwd=project.path,workspace=patches.length?'project-clean':'project';
   if(patches.length&&verified.ok){
     try{
       const review=await createReviewWorkspace({projectPath:project.path,dataDir,runId:run.id,base:run.isolation?.base,patches});
       cwd=review.cwd;workspace='integrated';
       for(const warning of review.warnings)pushEvent(run,warning);
     }catch(error){pushEvent(run,'No se pudo preparar la copia de revisión; el revisor juzga desde el proyecto: '+error.message);}
-  }else if(run.subtasks.some(subtask=>subtask.diff))workspace='project-direct';
+  }else if(!patches.length&&run.subtasks.some(subtask=>subtask.diff))workspace='project-direct';
   const current=message(conv.id,'assistant','',{provider:run.orchestrator.provider,model:run.orchestrator.model,
     status:'streaming',runId:run.id,subtaskId:null,kind:'review',stage:'Revisión'});
   flush();
@@ -405,7 +439,7 @@ async function reviewPhase(run,controller){
   current.content=result.text;current.status='completed';current.stage='Revisión';current.usage=result.usage;
   const verdict=readVerdict(result.text);
   run.review={messageId:current.id,summary:String(result.text||'').slice(0,8000),
-    status:verdict.integrate?'integrar':'no-integrar',integration:null,workspace};
+    status:verdict.integrate?'integrar':'no-integrar',integration:alreadyApplied?run.review.integration:null,workspace};
   if(!patches.length){flush();return;}
   run.status='integrating';run.stage='Integrando';flush();
   if(verdict.integrate&&verified.ok){
@@ -426,7 +460,9 @@ function recordRunMemory(run){
   const body=[`Tarea: ${run.prompt.slice(0,2000)}`,
     run.answer?`Respuesta directa (${run.orchestrator.provider} ${run.orchestrator.model}):\n${run.answer.slice(0,6000)}`:'',
     run.plan.summary?`Plan (${run.orchestrator.provider} ${run.orchestrator.model}): ${run.plan.summary}`:'',
-    ...run.subtasks.map(subtask=>`${subtask.title} · ${subtask.provider} ${subtask.model} · ${subtask.status}:\n${String(subtask.text||subtask.error||'').slice(0,2500)}`),
+    ...run.subtasks.map(subtask=>subtask.human
+      ?`${subtask.title} · ${subtask.personName} (persona) · ${humanStatusLabel(subtask.status)}${subtask.due?` · fecha límite ${subtask.due}`:''}:\n${String(subtask.result||'sin resultado anotado').slice(0,2500)}`
+      :`${subtask.title} · ${subtask.provider} ${subtask.model} · ${subtask.status}:\n${String(subtask.text||subtask.error||'').slice(0,2500)}`),
     run.review?.summary?`Revisión del orquestador:\n${run.review.summary.slice(0,2500)}`:''].filter(Boolean).join('\n\n');
   // Una corrección actualiza el registro de su tarea en vez de añadir otro.
   const existing=store.data.memories.find(m=>m.automatic&&m.runId===run.id);
@@ -449,7 +485,7 @@ async function finishWorkspaces(run){
 function markFixable(run){
   const project=projectOf(run);
   for(const subtask of run.subtasks||[]){
-    subtask.fixable=run.mode!=='directo'&&!!subtask.sessionId&&!subtask.readOnly&&['completed','error','stopped'].includes(subtask.status)
+    subtask.fixable=run.mode!=='directo'&&!subtask.human&&!!subtask.sessionId&&!subtask.readOnly&&['completed','error','stopped'].includes(subtask.status)
       &&(subtask.cwd===project.path||(!!subtask.cwd&&fs.existsSync(subtask.cwd)));
   }
   touch();
@@ -508,10 +544,14 @@ async function runWaves(run,controller){
 
 async function conclude(run,controller){
   if(controller.signal.aborted)throw new Error('Tarea detenida.');
-  if(run.reviewWanted===false)await skipReview(run);else await reviewPhase(run,controller);
-  const failed=run.subtasks.some(subtask=>subtask.status==='error');
+  const agents=run.subtasks.filter(subtask=>!subtask.human);
+  // Una tarea solo de personas no tiene nada que revisar todavía: se revisa cuando ellas terminen.
+  if(!agents.length&&!run.reviewRequested)run.review=null;
+  else if(run.reviewWanted===false)await skipReview(run);else await reviewPhase(run,controller);
+  const failed=agents.some(subtask=>subtask.status==='error');
   run.status=failed?'error':'completed';run.stage='Completado';run.error=null;
   if(failed)run.error='Alguna sub-tarea no pudo terminar. Revisa el informe antes de dar el trabajo por hecho.';
+  humansRollup(run);
   recordRunMemory(run);
 }
 
@@ -633,12 +673,12 @@ function startRun(body){
     subtasks:[],waves:[],review:null,events:[],reviewWanted:true,initRepo:false};
   let manualNote='';
   if(mode==='manual'){
-    const parsed=parseManualPlan(body.plan,{connections,maxSubtasks:MAX_SUBTASKS,runReadOnly:run.readOnly});
+    const parsed=parseManualPlan(body.plan,{connections,maxSubtasks:MAX_SUBTASKS,runReadOnly:run.readOnly,people:membersOf(project)});
     run.plan={status:'manual',summary:parsed.summary,warnings:parsed.warnings,context:parsed.context};
     run.subtasks=parsed.subtasks.map(toSubtask);
     run.reviewWanted=parsed.review;run.initRepo=body.plan?.initRepo===true;
     run.status='running';run.stage='Preparando';
-    manualNote='\n\n**Reparto a mano:**\n'+run.subtasks.map(subtask=>`- ${subtask.title} · ${agentName(subtask.provider)} ${subtask.model}${subtask.readOnly?' · solo lectura':''}`).join('\n');
+    manualNote='\n\n**Reparto a mano:**\n'+run.subtasks.map(subtask=>`- ${subtask.title} · ${assigneeName(subtask)}${subtask.readOnly?' · solo lectura':''}`).join('\n');
   }
   // El agente principal orquesta, responde en directo o revisa el reparto manual; solo hace falta si actúa.
   const needsPrincipal=mode!=='manual'||run.reviewWanted;
@@ -673,6 +713,33 @@ function startFix(body){
   run.status='running';run.stage='Corrigiendo';flush();
   setImmediate(()=>continueRun(run,subtask,feedback,controller).catch(e=>console.error(e)));
   return run;
+}
+
+// Revisar de nuevo cuando las personas hayan terminado su parte, o tras corregir a mano: solo la revisión.
+function startReview(body){
+  const run=getRun(body.runId);
+  if(active.has(run.id))throw new Error('Espera a que la tarea termine para revisarla de nuevo.');
+  if(run.phase!=='done')throw new Error('Esta tarea todavía no ha terminado.');
+  if(run.mode==='directo')throw new Error('El modo directo no tiene revisión: sigue conversando.');
+  const conv=store.conversation(run.conversationId),project=store.project(conv.projectId);
+  project.path=folder(project.path);
+  assertFolderFree(project);
+  const provider=run.orchestrator.provider;
+  if(!connections[provider].connected)throw new Error(`${agentName(provider)} no está conectado y es quien revisa.`);
+  Object.assign(run.orchestrator,modelChoice(provider,body.model||run.orchestrator.model,body.effort===undefined?run.orchestrator.effort:body.effort));
+  conv.updatedAt=now();
+  message(conv.id,'user','Revisar de nuevo el conjunto de la tarea.',{runId:run.id,kind:'review-request'});
+  const controller=new AbortController();active.set(run.id,controller);
+  run.status='reviewing';run.stage='Revisando';run.reviewWanted=true;run.reviewRequested=true;flush();
+  setImmediate(()=>reviewAgain(run,controller).catch(e=>console.error(e)));
+  return run;
+}
+async function reviewAgain(run,controller){
+  try{
+    run.phase='review';run.error=null;run.finishedAt=null;run.budgetExceeded=false;flush();
+    await conclude(run,controller);
+  }catch(error){failRun(run,controller,error);}
+  finally{await settle(run);}
 }
 
 async function bodyJson(req){let bytes=0,chunks=[];for await(const chunk of req){bytes+=chunk.length;if(bytes>1024*1024)throw new Error('La solicitud es demasiado grande.');chunks.push(chunk);}return JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');}
@@ -750,6 +817,51 @@ const server=http.createServer(async(req,res)=>{
       if(route==='/api/shutdown'&&req.method==='POST'){json(res,200,{ok:true});stop();return;}
       if(route==='/api/run'&&req.method==='POST')return json(res,202,startRun(b));
       if(route==='/api/fix'&&req.method==='POST')return json(res,202,startFix(b));
+      if(route==='/api/review'&&req.method==='POST')return json(res,202,startReview(b));
+      if(route==='/api/people'&&req.method==='POST'){
+        const person=personFields(b,{id:id(),createdAt:now()});
+        store.data.people.push(person);
+        if(b.projectId){const project=store.project(b.projectId);project.members||=[];if(!project.members.includes(person.id))project.members.push(person.id);}
+        flush();return json(res,201,person);
+      }
+      if(route.startsWith('/api/people/')&&['PATCH','DELETE'].includes(req.method)){
+        const person=store.data.people.find(candidate=>candidate.id===route.split('/').pop());if(!person)throw new Error('Persona no encontrada.');
+        if(req.method==='DELETE'){
+          store.data.people=store.data.people.filter(candidate=>candidate!==person);
+          for(const project of store.data.projects)project.members=(project.members||[]).filter(member=>member!==person.id);
+        } else Object.assign(person,personFields({...person,...b}),{updatedAt:now()});
+        flush();return json(res,200,{ok:true});
+      }
+      if(route==='/api/members'&&req.method==='POST'){
+        const project=store.project(b.projectId);
+        const person=store.data.people.find(candidate=>candidate.id===b.personId);if(!person)throw new Error('Persona no encontrada.');
+        project.members||=[];
+        if(b.remove===true)project.members=project.members.filter(member=>member!==person.id);
+        else if(!project.members.includes(person.id))project.members.push(person.id);
+        flush();return json(res,200,{ok:true});
+      }
+      if(route==='/api/subtask'&&req.method==='POST'){
+        const run=getRun(b.runId);
+        const subtask=run.subtasks.find(candidate=>candidate.id===b.subtaskId);
+        if(!subtask?.human)throw new Error('Solo las sub-tareas asignadas a personas se actualizan a mano.');
+        if(b.status!==undefined){
+          if(!HUMAN_STATUSES.includes(b.status))throw new Error('Estado no válido: pendiente, en-curso o hecha.');
+          subtask.status=b.status;
+          subtask.stage=b.status==='hecha'?`Hecha por ${subtask.personName}`:b.status==='en-curso'?`En curso · ${subtask.personName}`:`Asignada a ${subtask.personName}`;
+          subtask.finishedAt=b.status==='hecha'?now():null;
+          if(b.status!=='pendiente'&&!subtask.startedAt)subtask.startedAt=now();
+        }
+        if(b.result!==undefined)subtask.result=str(b.result,'Resultado',12000,true);
+        if(b.due!==undefined){
+          const due=String(b.due||'').trim();
+          if(due&&!/^\d{4}-\d{2}-\d{2}$/.test(due))throw new Error('Fecha límite: usa el formato AAAA-MM-DD.');
+          subtask.due=due||null;
+        }
+        humansRollup(run);
+        // El registro de memoria refleja lo que las personas entregaron, sin gastar ningún turno.
+        if(run.phase==='done')recordRunMemory(run);
+        flush();return json(res,200,{ok:true});
+      }
       if(route==='/api/plan'&&req.method==='POST'){
         const gate=planGates.get(b.runId);
         if(!gate)throw new Error('Ese plan ya no está esperando una respuesta.');
