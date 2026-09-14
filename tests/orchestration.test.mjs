@@ -66,7 +66,7 @@ async function boot(t,{delay=600,scenario}={}) {
   assert.ok(state.connections.claude.connected,'el agente falso no se reportó conectado: '+log);
   // Nunca usar el proyecto por defecto: apunta a la carpeta de Mixto, no a esta copia de prueba.
   const project=await call('projects',{name:'Proyecto de prueba',path:work,description:''});
-  return {call,work,dir,project,log:()=>log,
+  return {call,work,dir,project,origin,cookie,log:()=>log,
     until:async predicate=>{
       for(let attempt=0;attempt<200;attempt++) {
         const current=await call('state');
@@ -186,7 +186,7 @@ test('una pregunta se responde desde el plan: un turno, sin sub-tareas ni revisi
   assert.match(automatic[0].content,/Respuesta directa/);
 });
 
-test('un solo escritor trabaja en la carpeta real, sin copia ni parche, y reanuda su sesión',async t=>{
+test('un solo escritor del mismo agente: el arquitecto lo hace en su sesión, en la carpeta real, sin copia ni parche',async t=>{
   const {call,work,until,project,dir}=await boot(t,{delay:50,scenario:'unica'});
   const conversation=await call('conversations',{projectId:project.id});
   await call('run',{conversationId:conversation.id,prompt:'Escribe solo.txt',readOnly:false,
@@ -208,10 +208,31 @@ test('un solo escritor trabaja en la carpeta real, sin copia ni parche, y reanud
   assert.equal(run.review.integration,null,'no hay parche que integrar: el trabajo ya está en la carpeta');
   assert.equal(fs.readFileSync(path.join(work,'solo.txt'),'utf8'),'escrito por la sub-tarea solo.txt\n');
   assert.equal(fs.existsSync(path.join(dir,'datos','wt')),false);
-  const conv=state.conversations.find(c=>c.id===conversation.id);
-  assert.ok(Object.values(conv.sessions).includes('native-claude'),'la sesión nativa queda guardada para reanudarla');
+  assert.equal(run.subtasks[0].self,true,'misma sesión que el arquitecto: no arranca un trabajador en frío');
+  assert.equal(run.subtasks[0].sessionKey,null);
+  assert.match(run.events.map(e=>e.text).join('\n'),/propia sesión/);
   assert.equal(run.subtasks[0].fixable,true,'una sub-tarea directa con sesión se puede corregir');
   assert.deepEqual(state.messages.filter(m=>m.runId===run.id).map(m=>m.kind||m.role),['user','plan','work','review']);
+});
+
+test('un solo escritor del otro agente trabaja en la carpeta real y guarda su sesión para reanudarla',async t=>{
+  const {call,work,until,project}=await boot(t,{delay:50,scenario:'unica-codex'});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Escribe solo.txt',readOnly:false,
+    orchestrator:{provider:'claude',model:'claude-fake',effort:'medium'}});
+  let run=runOf(await until(s=>runOf(s).status==='awaiting-plan'));
+  assert.equal(run.subtasks[0].provider,'codex');
+  await call('plan',{runId:run.id,approve:true,subtasks:[]});
+  const state=await until(s=>['completed','error'].includes(runOf(s).status));
+  run=runOf(state);
+  assert.equal(run.status,'completed',JSON.stringify(run.subtasks.map(s=>s.error)));
+  assert.equal(run.subtasks[0].self,false);
+  assert.equal(run.subtasks[0].cwd,fs.realpathSync(work));
+  assert.deepEqual(run.isolation.roots,{});
+  assert.equal(fs.readFileSync(path.join(work,'solo.txt'),'utf8'),'escrito por la sub-tarea solo.txt\n');
+  const conv=state.conversations.find(c=>c.id===conversation.id);
+  assert.ok(Object.values(conv.sessions).includes('native-codex'),'la sesión nativa del trabajador queda guardada');
+  assert.deepEqual(state.messages.filter(m=>m.runId===run.id&&m.kind==='work').map(m=>m.provider),['codex']);
 });
 
 test('con la aprobación automática activada, un plan de una sola sub-tarea arranca solo',async t=>{
@@ -322,4 +343,150 @@ test('descartar el plan no ejecuta ninguna sub-tarea',async t=>{
   assert.deepEqual(run.subtasks.map(s=>s.status),['queued','queued']);
   assert.equal(fs.existsSync(path.join(work,'uno.txt')),false);
   assert.equal(fs.existsSync(path.join(work,'dos.txt')),false);
+});
+
+test('el modo directo habla con un solo agente, sin plan ni revisión, y conserva la sesión por agente',async t=>{
+  const {call,work,until,project}=await boot(t,{delay:50});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Hola, ¿qué ves?',readOnly:true,mode:'directo',
+    orchestrator:{provider:'claude',model:'claude-fake',effort:'medium'}});
+  let state=await until(s=>['completed','error'].includes(runOf(s).status));
+  let run=runOf(state);
+  assert.equal(run.status,'completed',run.error);
+  assert.equal(run.mode,'directo');
+  assert.equal(run.plan.status,'direct-mode');
+  assert.equal(run.review,null);
+  assert.equal(run.usage.turns,1);
+  assert.deepEqual(state.messages.filter(m=>m.runId===run.id).map(m=>m.kind||m.role),['user','direct']);
+  assert.equal(run.subtasks[0].fixable,false,'en directo se sigue conversando, no se corrige');
+  let conv=state.conversations.find(c=>c.id===conversation.id);
+  assert.equal(conv.sessions['direct:claude:read'],'native-claude');
+  // Segundo turno con permiso de escritura y otro modelo: el agente trabaja en la carpeta real.
+  await call('run',{conversationId:conversation.id,prompt:'ARCHIVO:directo.txt',readOnly:false,mode:'directo',
+    orchestrator:{provider:'claude',model:'claude-fake-rapido',effort:'low'}});
+  state=await until(s=>s.runs.length===2&&['completed','error'].includes(runOf(s).status));
+  run=runOf(state);
+  assert.equal(run.status,'completed',run.error);
+  assert.equal(fs.readFileSync(path.join(work,'directo.txt'),'utf8'),'escrito por la sub-tarea directo.txt\n');
+  conv=state.conversations.find(c=>c.id===conversation.id);
+  assert.equal(conv.sessions['direct:claude:work'],'native-claude');
+  assert.equal(state.memories.filter(m=>m.automatic&&m.conversationId===conversation.id).length,2);
+});
+
+test('reparto a mano: el usuario asigna cada sub-tarea a un agente y el principal revisa el conjunto',async t=>{
+  const {call,work,until,project}=await boot(t,{delay:300});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Escribe dos archivos',readOnly:false,mode:'manual',
+    orchestrator:{provider:'claude',model:'claude-fake',effort:'medium'},
+    plan:{review:true,subtasks:[
+      {title:'Parte de Codex',provider:'codex',model:'codex-fake',effort:'high',instructions:'ARCHIVO:uno.txt',scope:'uno.txt'},
+      {title:'Parte de Claude',provider:'claude',model:'claude-fake-rapido',effort:'low',instructions:'ARCHIVO:dos.txt',scope:'dos.txt, docs/'}]}});
+  const state=await until(s=>['completed','error'].includes(runOf(s).status));
+  const run=runOf(state);
+  assert.equal(run.status,'completed',JSON.stringify(run.subtasks.map(s=>s.error)));
+  assert.equal(run.mode,'manual');
+  assert.equal(run.plan.status,'manual');
+  assert.deepEqual(run.subtasks.map(s=>[s.provider,s.model,s.effort]),[['codex','codex-fake','high'],['claude','claude-fake-rapido','low']]);
+  assert.deepEqual(run.subtasks[1].scope,['dos.txt','docs/']);
+  assert.equal(run.waves.length,1,'dos escritores con alcances distintos trabajan a la vez');
+  assert.equal(Object.keys(run.isolation.roots).length,2);
+  assert.equal(run.review.status,'integrar');
+  assert.equal(run.review.integration.applied.length,2);
+  assert.equal(fs.readFileSync(path.join(work,'uno.txt'),'utf8'),'escrito por la sub-tarea uno.txt\n');
+  assert.equal(fs.readFileSync(path.join(work,'dos.txt'),'utf8'),'escrito por la sub-tarea dos.txt\n');
+  assert.equal(run.usage.turns,3,'dos sub-tareas y la revisión; ningún turno de planificación');
+  const messages=state.messages.filter(m=>m.runId===run.id);
+  assert.deepEqual(messages.map(m=>m.kind||m.role),['manual','work','work','review']);
+  assert.match(messages[0].content,/Reparto a mano/);
+  assert.match(messages[0].content,/Parte de Codex · Codex codex-fake/);
+  await assert.rejects(call('run',{conversationId:conversation.id,prompt:'Sin sub-tareas',readOnly:false,mode:'manual',
+    orchestrator:{provider:'claude',model:'claude-fake'},plan:{subtasks:[]}}),/al menos una sub-tarea/);
+});
+
+test('reparto a mano sin revisión: los cambios esperan a que el usuario los aplique',async t=>{
+  const {call,work,until,project,dir}=await boot(t,{delay:50});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Escribe dos archivos',readOnly:false,mode:'manual',
+    orchestrator:{provider:'codex',model:'codex-fake',effort:null},
+    plan:{review:false,subtasks:[
+      {title:'Uno',provider:'claude',model:'claude-fake',instructions:'ARCHIVO:uno.txt'},
+      {title:'Dos',provider:'codex',model:'codex-fake',instructions:'ARCHIVO:dos.txt'}]}});
+  const state=await until(s=>['completed','error'].includes(runOf(s).status));
+  const run=runOf(state);
+  assert.equal(run.status,'completed',run.error);
+  assert.equal(run.usage.turns,2,'sin revisión no hay turno del principal');
+  assert.equal(run.review.status,'sin-revisar');
+  assert.deepEqual(run.review.integration,{applied:[],conflicts:[]});
+  assert.equal(fs.existsSync(path.join(work,'uno.txt')),false,'nada se aplica sin que el usuario decida');
+  assert.ok(fs.existsSync(run.isolation.roots[0]),'las copias esperan');
+  const result=await call('integrate',{runId:run.id});
+  assert.equal(result.applied.length,2);
+  assert.equal(fs.readFileSync(path.join(work,'uno.txt'),'utf8'),'escrito por la sub-tarea uno.txt\n');
+  for(let attempt=0;attempt<40&&fs.existsSync(path.join(dir,'datos','wt'));attempt++)await wait(150);
+  assert.equal(fs.existsSync(path.join(dir,'datos','wt')),false);
+});
+
+test('en el plan del arquitecto se puede reasignar una sub-tarea al otro agente o limitarla a solo lectura',async t=>{
+  const {call,work,until,project}=await boot(t,{delay:50});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Reparte este trabajo',readOnly:false,
+    orchestrator:{provider:'claude',model:'claude-fake',effort:'medium'}});
+  let run=runOf(await until(s=>runOf(s).status==='awaiting-plan'));
+  assert.deepEqual(run.subtasks.map(s=>s.provider),['claude','claude']);
+  await call('plan',{runId:run.id,approve:true,subtasks:[
+    {id:run.subtasks[0].id,provider:'codex',model:'codex-fake',effort:'high'},
+    {id:run.subtasks[1].id,provider:'claude',model:run.subtasks[1].model,effort:run.subtasks[1].effort,readOnly:true}]});
+  const state=await until(s=>['completed','error'].includes(runOf(s).status));
+  run=runOf(state);
+  assert.equal(run.status,'completed',JSON.stringify(run.subtasks.map(s=>s.error)));
+  assert.deepEqual(run.subtasks.map(s=>[s.provider,s.model,s.effort,s.readOnly]),[['codex','codex-fake','high',false],['claude','claude-fake','medium',true]]);
+  const events=run.events.map(e=>e.text).join('\n');
+  assert.match(events,/reasignada a Codex/);
+  assert.match(events,/limitada a solo lectura/);
+  // Con un solo escritor ya no hace falta aislar: Codex escribe en la carpeta real; la consulta va antes.
+  assert.deepEqual(run.isolation.roots,{});
+  assert.equal(run.waves.length,2,'primero la consulta, después el único escritor');
+  assert.equal(run.subtasks[1].diff,null,'una sub-tarea de solo lectura no deja diff que revisar');
+  assert.equal(fs.readFileSync(path.join(work,'uno.txt'),'utf8'),'escrito por la sub-tarea uno.txt\n');
+  assert.deepEqual(state.messages.filter(m=>m.runId===run.id&&m.kind==='work').map(m=>m.provider),['claude','codex']);
+});
+
+test('el tope de tokens detiene la tarea al superarse y lo explica',async t=>{
+  const {call,until,project}=await boot(t,{delay:50});
+  await call('settings',{tokenBudget:200});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Reparte este trabajo',readOnly:false,
+    orchestrator:{provider:'claude',model:'claude-fake',effort:'medium'}});
+  let run=runOf(await until(s=>runOf(s).status==='awaiting-plan'));
+  await call('plan',{runId:run.id,approve:true,subtasks:[]});
+  const state=await until(s=>['completed','error','cancelled'].includes(runOf(s).status));
+  run=runOf(state);
+  assert.equal(run.status,'cancelled');
+  assert.equal(run.budgetExceeded,true);
+  assert.match(run.error,/tope de 200 tokens/);
+  assert.equal(run.stage,'Detenida por tope de consumo');
+  assert.ok(run.usage.total>200);
+  assert.ok(run.usage.turns<=3,'como mucho el plan y las dos sub-tareas; nunca la revisión');
+  assert.equal(run.review,null);
+  assert.equal(state.settings.tokenBudget,200);
+  await assert.rejects(call('settings',{tokenBudget:-5}),/Tope de tokens/);
+});
+
+test('el servidor empuja el estado por SSE en cuanto cambia, sin sondeo',async t=>{
+  const {call,project,origin,cookie}=await boot(t,{delay:50});
+  const response=await fetch(origin+'/api/events',{headers:{cookie}});
+  assert.equal(response.status,200);
+  assert.equal(response.headers.get('content-type'),'text/event-stream; charset=utf-8');
+  const reader=response.body.getReader(),decoder=new TextDecoder();
+  let text='';
+  while(!/event: state\ndata: [^\n]+\n\n/.test(text)){const {value,done}=await reader.read();if(done)break;text+=decoder.decode(value,{stream:true});}
+  assert.match(text,/^retry: 2000\n\n/);
+  assert.match(text,/event: state\ndata: \{"version":1/);
+  await call('memories',{projectId:project.id,title:'Nota',content:'Empujada por SSE'});
+  let more='';
+  for(let attempt=0;attempt<40&&!more.includes('Empujada por SSE');attempt++){const {value,done}=await reader.read();if(done)break;more+=decoder.decode(value,{stream:true});}
+  assert.match(more,/Empujada por SSE/,'el cambio llegó por el flujo de eventos');
+  await reader.cancel();
+  const unauthenticated=await fetch(origin+'/api/events');
+  assert.equal(unauthenticated.status,401);
 });

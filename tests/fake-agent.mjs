@@ -30,6 +30,7 @@ const PLAN=fence({resumen:'Dos frentes en paralelo',contexto:'El proyecto es una
 const PLAN_COLISION=fence({resumen:'Dos frentes que chocan a propósito',
   subtareas:[writer('Frente colisión uno','compartido.txt',1),writer('Frente colisión dos','compartido.txt',2)]});
 const PLAN_UNICA=fence({resumen:'Un solo escritor',contexto:'Trabaja en la carpeta real.',subtareas:[writer('Frente único','solo.txt',1)]});
+const PLAN_UNICA_CODEX=fence({resumen:'Un solo escritor, en Codex',subtareas:[{...writer('Frente único','solo.txt',1),proveedor:'codex',modelo:'codex-fake'}]});
 const PLAN_LECTURA=fence({resumen:'Una sola consulta',subtareas:[{titulo:'Consulta',proveedor:'claude',modelo:'claude-fake',esfuerzo:'medium',
   justificacion:'solo leer',rol:'Investigar',instrucciones:'CONSULTA: describe base.txt',alcance:[],soloLectura:true,orden:1}]});
 // A direct answer with a code fence inside the JSON string: the parser must survive the inner ```.
@@ -46,12 +47,14 @@ function scripted(text){
   if(text.includes('AGENTES Y MODELOS DISPONIBLES')){
     if(scenario==='colision')return PLAN_COLISION;
     if(scenario==='unica'||scenario==='auto')return PLAN_UNICA;
+    if(scenario==='unica-codex')return PLAN_UNICA_CODEX;
     if(scenario==='lectura')return PLAN_LECTURA;
     if(scenario==='directa')return RESPUESTA;
     return PLAN;
   }
   if(text.includes('"accion":"seguir"'))return scenario==='colision'?SUPERVISION_DETENER:'```json\n{"accion":"seguir"}\n```';
-  if(text.includes('VEREDICTO')){
+  // The review is recognised by its own heading: «VEREDICTO» also travels inside memory records.
+  if(text.includes('TRABAJO DE CADA SUB-TAREA')){
     // In the fix scenario the first review rejects; only a corrected patch is accepted.
     if(scenario==='corregir'&&!text.includes('corregido'))return 'Falta la corrección en uno.txt.\n\nVEREDICTO: NO INTEGRAR';
     return 'Sin duplicados ni contradicciones.\n\nVEREDICTO: INTEGRAR';

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {buildPlanPrompt,parsePlan,assignWaves,buildReviewPrompt,readVerdict,PlanError,buildSupervisionPrompt,parseDecision,buildWorkPrompt,buildFixPrompt,parseJsonBlock} from '../lib/orchestrator.mjs';
+import {buildPlanPrompt,parsePlan,parseManualPlan,assignWaves,buildReviewPrompt,readVerdict,PlanError,buildSupervisionPrompt,parseDecision,buildWorkPrompt,buildFixPrompt,buildDirectPrompt,buildSelfPrompt,parseJsonBlock} from '../lib/orchestrator.mjs';
 
 const connections={
   codex:{connected:true,models:[{id:'gpt-5-codex',name:'Codex',efforts:['low','medium','high'],default:true}]},
@@ -244,4 +244,41 @@ test('buildReviewPrompt describe dónde está el revisor y lista los archivos nu
   // Un parche largo se recorta y se dice dónde está el completo.
   const long=buildReviewPrompt({request:'Haz X',subtasks,patchText:{a:'x'.repeat(20000)},workspace:'integrated'});
   assert.match(long,/recortado/);
+});
+
+test('parseManualPlan valida el reparto hecho a mano con las mismas reglas que un plan',()=>{
+  const result=parseManualPlan({review:false,context:'Usa node:test',subtasks:[
+    {title:'API',provider:'codex',model:'gpt-5-codex',effort:'high',instructions:'Crea el endpoint',scope:'src/api.js, src/routes/'},
+    {title:'Docs',provider:'claude',model:'inventado',effort:'ultra',instructions:'Documenta',readOnly:true,order:''}]},{connections});
+  assert.equal(result.direct,false);
+  assert.equal(result.review,false);
+  assert.equal(result.context,'Usa node:test');
+  assert.equal(result.summary,'Reparto hecho a mano.');
+  assert.deepEqual(result.subtasks[0].scope,['src/api.js','src/routes/']);
+  assert.equal(result.subtasks[0].role,'Sub-tarea asignada por el usuario');
+  assert.equal(result.subtasks[0].effort,'high');
+  assert.equal(result.subtasks[1].model,'opus','un modelo fuera del catálogo se corrige al predeterminado');
+  assert.equal(result.subtasks[1].effort,null);
+  assert.equal(result.subtasks[1].readOnly,true);
+  assert.equal(result.subtasks[1].order,2);
+  assert.equal(result.warnings.length,2);
+  assert.throws(()=>parseManualPlan({subtasks:[]},{connections}),/al menos una sub-tarea/);
+  assert.throws(()=>parseManualPlan({subtasks:[{title:'',provider:'codex',model:'gpt-5-codex',instructions:'x'}]},{connections}),PlanError);
+  assert.throws(()=>parseManualPlan({subtasks:[{title:'t',provider:'gemini',model:'x',instructions:'x'}]},{connections}),/no es un agente/);
+  assert.throws(()=>parseManualPlan({subtasks:Array.from({length:9},()=>({title:'t',provider:'codex',model:'gpt-5-codex',instructions:'x'}))},{connections}),/máximo 8/);
+  assert.equal(parseManualPlan({subtasks:[{title:'t',provider:'codex',model:'gpt-5-codex',instructions:'x'}]},{connections,runReadOnly:true}).subtasks[0].readOnly,true,'el techo de permisos manda');
+});
+
+test('buildDirectPrompt solo lleva historial cuando no hay sesión que reanudar; buildSelfPrompt no replanifica',()=>{
+  const fresh=buildDirectPrompt({request:'Hola',history:'usuario: antes',readOnly:true,resumed:false});
+  assert.match(fresh,/modo directo/);
+  assert.match(fresh,/usuario: antes/);
+  assert.match(fresh,/no puedes modificar/);
+  const resumed=buildDirectPrompt({request:'Hola',history:'usuario: antes',readOnly:false,resumed:true});
+  assert.doesNotMatch(resumed,/usuario: antes/,'con sesión reanudada el historial ya está en el agente');
+  assert.match(resumed,/Puedes modificar archivos/);
+  const self=buildSelfPrompt({subtask:{title:'Tests',role:'Probar',instructions:'Escribe tests',scope:['tests/'],readOnly:false}});
+  assert.match(self,/hazla tú ahora en esta misma sesión/);
+  assert.match(self,/tests\//);
+  assert.doesNotMatch(self,/PETICIÓN ORIGINAL|MEMORIA COMPARTIDA/);
 });

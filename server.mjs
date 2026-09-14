@@ -6,7 +6,7 @@ import {randomBytes} from 'node:crypto';
 import {Store,id,now,memoryContext,sessionKey,rememberSession} from './lib/store.mjs';
 import {discover,runProvider,readLimits} from './lib/providers.mjs';
 import {EngramBridge,sharedMemories,cleanupOrphanTransfers} from './lib/engram.mjs';
-import {buildPlanPrompt,parsePlan,assignWaves,buildReviewPrompt,readVerdict,PlanError,buildSupervisionPrompt,parseDecision,buildWorkPrompt,buildFixPrompt} from './lib/orchestrator.mjs';
+import {buildPlanPrompt,parsePlan,parseManualPlan,assignWaves,buildReviewPrompt,readVerdict,PlanError,buildSupervisionPrompt,parseDecision,buildWorkPrompt,buildFixPrompt,buildDirectPrompt,buildSelfPrompt} from './lib/orchestrator.mjs';
 import {inspect,initRepository,createWorkspaces,createReviewWorkspace,capturePatch,checkPatches,applyPatches,removeWorkspaces,cleanupOrphanWorkspaces,snapshotProject,diffSince} from './lib/isolation.mjs';
 import {createManagedProject,managedProjectPath,projectsRoot,syncDiscoveredProjects} from './lib/projects.mjs';
 import {listPersonas,personaBody} from './lib/personas.mjs';
@@ -39,6 +39,7 @@ void cleanupOrphanWorkspaces({dataDir,projectPaths:store.data.projects.map(proje
   .then(()=>{for(const run of store.data.runs){try{markFixable(run);}catch{}}store.save();});
 const active=new Map(),approvals=new Map(),planGates=new Map();
 const MAX_SUBTASKS=8;
+const PROVIDERS=['codex','claude'];
 const maxParallel=()=>Math.max(1,Math.min(6,Number(process.env.MIXTO_MAX_PARALLEL)||3));
 // Comandos de solo lectura que el revisor puede ejecutar sin preguntar; todo lo demás pasa por el usuario.
 const REVIEW_ALLOWED=['git diff','git status','git log','git show'].flatMap(command=>[`Bash(${command})`,`Bash(${command}:*)`,`Bash(${command} *)`]);
@@ -48,20 +49,35 @@ const memoryTimer=setInterval(()=>void syncMemory(),15000);
 memoryTimer.unref();
 const connections=Object.fromEntries(['codex','claude'].map(provider=>[provider,{connected:false,loading:true,models:store.data.catalogs?.[provider]||[]}]));
 let refreshing=null,dirty=false;
-const flush=()=>{store.save();dirty=false;};
+// Los cambios se empujan a la interfaz por SSE en vez de sondearlos: `touch()` marca datos pendientes de
+// guardar y de enviar, y `notify()` agrupa los envíos para no inundar mientras un agente escribe.
+const clients=new Set();let pushTimer=null;
+function broadcast(){
+  if(!clients.size)return;
+  let payload;
+  try{payload=`event: state\ndata: ${JSON.stringify(snapshot())}\n\n`;}catch{return;}
+  for(const client of clients){try{client.write(payload);}catch{clients.delete(client);}}
+}
+function notify(){if(pushTimer||!clients.size)return;pushTimer=setTimeout(()=>{pushTimer=null;broadcast();},300);}
+const touch=()=>{dirty=true;notify();};
+const flush=()=>{store.save();dirty=false;notify();};
+const keepalive=setInterval(()=>{for(const client of clients){try{client.write(': ping\n\n');}catch{clients.delete(client);}}},20000);
+keepalive.unref();
+const toSubtask=(item,index)=>({id:id(),index,...item,cwd:null,patch:null,diff:null,text:'',status:'queued',stage:'En espera',
+  events:[],messageId:null,sessionKey:null,sessionId:null,usage:null,error:null,startedAt:null,finishedAt:null,fixable:false,self:false});
 const checkpoint=setInterval(()=>{if(dirty)try{flush();}catch(e){console.error('No se pudo guardar:',e.message);}},2000);
 checkpoint.unref();
 
 async function refreshConnections(){
   if(refreshing)return refreshing;
   refreshing=Promise.all(['codex','claude'].map(async provider=>{
-    connections[provider]={...connections[provider],loading:true};
+    connections[provider]={...connections[provider],loading:true};notify();
     try{
       connections[provider]={...await discover(provider,root),loading:false};
-      store.data.catalogs||={};store.data.catalogs[provider]=connections[provider].models;dirty=true;
+      store.data.catalogs||={};store.data.catalogs[provider]=connections[provider].models;touch();
     }
     catch(e){connections[provider]={...connections[provider],connected:false,loading:false,error:e.message};}
-  })).finally(()=>{refreshing=null;});
+  })).finally(()=>{refreshing=null;notify();});
   return refreshing;
 }
 
@@ -69,7 +85,7 @@ async function refreshConnections(){
 let limitsRefresh=null;
 function refreshLimits(){
   if(limitsRefresh||!connections.codex.connected)return limitsRefresh||Promise.resolve();
-  limitsRefresh=readLimits('codex',root).then(limits=>{if(limits)connections.codex={...connections.codex,limits};}).catch(()=>{}).finally(()=>{limitsRefresh=null;});
+  limitsRefresh=readLimits('codex',root).then(limits=>{if(limits){connections.codex={...connections.codex,limits};notify();}}).catch(()=>{}).finally(()=>{limitsRefresh=null;});
   return limitsRefresh;
 }
 
@@ -95,14 +111,21 @@ function snapshot(){
 function message(conversationId,role,content,extra={}){const m={id:id(),conversationId,role,content,createdAt:now(),...extra};store.data.messages.push(m);return m;}
 
 const agentName=provider=>provider==='claude'?'Claude Code':'Codex';
-const pushEvent=(run,text)=>{run.events.push({time:now(),text:String(text).slice(0,1500)});run.events=run.events.slice(-60);dirty=true;};
+const pushEvent=(run,text)=>{run.events.push({time:now(),text:String(text).slice(0,1500)});run.events=run.events.slice(-60);touch();};
 
-// Todo turno de la tarea suma aquí, también los del arquitecto: es lo que cuesta la tarea entera.
+// Todo turno de la tarea suma aquí, también los del arquitecto: es lo que cuesta la tarea entera. El tope
+// se comprueba al cerrar cada turno, así que puede excederse por uno; al superarlo la tarea se detiene.
 function addUsage(run,usage){
   if(!usage)return;
   run.usage||={input:0,cached:0,output:0,total:0,costUsd:0,turns:0};
   for(const key of ['input','cached','output','total','costUsd'])run.usage[key]+=Number(usage[key])||0;
-  run.usage.turns++;dirty=true;
+  run.usage.turns++;touch();
+  const budget=Math.floor(Number(store.data.settings.tokenBudget))||0;
+  if(budget>0&&run.usage.total>budget&&!run.budgetExceeded){
+    run.budgetExceeded=true;
+    pushEvent(run,`La tarea superó el tope de ${budget} tokens (lleva ${run.usage.total}); se detiene.`);
+    active.get(run.id)?.abort({budget:true,limit:budget,total:run.usage.total});
+  }
 }
 
 // The run's own status is never written by a sub-task: with several running at once it is derived here.
@@ -125,7 +148,7 @@ function ask(run,subtask,request,signal,label){
     signal.addEventListener('abort',abort,{once:true});
     approvals.set(requestId,{public:{id:requestId,runId:run.id,subtaskId:subtask.id,provider:subtask.provider,
       label:label||`#${subtask.index+1} ${subtask.title} · ${subtask.model}`,...request},
-      resolve:answer=>{signal.removeEventListener('abort',abort);approvals.delete(requestId);subtask.status='running';if(run.phase==='review')run.status='reviewing';rollup(run);dirty=true;resolve(answer);}});
+      resolve:answer=>{signal.removeEventListener('abort',abort);approvals.delete(requestId);subtask.status='running';if(run.phase==='review')run.status='reviewing';rollup(run);touch();resolve(answer);}});
     subtask.status='waiting';if(run.phase==='review')run.status='waiting';rollup(run);flush();
   });
 }
@@ -149,13 +172,22 @@ function modelChoice(provider,model,effort){
   return {model:checked,effort:effort||null};
 }
 
-// The user may trade a model down to economise; everything else in the plan stays as the orchestrator wrote it.
+// The user may reassign a sub-task to the other agent, trade a model down or tighten it to read-only;
+// everything else in the plan stays as the orchestrator wrote it. One bad choice never blocks the rest.
 function applyPlanChoices(run,choices){
   for(const choice of Array.isArray(choices)?choices:[]){
     const subtask=run.subtasks.find(candidate=>candidate.id===choice?.id);
     if(!subtask)continue;
-    const chosen=modelChoice(subtask.provider,choice.model||subtask.model,choice.effort===undefined?subtask.effort:choice.effort);
-    subtask.model=chosen.model;subtask.effort=chosen.effort;
+    try{
+      const provider=PROVIDERS.includes(choice.provider)?choice.provider:subtask.provider;
+      const moved=provider!==subtask.provider;
+      if(moved&&!connections[provider].connected)throw new Error(`${agentName(provider)} no está conectado.`);
+      const fallbackModel=moved?(connections[provider].models.find(m=>m.default)||connections[provider].models[0])?.id:subtask.model;
+      const chosen=modelChoice(provider,choice.model||fallbackModel,choice.effort===undefined?(moved?null:subtask.effort):choice.effort);
+      if(moved)pushEvent(run,`Sub-tarea #${subtask.index+1} reasignada a ${agentName(provider)} (${chosen.model}).`);
+      subtask.provider=provider;subtask.model=chosen.model;subtask.effort=chosen.effort;
+      if(choice.readOnly===true&&!subtask.readOnly){subtask.readOnly=true;pushEvent(run,`Sub-tarea #${subtask.index+1} limitada a solo lectura.`);}
+    }catch(error){pushEvent(run,`No se pudo aplicar tu elección en la sub-tarea #${subtask.index+1}: ${error.message}`);}
   }
 }
 
@@ -165,7 +197,7 @@ async function orchestratorRun(run,{prompt,sessionId,controller,onText,cwd,extra
     cwd:cwd||project.path,model:run.orchestrator.model,effort:run.orchestrator.effort,prompt,readOnly:true,extraTools,allowedTools,
     // The architect's session is kept alive across plan, supervision and review turns: it never re-explains itself.
     sessionId:sessionId??run.orchestrator.sessionId,signal:controller.signal,
-    onSession:sid=>{run.orchestrator.sessionId=sid;dirty=true;},onText,
+    onSession:sid=>{run.orchestrator.sessionId=sid;touch();},onText,
     onEvent:text=>pushEvent(run,text),
     approve:approve||(()=>Promise.resolve({allow:false}))
   });
@@ -189,7 +221,7 @@ async function planPhase(run,controller){
     instructions,maxSubtasks:MAX_SUBTASKS,maxParallel:maxParallel(),readOnly:run.readOnly});
   let parsed=null,sessionId,lastError;
   for(let attempt=0;attempt<2&&!parsed;attempt++){
-    const result=await orchestratorRun(run,{prompt,sessionId,controller,onText:text=>{current.content=text;dirty=true;}});
+    const result=await orchestratorRun(run,{prompt,sessionId,controller,onText:text=>{current.content=text;touch();}});
     sessionId=result.sessionId||sessionId;
     current.content=result.text||current.content;current.usage=result.usage;
     try {parsed=parsePlan(result.text,{connections,maxSubtasks:MAX_SUBTASKS,runReadOnly:run.readOnly});}
@@ -214,8 +246,7 @@ async function planPhase(run,controller){
       provider:run.orchestrator.provider,model:run.orchestrator.model,effort:run.orchestrator.effort,scope:[],
       readOnly:run.readOnly===true,order:1}]};
   run.plan={status:fallback?'fallback':'ready',summary:parsed.summary,warnings:parsed.warnings,context:parsed.context||''};
-  run.subtasks=parsed.subtasks.map((item,index)=>({id:id(),index,...item,cwd:null,patch:null,diff:null,text:'',
-    status:'queued',stage:'En espera',events:[],messageId:null,sessionKey:null,sessionId:null,usage:null,error:null,startedAt:null,finishedAt:null,fixable:false}));
+  run.subtasks=parsed.subtasks.map(toSubtask);
   current.status='completed';current.stage='Plan';
   if(!current.content.trim())current.content=parsed.summary;
   // Inspected before the gate so the approval screen can ask about a folder without git.
@@ -262,41 +293,59 @@ async function prepare(run,decision){
     // Con el escritor en la carpeta real, el diff desde este punto es la evidencia que verá el revisor.
     run.snapshot=writers.length?snapshotProject(project.path):null;
   }
+  if(wantsIsolation&&!isolated)pushEvent(run,'La carpeta no es un repositorio git: las sub-tareas que escriben se ejecutan de una en una.');
+  // Una sola sub-tarea para el mismo agente que planificó: la hace él en su sesión, que ya conoce el proyecto.
+  const only=run.subtasks.length===1?run.subtasks[0]:null;
+  if(only&&only.provider===run.orchestrator.provider&&run.orchestrator.sessionId&&only.cwd===project.path)only.self=true;
   run.waves=assignWaves(run.subtasks,{isolated,maxParallel:maxParallel()});
   flush();
 }
 
-// `fix` reanuda la sesión nativa de la sub-tarea con la revisión y las indicaciones del usuario.
-async function runSubtask(run,subtask,controller,fix=null){
+// `options.kind`: 'work' (una sub-tarea del plan), 'self' (el arquitecto la hace en su propia sesión),
+// 'direct' (modo directo, sin arquitecto) o 'fix' (corrección que reanuda la sesión de la sub-tarea).
+async function runSubtask(run,subtask,controller,options=null){
   const conv=store.conversation(run.conversationId),project=store.project(conv.projectId);
+  const kind=options?.kind||'work';
   const direct=subtask.cwd===project.path;
-  subtask.status='running';subtask.stage=fix?'Corrigiendo':subtask.readOnly?'Investigando':'Trabajando';
+  const stageLabel=kind==='fix'?`Corrección: ${subtask.title}`:kind==='direct'?'Directo':subtask.title;
+  subtask.status='running';subtask.stage=kind==='fix'?'Corrigiendo':subtask.readOnly?'Investigando':'Trabajando';
   subtask.startedAt=now();subtask.finishedAt=null;subtask.error=null;rollup(run);
   const current=message(conv.id,'assistant','',{provider:subtask.provider,model:subtask.model,status:'streaming',
-    runId:run.id,subtaskId:subtask.id,kind:'work',stage:fix?`Corrección: ${subtask.title}`:subtask.title});
+    runId:run.id,subtaskId:subtask.id,kind:kind==='direct'?'direct':'work',stage:stageLabel});
   subtask.messageId=current.id;flush();
-  const memory=fix?'':memoryContext({...store.data,memories:sharedMemories(store.data)},project.id,conv.id,subtask.instructions);
-  // A native session belongs to one working folder: resuming it from an isolated copy would mix contexts.
-  const key=direct?sessionKey(subtask):null;
-  subtask.sessionKey=key;
+  if(kind==='self')pushEvent(run,'Una sola sub-tarea para el mismo agente: el arquitecto la hace en su propia sesión, sin arrancar otro proceso en frío.');
   const instructions=store.data.settings[subtask.provider+'Instructions']||'';
-  const prompt=fix?buildFixPrompt({request:run.prompt,subtask,review:run.review?.summary||'',feedback:fix.feedback})
-    :buildWorkPrompt({request:run.prompt,subtask,memory,instructions,context:run.plan.context,direct});
-  const sessionId=fix?subtask.sessionId:(key?conv.sessions?.[key]:undefined);
+  // A native session belongs to one working folder: resuming it from an isolated copy would mix contexts.
+  // En modo directo la sesión es de la conversación y del agente, no del modelo: cambiar de modelo no la pierde.
+  const key=kind==='work'&&direct?sessionKey(subtask):kind==='direct'?`direct:${subtask.provider}:${subtask.readOnly?'read':'work'}`:null;
+  subtask.sessionKey=key;
+  const sessionId=kind==='fix'?subtask.sessionId:kind==='self'?run.orchestrator.sessionId:(key?conv.sessions?.[key]:undefined);
+  let prompt;
+  if(kind==='fix')prompt=buildFixPrompt({request:run.prompt,subtask,review:run.review?.summary||'',feedback:options?.feedback||''});
+  else if(kind==='self')prompt=buildSelfPrompt({subtask});
+  else{
+    const memory=memoryContext({...store.data,memories:sharedMemories(store.data)},project.id,conv.id,subtask.instructions);
+    if(kind==='direct'){
+      const prior=store.data.messages.filter(m=>m.conversationId===conv.id&&m.runId!==run.id&&m.status!=='error').slice(-12);
+      const history=prior.map(m=>`${m.provider||m.role}: ${m.content}`).join('\n\n').slice(-24000);
+      prompt=buildDirectPrompt({request:run.prompt,memory,instructions,history,readOnly:subtask.readOnly,resumed:!!sessionId});
+    } else prompt=buildWorkPrompt({request:run.prompt,subtask,memory,instructions,context:run.plan.context,direct});
+  }
   try{
     const result=await runProvider(subtask.provider,{
       cwd:subtask.cwd,model:subtask.model,effort:subtask.effort,prompt,readOnly:subtask.readOnly,
-      sessionId,signal:controller.signal,onSession:sid=>{subtask.sessionId=sid;dirty=true;},
-      onText:text=>{current.content=text;dirty=true;},
-      onEvent:text=>{subtask.events.push({time:now(),text:String(text).slice(0,1500)});subtask.events=subtask.events.slice(-40);dirty=true;},
+      sessionId,signal:controller.signal,onSession:sid=>{subtask.sessionId=sid;touch();},
+      onText:text=>{current.content=text;touch();},
+      onEvent:text=>{subtask.events.push({time:now(),text:String(text).slice(0,1500)});subtask.events=subtask.events.slice(-40);touch();},
       approve:request=>ask(run,subtask,request,controller.signal)
     });
     if(controller.signal.aborted)throw new Error('Tarea detenida.');
     if(!result.text?.trim())throw new Error('El agente terminó sin devolver texto. Revisa la actividad e inténtalo de nuevo.');
     if(result.sessionId)subtask.sessionId=result.sessionId;
     if(key&&result.sessionId)rememberSession(conv,key,result.sessionId);
+    if(kind==='self'&&result.sessionId)run.orchestrator.sessionId=result.sessionId;
     connections[subtask.provider].verifiedAt=now();
-    current.content=result.text;current.status='completed';current.stage=fix?`Corrección: ${subtask.title}`:subtask.title;current.usage=result.usage;
+    current.content=result.text;current.status='completed';current.stage=stageLabel;current.usage=result.usage;
     addUsage(run,result.usage);
     subtask.text=result.text.slice(0,20000);subtask.usage=result.usage;subtask.status='completed';subtask.stage='Completado';
     if(result.permissionDenials?.length)pushEvent(run,`${subtask.title}: algunas herramientas no recibieron permiso.`);
@@ -307,10 +356,11 @@ async function runSubtask(run,subtask,controller,fix=null){
     }
   }catch(error){
     // A subtask-specific abort carries a reason object; a run-wide cancel or a real failure does not.
-    const byArchitect=controller.signal.aborted&&controller.signal.reason?.architect===true;
+    const reason=controller.signal.aborted?controller.signal.reason:null;
+    const byArchitect=reason?.architect===true,byBudget=reason?.budget===true;
     subtask.status=byArchitect?'stopped':controller.signal.aborted?'cancelled':'error';
-    subtask.stage=byArchitect?'Detenida por el arquitecto':'Sin completar';
-    subtask.error=byArchitect?controller.signal.reason.motivo:(noteAuthFailure(subtask.provider,error.message)||error.message);
+    subtask.stage=byArchitect?'Detenida por el arquitecto':byBudget?'Detenida por tope de consumo':'Sin completar';
+    subtask.error=byArchitect?reason.motivo:byBudget?`La tarea superó el tope de ${reason.limit} tokens.`:(noteAuthFailure(subtask.provider,error.message)||error.message);
     current.status=subtask.status;current.error=subtask.error;current.stage=subtask.stage;
     if(current.content.trim()===error.message.trim())current.content='';
   }finally{subtask.finishedAt=now();rollup(run);flush();}
@@ -341,7 +391,7 @@ async function reviewPhase(run,controller){
   const reviewer={id:'review:'+run.id,index:-1,title:'Revisión',model:run.orchestrator.model,provider:run.orchestrator.provider,status:'running'};
   const turn=where=>orchestratorRun(run,{controller,cwd:where,extraTools:['Bash'],allowedTools:REVIEW_ALLOWED,
     approve:request=>ask(run,reviewer,request,controller.signal,`Revisión · ${run.orchestrator.model}`),
-    onText:text=>{current.content=text;dirty=true;},
+    onText:text=>{current.content=text;touch();},
     prompt:buildReviewPrompt({request:run.prompt,subtasks:run.subtasks,overlaps:verified.overlaps,failures:verified.failures,patchText,workspace})});
   let result;
   try{result=await turn(cwd);}
@@ -399,10 +449,10 @@ async function finishWorkspaces(run){
 function markFixable(run){
   const project=projectOf(run);
   for(const subtask of run.subtasks||[]){
-    subtask.fixable=!!subtask.sessionId&&!subtask.readOnly&&['completed','error','stopped'].includes(subtask.status)
+    subtask.fixable=run.mode!=='directo'&&!!subtask.sessionId&&!subtask.readOnly&&['completed','error','stopped'].includes(subtask.status)
       &&(subtask.cwd===project.path||(!!subtask.cwd&&fs.existsSync(subtask.cwd)));
   }
-  dirty=true;
+  touch();
 }
 
 const MAX_SUPERVISION=()=>Math.max(1,Number(process.env.MIXTO_MAX_SUPERVISION)||12);
@@ -450,7 +500,7 @@ async function runWaves(run,controller){
       }});
       watcher.start();
     }
-    await Promise.allSettled(tasks.map(subtask=>runSubtask(run,subtask,controllers.get(subtask.id))));
+    await Promise.allSettled(tasks.map(subtask=>runSubtask(run,subtask,controllers.get(subtask.id),subtask.self?{kind:'self'}:null)));
     watcher?.stop();
     await supervision.chain.catch(()=>{});
   }
@@ -458,19 +508,35 @@ async function runWaves(run,controller){
 
 async function conclude(run,controller){
   if(controller.signal.aborted)throw new Error('Tarea detenida.');
-  await reviewPhase(run,controller);
+  if(run.reviewWanted===false)await skipReview(run);else await reviewPhase(run,controller);
   const failed=run.subtasks.some(subtask=>subtask.status==='error');
   run.status=failed?'error':'completed';run.stage='Completado';run.error=null;
   if(failed)run.error='Alguna sub-tarea no pudo terminar. Revisa el informe antes de dar el trabajo por hecho.';
   recordRunMemory(run);
 }
 
+// Reparto manual sin revisor: los parches se comprueban y quedan a la espera de que el usuario decida.
+async function skipReview(run){
+  const project=projectOf(run);
+  const patches=run.subtasks.map(subtask=>subtask.patch).filter(Boolean);
+  if(!patches.length){run.review=null;return;}
+  run.phase='review';run.status='integrating';run.stage='Comprobando';flush();
+  const verified=await checkPatches({projectPath:project.path,patches});
+  run.review={messageId:null,summary:'',status:'sin-revisar',workspace:null,integration:{applied:[],conflicts:verified.failures}};
+  pushEvent(run,verified.ok?'Sin revisión automática: aplica o descarta los cambios desde la conversación.'
+    :'Sin revisión automática: hay parches que no aplican limpios. Revisa el informe y corrige o descarta.');
+  flush();
+}
+
 function failRun(run,controller,error){
+  const reason=controller.signal.aborted?controller.signal.reason:null;
   run.status=controller.signal.aborted?'cancelled':'error';
-  run.error=noteAuthFailure(run.orchestrator.provider,error.message)||error.message;
-  run.stage='Sin completar';
+  run.error=reason?.budget===true
+    ?`La tarea se detuvo al superar el tope de ${reason.limit} tokens (llevaba ${reason.total}). Sube el tope en Agentes, corrige una sub-tarea o vuelve a pedirla.`
+    :(noteAuthFailure(run.orchestrator.provider,error.message)||error.message);
+  run.stage=reason?.budget===true?'Detenida por tope de consumo':'Sin completar';
   for(const message of store.data.messages)if(message.runId===run.id&&message.status==='streaming'){
-    message.status=run.status;message.stage='Sin completar';message.error=run.error;
+    message.status=run.status;message.stage=run.stage;message.error=run.error;
   }
 }
 
@@ -486,9 +552,14 @@ async function settle(run){
 
 async function execute(run,controller){
   try{
-    const decision=await planPhase(run,controller);
-    if(!decision){run.status='cancelled';run.stage='Plan descartado';return;}
-    if(decision.direct){run.status='completed';run.stage='Respondido';recordRunMemory(run);return;}
+    if(run.mode==='directo'){await directPhase(run,controller);return;}
+    let decision;
+    if(run.mode==='manual'){decision={approve:true,initRepo:run.initRepo===true,subtasks:[]};run.status='running';run.stage='Preparando';flush();}
+    else{
+      decision=await planPhase(run,controller);
+      if(!decision){run.status='cancelled';run.stage='Plan descartado';return;}
+      if(decision.direct){run.status='completed';run.stage='Respondido';recordRunMemory(run);return;}
+    }
     await prepare(run,decision);
     run.phase='work';rollup(run);flush();
     await runWaves(run,controller);
@@ -497,12 +568,28 @@ async function execute(run,controller){
   finally{await settle(run);}
 }
 
+// Modo directo: un solo agente en la carpeta real, con sesión continua, sin plan ni revisión.
+async function directPhase(run,controller){
+  const project=projectOf(run);
+  run.phase='work';run.plan={status:'direct-mode',summary:'',warnings:[],context:''};
+  const subtask=toSubtask({title:'Directo',role:'Responder o resolver la petición',instructions:run.prompt,justification:'',
+    provider:run.orchestrator.provider,model:run.orchestrator.model,effort:run.orchestrator.effort,scope:[],readOnly:run.readOnly===true,order:1},0);
+  subtask.cwd=project.path;run.subtasks=[subtask];run.waves=[[subtask.id]];rollup(run);flush();
+  await runSubtask(run,subtask,controller,{kind:'direct'});
+  if(controller.signal.aborted)throw new Error('Tarea detenida.');
+  run.review=null;
+  run.status=subtask.status==='completed'?'completed':'error';
+  run.stage=run.status==='completed'?'Respondido':'Sin completar';
+  if(run.status==='error')run.error=subtask.error;
+  recordRunMemory(run);
+}
+
 // Corregir una sub-tarea y volver a revisar el conjunto, sin replanificar ni repetir las demás.
 async function continueRun(run,subtask,feedback,controller){
   try{
-    run.phase='work';run.status='running';run.stage='Corrigiendo';run.error=null;run.finishedAt=null;
+    run.phase='work';run.status='running';run.stage='Corrigiendo';run.error=null;run.finishedAt=null;run.budgetExceeded=false;
     flush();
-    await runSubtask(run,subtask,controller,{feedback});
+    await runSubtask(run,subtask,controller,{kind:'fix',feedback});
     await conclude(run,controller);
   }catch(error){failRun(run,controller,error);}
   finally{await settle(run);}
@@ -535,18 +622,32 @@ function assertFolderFree(project){
 function startRun(body){
   const conv=store.conversation(body.conversationId),project=store.project(conv.projectId);
   const prompt=str(body.prompt,'Mensaje',50000);
-  const provider=['claude','codex'].includes(body.orchestrator?.provider)?body.orchestrator.provider:'codex';
+  const mode=['orquestar','directo','manual'].includes(body.mode)?body.mode:'orquestar';
+  const provider=PROVIDERS.includes(body.orchestrator?.provider)?body.orchestrator.provider:'codex';
   // Resolve symlinks and case before locking the workspace across providers.
   project.path=folder(project.path);
   assertFolderFree(project);
-  if(!connections[provider].connected)throw new Error(`${agentName(provider)} no está conectado. Abre Conexiones para comprobarlo.`);
-  const chosen=modelChoice(provider,body.orchestrator?.model,body.orchestrator?.effort);
+  const run={id:id(),conversationId:conv.id,prompt,mode,orchestrator:{provider,model:'',effort:null,sessionId:null},
+    readOnly:body.readOnly!==false,phase:'plan',status:'planning',stage:'Planificando',createdAt:now(),
+    plan:{status:'pending',summary:'',warnings:[],context:''},isolation:null,snapshot:null,answer:null,usage:null,
+    subtasks:[],waves:[],review:null,events:[],reviewWanted:true,initRepo:false};
+  let manualNote='';
+  if(mode==='manual'){
+    const parsed=parseManualPlan(body.plan,{connections,maxSubtasks:MAX_SUBTASKS,runReadOnly:run.readOnly});
+    run.plan={status:'manual',summary:parsed.summary,warnings:parsed.warnings,context:parsed.context};
+    run.subtasks=parsed.subtasks.map(toSubtask);
+    run.reviewWanted=parsed.review;run.initRepo=body.plan?.initRepo===true;
+    run.status='running';run.stage='Preparando';
+    manualNote='\n\n**Reparto a mano:**\n'+run.subtasks.map(subtask=>`- ${subtask.title} · ${agentName(subtask.provider)} ${subtask.model}${subtask.readOnly?' · solo lectura':''}`).join('\n');
+  }
+  // El agente principal orquesta, responde en directo o revisa el reparto manual; solo hace falta si actúa.
+  const needsPrincipal=mode!=='manual'||run.reviewWanted;
+  if(needsPrincipal&&!connections[provider].connected)throw new Error(`${agentName(provider)} no está conectado. Abre Conexiones para comprobarlo.`);
+  if(needsPrincipal)Object.assign(run.orchestrator,modelChoice(provider,body.orchestrator?.model,body.orchestrator?.effort));
+  else run.orchestrator.model=typeof body.orchestrator?.model==='string'?body.orchestrator.model.slice(0,200):'';
   if(conv.title==='Nueva conversación')conv.title=prompt.slice(0,70);
   conv.updatedAt=now();
-  const run={id:id(),conversationId:conv.id,prompt,orchestrator:{provider,...chosen,sessionId:null},
-    readOnly:body.readOnly!==false,phase:'plan',status:'planning',stage:'Planificando',createdAt:now(),
-    plan:{status:'pending',summary:'',warnings:[],context:''},isolation:null,snapshot:null,answer:null,usage:null,subtasks:[],waves:[],review:null,events:[]};
-  message(conv.id,'user',prompt,{runId:run.id});store.data.runs.push(run);
+  message(conv.id,'user',prompt+manualNote,{runId:run.id,...(mode==='manual'?{kind:'manual'}:{})});store.data.runs.push(run);
   const controller=new AbortController();active.set(run.id,controller);flush();
   setImmediate(()=>execute(run,controller).catch(e=>console.error(e)));
   return run;
@@ -593,6 +694,14 @@ const server=http.createServer(async(req,res)=>{
       if(!cookie.split(';').some(c=>c.trim()===`mixto_session=${secret}`))return json(res,401,{error:'Recarga Mixto para conectar con la sesión local.'});
       if(req.method!=='GET'&&req.headers['x-mixto-client']!=='1')return json(res,403,{error:'Solicitud no autorizada.'});
       if(route==='/api/state'&&req.method==='GET')return json(res,200,snapshot());
+      if(route==='/api/events'&&req.method==='GET'){
+        res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-store','Connection':'keep-alive','X-Accel-Buffering':'no'});
+        res.write('retry: 2000\n\n');
+        res.write(`event: state\ndata: ${JSON.stringify(snapshot())}\n\n`);
+        clients.add(res);
+        req.on('close',()=>clients.delete(res));
+        return;
+      }
       if(route==='/api/export'&&req.method==='GET')return json(res,200,store.data,{'Content-Disposition':'attachment; filename="mixto-copia.json"'});
       const b=await bodyJson(req);
       if(route==='/api/connections'&&req.method==='POST'){void refreshConnections();return json(res,202,{ok:true});}
@@ -631,6 +740,11 @@ const server=http.createServer(async(req,res)=>{
           store.data.settings.orchestratorPersona=listPersonas().some(item=>item.id===persona)?persona:'';
         }
         for(const key of ['autoApproveSingle','autoApproveReadOnly'])if(b[key]!==undefined)store.data.settings[key]=b[key]===true;
+        if(b.tokenBudget!==undefined){
+          const budget=Number(b.tokenBudget);
+          if(!Number.isFinite(budget)||budget<0)throw new Error('Tope de tokens: escribe un número de tokens, o 0 para no limitar.');
+          store.data.settings.tokenBudget=Math.floor(budget);
+        }
         flush();return json(res,200,{ok:true});
       }
       if(route==='/api/shutdown'&&req.method==='POST'){json(res,200,{ok:true});stop();return;}
@@ -669,5 +783,5 @@ const server=http.createServer(async(req,res)=>{
 server.on('error',e=>{console.error(e.code==='EADDRINUSE'?`El puerto ${port} ya está ocupado.`:e.message);process.exit(1);});
 server.listen(port,'127.0.0.1',()=>{console.log(`Mixto · ${origin}`);void refreshConnections();void syncMemory();});
 let stopping=false;
-function stop(){if(stopping)return;stopping=true;for(const c of active.values())c.abort();setTimeout(()=>{flush();server.close();process.exit(0);},750);}
+function stop(){if(stopping)return;stopping=true;for(const c of active.values())c.abort();setTimeout(()=>{flush();for(const client of clients){try{client.end();}catch{}}server.close();process.exit(0);},750);}
 process.on('SIGINT',stop);process.on('SIGTERM',stop);

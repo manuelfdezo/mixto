@@ -10,11 +10,17 @@ También puedes ejecutar `npm start` desde esta carpeta. Cierra esa terminal par
 
 ## Trabajar
 
+Junto al cuadro de escritura eliges el **agente principal** y el **modo**:
+
+- **Orquesta**: el agente principal estudia la carpeta, responde o propone un plan, y revisa el resultado. Es el modo que se describe a continuación.
+- **Directo**: hablas con un solo agente, con sesión continua, sin plan ni revisión. Es el modo para el trabajo iterativo del día a día: cada mensaje cuesta un turno. La sesión se conserva por conversación y agente aunque cambies de modelo; cambiar entre consulta y trabajo la reinicia.
+- **Reparto a mano**: tú planteas la tarea y decides las sub-tareas, quién hace cada una (Codex o Claude Code), con qué modelo, alcance y permisos. No hay turno de planificación; las sub-tareas arrancan directamente y el agente principal revisa el conjunto al final si lo marcas. Sin revisión, los cambios de varias sub-tareas quedan a la espera de que los apliques o descartes tú.
+
 1. Crea la carpeta de proyectos `mixto-projects` junto a la carpeta de Mixto. Cada subcarpeta directa aparece automáticamente en el selector **Proyectos**; también puedes crear una con el botón **+**.
 2. Elige qué agente **orquesta**. El modelo y el nivel de razonamiento predeterminados se configuran en **Agentes**.
 3. **Solo consultar** viene activado. Desmárcalo cuando quieras que los agentes modifiquen archivos: es el techo de permisos de toda la tarea y el plan no puede ampliarlo, solo restringirlo. Las solicitudes de permisos compatibles aparecen dentro de la conversación, indicando de qué sub-tarea vienen.
 4. Envía tu petición. El orquestador estudia la carpeta sin modificar nada. Si es una pregunta o algo que puede resolver con lo que acaba de ver, **responde directamente** y la tarea termina ahí, en un solo turno. Si hace falta trabajar, propone un plan: cuántas sub-tareas hacen falta, qué agente y modelo se ocupa de cada una, con qué alcance y por qué, más un **contexto** con lo que descubrió para que ninguna sub-tarea tenga que volver a explorarlo.
-5. Revisa el plan antes de que empiece nadie. Puedes cambiar el modelo y el nivel de razonamiento de cada sub-tarea para ajustar el consumo, o descartarlo. En **Agentes** puedes activar que los planes de una sola sub-tarea, o los de solo lectura, arranquen sin pedirte aprobación.
+5. Revisa el plan antes de que empiece nadie. En cada sub-tarea puedes **reasignarla al otro agente**, cambiar el modelo y el nivel de razonamiento para ajustar el consumo, o limitarla a solo lectura; o descartar el plan. En **Agentes** puedes activar que los planes de una sola sub-tarea, o los de solo lectura, arranquen sin pedirte aprobación. Si el plan tiene una sola sub-tarea asignada al mismo agente que planificó, la hace él en su propia sesión, que ya conoce el proyecto, sin arrancar otro proceso en frío.
 6. Las sub-tareas se ejecutan, hasta tres a la vez. Cada una informa de su estado y de su consumo por separado. Puedes detener la tarea y retomar la conversación después.
 7. Al terminar, el mismo orquestador revisa el conjunto desde una copia con todos los cambios ya aplicados: busca trabajo duplicado, contradicciones y lo que falte, puede ejecutar los tests del proyecto para comprobarlo, y decide si procede integrar. Una sola sub-tarea de consulta no se revisa: su respuesta ya es la respuesta.
 8. Si la revisión no convence, **Corregir** reanuda la sesión de la sub-tarea que elijas, en su misma copia, con la revisión del arquitecto y tus indicaciones. No se replanifica ni se repiten las demás; al terminar se vuelve a revisar el conjunto.
@@ -25,7 +31,9 @@ Si la carpeta no es un repositorio git no hay copias aisladas posibles, y cuando
 
 ### Consumo y cuota
 
-Cada respuesta muestra los tokens de ese turno y, en la respuesta directa o la revisión, el total de la tarea con todos sus turnos, incluidos el plan y la revisión. Claude Code informa además del coste estimado. La cuota de Codex aparece junto al cuadro de escritura y en **Agentes**, con sus ventanas de uso; se relee al terminar cada tarea y al pulsar **Actualizar**. Claude Code no publica su cuota. Para gastar menos: usa un modelo rápido como orquestador (planifica y revisa) y deja los potentes para las sub-tareas difíciles, y no actives una persona salvo que la necesites, porque añade unos 7.000 tokens a cada plan.
+Cada respuesta muestra los tokens de ese turno y, en la respuesta directa o la revisión, el total de la tarea con todos sus turnos, incluidos el plan y la revisión. Claude Code informa además del coste estimado. La cuota de Codex aparece junto al cuadro de escritura y en **Agentes**, con sus ventanas de uso; se relee al terminar cada tarea y al pulsar **Actualizar**. Claude Code no publica su cuota.
+
+En **Agentes** puedes fijar un **tope de tokens por tarea**. Se comprueba al cerrar cada turno, así que puede excederse por un turno; al superarlo, la tarea se detiene, lo dice en la conversación y puedes corregir una sub-tarea o volver a pedirla. Para gastar menos: usa el modo directo para el trabajo iterativo, un modelo rápido como agente principal (planifica y revisa) y deja los potentes para las sub-tareas difíciles. Las dos personas del arquitecto están recortadas a lo que ayuda a repartir trabajo, unos 1.500 tokens cada una; aun así, déjala en «Sin persona» salvo que la necesites.
 
 Mixto es únicamente el orquestador: el código de cada producto permanece fuera de su repositorio. La raíz gestionada se puede cambiar con `MIXTO_PROJECTS_ROOT`; debe ser una carpeta existente. Mixto solo descubre sus subcarpetas directas y la interfaz no acepta rutas arbitrarias. Las referencias antiguas guardadas se conservan para no perder conversaciones ni memoria, pero todo proyecto nuevo se crea dentro de la raíz gestionada. Mixto nunca mueve ni elimina automáticamente un proyecto existente.
 
@@ -70,6 +78,8 @@ La app escucha únicamente en la interfaz local. Comprueba Host y Origin, exige 
 No usa `--dangerously-skip-permissions` ni un modo sin aislamiento de Codex. Claude conserva su configuración nativa; en modo trabajo se permiten las ediciones mediante `acceptEdits` y las solicitudes adicionales se trasladan al usuario. El revisor trabaja en solo lectura y, para poder ejecutar comprobaciones, recibe además Bash: con Claude Code solo `git diff`, `git status`, `git log` y `git show` pasan sin preguntar y cualquier otro comando, como los tests, te lo pide en la conversación; con Codex los comandos corren en su sandbox de solo lectura. Como en las herramientas originales, los permisos y personalizaciones que tengas configurados afectan a su funcionamiento. Las confirmaciones MCP con esquemas arbitrarios no se implementan: se rechazan explícitamente para que el agente pueda proponer otra vía.
 
 ## Desarrollo
+
+La interfaz recibe el estado por eventos del servidor (`/api/events`, SSE) en cuanto cambia, sin sondeo; solo si esa conexión no está abierta vuelve a consultar `/api/state` cada pocos segundos.
 
 `npm test` ejecuta las pruebas locales sin consumir modelos, incluida una base Engram temporal aislada. Requiere el binario Engram instalado; `MIXTO_TEST_ENGRAM_PATH` permite indicar su ubicación. `npm run check` comprueba la sintaxis. Para una instancia de prueba aislada usa **las tres variables** `MIXTO_PORT`, `MIXTO_DATA_DIR` y `ENGRAM_DATA_DIR`; cambiar solo los datos de Mixto no aísla Engram.
 
