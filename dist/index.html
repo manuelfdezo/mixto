@@ -20,7 +20,7 @@
         <div id="run-status" class="run-status" hidden></div>
         <div class="composer-area">
           <form id="composer" class="composer"><label class="sr-only" for="prompt">Tu mensaje</label><textarea id="prompt" rows="3" placeholder="¿Qué vamos a hacer?" required></textarea><div class="composer-controls"><label class="provider-control"><span id="orchestrator-symbol">✳</span><select id="orchestrator" aria-label="Agente orquestador"><option value="codex">Codex orquesta</option><option value="claude">Claude Code orquesta</option></select></label><label class="readonly-control"><input id="read-only" type="checkbox" checked> Solo consultar</label><button type="button" id="cancel-run" class="stop-button" hidden>■ Detener</button><button type="submit" id="send" class="send-button" aria-label="Enviar mensaje">↑</button></div></form>
-          <div class="composer-hint"><span id="mode-hint">El orquestador reparte el trabajo entre los agentes necesarios.</span><span>Ctrl ↵ enviar</span></div>
+          <div class="composer-hint"><span id="mode-hint">El orquestador reparte el trabajo entre los agentes necesarios.</span><span id="quota-hint" class="quota-hint" title="Cuota usada de Codex según su propia API. Se actualiza al terminar cada tarea y al pulsar Actualizar en Agentes."></span><span>Ctrl ↵ enviar</span></div>
         </div>
       </section>
     </div>

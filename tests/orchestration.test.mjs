@@ -154,6 +154,136 @@ test('un run orquestado planifica, espera tu aprobación, trabaja en paralelo e 
   assert.equal(automatic.length,1);
   assert.match(automatic[0].content,/Frente uno/);
   assert.match(automatic[0].content,/Frente dos/);
+
+  // 8. El revisor trabajó en la copia integrada, y el consumo de cada turno y de la tarea es visible.
+  assert.equal(run.review.workspace,'integrated');
+  assert.equal(run.plan.context,'El proyecto es una carpeta de prueba con base.txt.');
+  assert.equal(run.usage.turns,4,'plan, dos sub-tareas y revisión');
+  assert.equal(run.usage.total,4*150);
+  assert.ok(run.usage.costUsd>0.04);
+  for(const m of state.messages.filter(m=>m.runId===run.id&&m.role==='assistant'))assert.equal(m.usage.total,150);
+  assert.deepEqual(state.connections.codex.limits.windows.map(w=>w.usedPercent),[34,12],'la cuota de Codex llega normalizada');
+});
+
+test('una pregunta se responde desde el plan: un turno, sin sub-tareas ni revisión',async t=>{
+  const {call,work,until,project}=await boot(t,{delay:50,scenario:'directa'});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'¿Qué es este proyecto?',readOnly:true,
+    orchestrator:{provider:'claude',model:'claude-fake',effort:'medium'}});
+  const state=await until(s=>['completed','error','awaiting-plan'].includes(runOf(s).status));
+  const run=runOf(state);
+  assert.equal(run.status,'completed',run.error);
+  assert.equal(run.plan.status,'direct');
+  assert.deepEqual(run.subtasks,[]);
+  assert.equal(run.review,null);
+  assert.match(run.answer,/proyecto de prueba/);
+  assert.match(run.answer,/console\.log\(1\)/,'el bloque de código dentro de la respuesta sobrevive');
+  assert.deepEqual(state.messages.filter(m=>m.runId===run.id).map(m=>m.kind||m.role),['user','answer']);
+  assert.equal(run.usage.turns,1);
+  assert.equal(fs.existsSync(path.join(work,'uno.txt')),false);
+  const automatic=state.memories.filter(m=>m.automatic&&m.conversationId===conversation.id);
+  assert.equal(automatic.length,1);
+  assert.match(automatic[0].content,/Respuesta directa/);
+});
+
+test('un solo escritor trabaja en la carpeta real, sin copia ni parche, y reanuda su sesión',async t=>{
+  const {call,work,until,project,dir}=await boot(t,{delay:50,scenario:'unica'});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Escribe solo.txt',readOnly:false,
+    orchestrator:{provider:'claude',model:'claude-fake',effort:'medium'}});
+  let state=await until(s=>runOf(s).status==='awaiting-plan');
+  let run=runOf(state);
+  assert.equal(run.subtasks.length,1);
+  await call('plan',{runId:run.id,approve:true,subtasks:[]});
+  state=await until(s=>['completed','error'].includes(runOf(s).status));
+  run=runOf(state);
+  assert.equal(run.status,'completed',JSON.stringify(run.subtasks.map(s=>s.error)));
+  assert.deepEqual(run.isolation.roots,{},'no se creó ninguna copia aislada');
+  assert.equal(run.subtasks[0].cwd,fs.realpathSync(work));
+  assert.equal(run.subtasks[0].patch,null);
+  assert.equal(run.subtasks[0].diff.files,1,'el diff desde la instantánea es la evidencia del revisor');
+  assert.deepEqual(run.subtasks[0].diff.created,['solo.txt']);
+  assert.equal(run.review.workspace,'project-direct');
+  assert.equal(run.review.status,'integrar');
+  assert.equal(run.review.integration,null,'no hay parche que integrar: el trabajo ya está en la carpeta');
+  assert.equal(fs.readFileSync(path.join(work,'solo.txt'),'utf8'),'escrito por la sub-tarea solo.txt\n');
+  assert.equal(fs.existsSync(path.join(dir,'datos','wt')),false);
+  const conv=state.conversations.find(c=>c.id===conversation.id);
+  assert.ok(Object.values(conv.sessions).includes('native-claude'),'la sesión nativa queda guardada para reanudarla');
+  assert.equal(run.subtasks[0].fixable,true,'una sub-tarea directa con sesión se puede corregir');
+  assert.deepEqual(state.messages.filter(m=>m.runId===run.id).map(m=>m.kind||m.role),['user','plan','work','review']);
+});
+
+test('con la aprobación automática activada, un plan de una sola sub-tarea arranca solo',async t=>{
+  const {call,work,until,project}=await boot(t,{delay:50,scenario:'auto'});
+  await call('settings',{autoApproveSingle:true});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Escribe solo.txt',readOnly:false,
+    orchestrator:{provider:'claude',model:'claude-fake',effort:'medium'}});
+  const state=await until(s=>['completed','error','awaiting-plan'].includes(runOf(s).status));
+  const run=runOf(state);
+  assert.equal(run.status,'completed',run.error||run.status);
+  assert.equal(run.plan.autoApproved,true);
+  assert.match(run.events.map(e=>e.text).join('\n'),/aprobado automáticamente/);
+  assert.equal(fs.readFileSync(path.join(work,'solo.txt'),'utf8'),'escrito por la sub-tarea solo.txt\n');
+  assert.equal(state.settings.autoApproveSingle,true);
+});
+
+test('una única sub-tarea de consulta no paga revisión',async t=>{
+  const {call,until,project}=await boot(t,{delay:50,scenario:'lectura'});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Describe base.txt',readOnly:true,
+    orchestrator:{provider:'claude',model:'claude-fake',effort:'medium'}});
+  let run=runOf(await until(s=>runOf(s).status==='awaiting-plan'));
+  await call('plan',{runId:run.id,approve:true,subtasks:[]});
+  const state=await until(s=>['completed','error'].includes(runOf(s).status));
+  run=runOf(state);
+  assert.equal(run.status,'completed',run.error);
+  assert.equal(run.review,null);
+  assert.equal(run.usage.turns,2,'plan y consulta; ninguna revisión');
+  assert.deepEqual(state.messages.filter(m=>m.runId===run.id).map(m=>m.kind||m.role),['user','plan','work']);
+  assert.equal(run.subtasks[0].fixable,false,'una consulta no se corrige');
+});
+
+test('corregir una sub-tarea reanuda su sesión en su copia, vuelve a revisar e integra',async t=>{
+  const {call,work,until,project,dir}=await boot(t,{delay:50,scenario:'corregir'});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Reparte este trabajo',readOnly:false,
+    orchestrator:{provider:'claude',model:'claude-fake',effort:'medium'}});
+  let run=runOf(await until(s=>runOf(s).status==='awaiting-plan'));
+  await call('plan',{runId:run.id,approve:true,subtasks:run.subtasks.map(s=>({id:s.id,model:s.model,effort:s.effort}))});
+  let state=await until(s=>['completed','error'].includes(runOf(s).status));
+  run=runOf(state);
+  // 1. Primera vuelta: el revisor rechaza, los parches quedan aparte y las copias sobreviven para corregir.
+  assert.equal(run.status,'completed',run.error);
+  assert.equal(run.review.status,'no-integrar');
+  assert.equal(run.review.integration.applied.length,0);
+  assert.equal(fs.existsSync(path.join(work,'uno.txt')),false,'nada llegó a la carpeta real');
+  assert.ok(fs.existsSync(run.isolation.roots[0]),'la copia de la sub-tarea sigue ahí');
+  assert.equal(run.subtasks[0].fixable,true);
+  assert.equal(run.subtasks[1].fixable,true);
+  assert.ok(run.subtasks[0].sessionId,'la sesión nativa de la sub-tarea aislada se conserva');
+  const turnsBefore=run.usage.turns;
+  // 2. Corregir solo la primera: ni plan nuevo ni segunda sub-tarea repetida.
+  await call('fix',{runId:run.id,subtaskId:run.subtasks[0].id,feedback:'Cámbialo'});
+  state=await until(s=>runOf(s).status==='running'||['completed','error'].includes(runOf(s).status)&&runOf(s).usage.turns>turnsBefore);
+  state=await until(s=>['completed','error'].includes(runOf(s).status)&&runOf(s).usage.turns>turnsBefore);
+  run=runOf(state);
+  assert.equal(run.status,'completed',run.error);
+  assert.equal(run.usage.turns,turnsBefore+2,'una corrección y una revisión');
+  assert.equal(run.review.status,'integrar');
+  assert.equal(run.review.integration.applied.length,2);
+  assert.equal(fs.readFileSync(path.join(work,'uno.txt'),'utf8'),'corregido por la sub-tarea uno.txt\n');
+  assert.equal(fs.readFileSync(path.join(work,'dos.txt'),'utf8'),'escrito por la sub-tarea dos.txt\n','la otra sub-tarea no se repitió');
+  assert.equal(git(work,'log','--oneline').trim().split('\n').length,1);
+  // 3. Historial completo en la conversación, un solo registro de memoria y copias recogidas.
+  const kinds=state.messages.filter(m=>m.runId===run.id).map(m=>m.kind||m.role);
+  assert.deepEqual(kinds,['user','plan','work','work','review','fix','work','review']);
+  assert.equal(state.memories.filter(m=>m.automatic&&m.conversationId===conversation.id).length,1);
+  for(let attempt=0;attempt<40&&fs.existsSync(path.join(dir,'datos','wt'));attempt++)await wait(150);
+  assert.equal(fs.existsSync(path.join(dir,'datos','wt')),false);
+  assert.equal(run.subtasks[0].fixable,false,'sin copia no hay nada que corregir');
+  await assert.rejects(call('fix',{runId:run.id,subtaskId:run.subtasks[0].id,feedback:''}),/ya no se puede corregir/);
 });
 
 test('el arquitecto detiene una sub-tarea que colisiona con otra, sin tumbar el run',async t=>{

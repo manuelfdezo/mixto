@@ -5,7 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import {fileURLToPath} from 'node:url';
 import {Store,memoryContext} from '../lib/store.mjs';
-import {runProvider,executables,resolveCommand} from '../lib/providers.mjs';
+import {runProvider,executables,resolveCommand,normalizeUsage,normalizeLimits} from '../lib/providers.mjs';
 
 test('La memoria y las conversaciones sobreviven al reinicio, con copia anterior',()=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mixto-test-store-'));
@@ -45,6 +45,10 @@ for(const provider of ['codex','claude']){
     let displayed='',session;
     const result=await runProvider(provider,opts('OK',{onText:t=>displayed=t,onSession:s=>session=s}));
     assert.equal(result.text,'Respuesta verificada: áéñ');assert.equal(displayed.trim(),result.text);assert.equal(session,'native-'+provider);
+    // El consumo llega normalizado con la misma forma para los dos agentes.
+    assert.equal(result.usage.total,provider==='claude'?150:120);
+    assert.equal(result.usage.cached,30);
+    assert.equal(result.usage.costUsd,provider==='claude'?0.0123:0);
   });
   test(`${provider}: fallo del agente no se interpreta como éxito`,async()=>{
     await assert.rejects(runProvider(provider,opts('ERROR')),/Fallo controlado/);
@@ -95,4 +99,25 @@ test('resolveCommand encuentra el atajo por PATH, como haría una terminal',enWi
     // Un comando que no existe se devuelve tal cual, para que el fallo siga siendo un ENOENT claro.
     assert.deepEqual(resolveCommand('no-existe-este-agente'),['no-existe-este-agente']);
   }finally{process.env.PATH=anterior;fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('normalizeUsage entiende el formato de cada agente y descarta lo vacío',()=>{
+  assert.deepEqual(normalizeUsage('claude',{input_tokens:10,cache_read_input_tokens:5,cache_creation_input_tokens:2,output_tokens:3},0.5),
+    {input:10,cached:7,output:3,total:20,costUsd:0.5});
+  assert.deepEqual(normalizeUsage('codex',{inputTokens:10,cachedInputTokens:4,outputTokens:6,totalTokens:16}),
+    {input:10,cached:4,output:6,total:16,costUsd:0});
+  assert.equal(normalizeUsage('codex',{inputTokens:10,outputTokens:6}).total,16,'sin total declarado se suma');
+  assert.equal(normalizeUsage('claude',null),null);
+  assert.equal(normalizeUsage('claude',{}),null);
+});
+
+test('normalizeLimits encuentra las ventanas de cuota sin depender de la forma exacta',()=>{
+  const limits=normalizeLimits({rateLimits:{primary:{usedPercent:34,windowDurationMins:300,resetsAt:1800000000},secondary:{usedPercent:12,windowDurationMins:10080}}});
+  assert.equal(limits.windows.length,2);
+  assert.deepEqual(limits.windows.map(w=>[w.usedPercent,w.minutes]),[[34,300],[12,10080]]);
+  assert.equal(limits.windows[0].resetsAt,new Date(1800000000*1000).toISOString());
+  assert.equal(limits.windows[1].resetsAt,null);
+  assert.equal(normalizeLimits({}),null);
+  assert.equal(normalizeLimits(null),null);
+  assert.equal(normalizeLimits({used_percent:250}).windows[0].usedPercent,100,'se acota a 100');
 });

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {buildPlanPrompt,parsePlan,assignWaves,buildReviewPrompt,readVerdict,PlanError,buildSupervisionPrompt,parseDecision} from '../lib/orchestrator.mjs';
+import {buildPlanPrompt,parsePlan,assignWaves,buildReviewPrompt,readVerdict,PlanError,buildSupervisionPrompt,parseDecision,buildWorkPrompt,buildFixPrompt,parseJsonBlock} from '../lib/orchestrator.mjs';
 
 const connections={
   codex:{connected:true,models:[{id:'gpt-5-codex',name:'Codex',efforts:['low','medium','high'],default:true}]},
@@ -68,7 +68,8 @@ test('parsePlan recorta el plan al tope de sub-tareas y avisa',()=>{
 
 test('parsePlan rechaza instrucciones vacías o desmedidas',()=>{
   assert.throws(()=>parsePlan(plan([subtask({instrucciones:'   '})]),{connections}),PlanError);
-  assert.throws(()=>parsePlan(plan([subtask({instrucciones:'x'.repeat(4001)})]),{connections}),PlanError);
+  assert.throws(()=>parsePlan(plan([subtask({instrucciones:'x'.repeat(12001)})]),{connections}),PlanError);
+  assert.equal(parsePlan(plan([subtask({instrucciones:'x'.repeat(9000)})]),{connections}).subtasks[0].instructions.length,9000);
 });
 
 test('assignWaves paraleliza todo cuando hay aislamiento, respetando el tope',()=>{
@@ -167,4 +168,80 @@ test('buildPlanPrompt ofrece el catálogo real y exige un único bloque JSON',()
   assert.match(prompt,/4/);
   // El orquestador planifica, no ejecuta.
   assert.match(prompt,/no (modifiques|escribas)/i);
+});
+
+test('parsePlan devuelve una respuesta directa cuando el arquitecto contesta sin sub-tareas',()=>{
+  const result=parsePlan('Ya lo tengo:\n```json\n{"respuesta":"El proyecto usa **node:test** y no tiene dependencias."}\n```',{connections});
+  assert.equal(result.direct,true);
+  assert.match(result.answer,/node:test/);
+  assert.deepEqual(result.subtasks,[]);
+  // Una respuesta vacía no vale como respuesta: el plan sigue siendo obligatorio.
+  assert.throws(()=>parsePlan('```json\n{"respuesta":"   "}\n```',{connections}),PlanError);
+  // Si vienen sub-tareas, el plan manda aunque también haya respuesta.
+  const both=parsePlan('```json\n'+JSON.stringify({respuesta:'ignorada',resumen:'Plan',subtareas:[subtask()]})+'\n```',{connections});
+  assert.equal(both.direct,false);
+  assert.equal(both.subtasks.length,1);
+});
+
+test('parseJsonBlock sobrevive a un ``` dentro de una cadena de la respuesta',()=>{
+  const text='Aquí va:\n```json\n{"respuesta":"Usa esto:\\n```js\\nfoo()\\n```\\nListo."}\n```';
+  const {data}=parseJsonBlock(text);
+  assert.ok(data,'el bloque cortado por el ``` interno se recupera por llaves balanceadas');
+  assert.match(data.respuesta,/foo\(\)/);
+  assert.equal(parsePlan(text,{connections}).direct,true);
+  assert.equal(parseJsonBlock('sin json').data,undefined);
+});
+
+test('parsePlan conserva el contexto compartido y lo recorta',()=>{
+  const text='```json\n'+JSON.stringify({resumen:'Plan',contexto:'c'.repeat(7000),subtareas:[subtask()]})+'\n```';
+  const result=parsePlan(text,{connections});
+  assert.equal(result.context.length,6000);
+  assert.equal(parsePlan(plan([subtask()]),{connections}).context,'');
+});
+
+test('buildPlanPrompt ofrece la respuesta directa, pide contexto y avisa del modo de la tarea',()=>{
+  const readOnly=buildPlanPrompt({request:'¿Qué hace store.mjs?',connections,readOnly:true});
+  assert.match(readOnly,/"respuesta"/);
+  assert.match(readOnly,/"contexto"/);
+  assert.match(readOnly,/solo consulta/i);
+  assert.match(readOnly,/modelos rápidos/i);
+  const writable=buildPlanPrompt({request:'Añade tests',connections,readOnly:false});
+  assert.match(writable,/permitido modificar archivos/i);
+});
+
+test('buildWorkPrompt distingue la carpeta real de la copia aislada e incluye el contexto',()=>{
+  const base={request:'Añade tests',subtask:{role:'Probar',instructions:'Escribe tests',scope:['tests/'],readOnly:false}};
+  const direct=buildWorkPrompt({...base,context:'Los tests usan node:test',direct:true});
+  assert.match(direct,/directamente en la carpeta del proyecto/);
+  assert.match(direct,/node:test/);
+  assert.match(direct,/tests\//);
+  const isolated=buildWorkPrompt({...base,direct:false});
+  assert.match(isolated,/copia aislada/);
+  const reading=buildWorkPrompt({...base,subtask:{...base.subtask,readOnly:true}});
+  assert.match(reading,/no puedes modificar archivos/);
+});
+
+test('buildFixPrompt lleva la revisión y las indicaciones sin repetir la memoria',()=>{
+  const prompt=buildFixPrompt({request:'Añade tests',subtask:{role:'Probar',instructions:'Escribe tests',scope:['tests/']},
+    review:'Falta el caso vacío.\n\nVEREDICTO: NO INTEGRAR',feedback:'Cubre también null'});
+  assert.match(prompt,/^CORRECCIÓN SOLICITADA/);
+  assert.match(prompt,/Falta el caso vacío/);
+  assert.match(prompt,/Cubre también null/);
+  assert.doesNotMatch(prompt,/MEMORIA COMPARTIDA/);
+});
+
+test('buildReviewPrompt describe dónde está el revisor y lista los archivos nuevos sin diff',()=>{
+  const subtasks=[{id:'a',index:0,title:'Directo',role:'Escribir',provider:'claude',model:'sonnet',status:'completed',text:'Hecho',
+    patch:null,diff:{files:2,insertions:3,deletions:0,created:['nuevo.txt']},readOnly:false}];
+  const integrated=buildReviewPrompt({request:'Haz X',subtasks,workspace:'integrated'});
+  assert.match(integrated,/copia aislada del proyecto con todos los cambios/);
+  assert.match(integrated,/ejecútalos/);
+  const direct=buildReviewPrompt({request:'Haz X',subtasks,workspace:'project-direct'});
+  assert.match(direct,/ya están aplicados en la carpeta del proyecto/);
+  assert.match(direct,/nuevo\.txt/);
+  const clean=buildReviewPrompt({request:'Haz X',subtasks,workspace:'project-clean'});
+  assert.match(clean,/sin los cambios aplicados/);
+  // Un parche largo se recorta y se dice dónde está el completo.
+  const long=buildReviewPrompt({request:'Haz X',subtasks,patchText:{a:'x'.repeat(20000)},workspace:'integrated'});
+  assert.match(long,/recortado/);
 });

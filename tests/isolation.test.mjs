@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
-import {inspect,initRepository,createWorkspaces,capturePatch,checkPatches,applyPatches,removeWorkspaces,cleanupOrphanWorkspaces,ignoredPaths,isIgnored} from '../lib/isolation.mjs';
+import {inspect,initRepository,createWorkspaces,createReviewWorkspace,capturePatch,checkPatches,applyPatches,removeWorkspace,removeWorkspaces,cleanupOrphanWorkspaces,ignoredPaths,isIgnored,snapshotProject,diffSince} from '../lib/isolation.mjs';
 
 const git=(cwd,...args)=>execFileSync('git',['-C',cwd,...args],{windowsHide:true,encoding:'utf8'});
 const read=file=>fs.readFileSync(file,'utf8');
@@ -178,4 +178,54 @@ test('capturePatch devuelve null cuando lo único que cambió es ruido de .atl',
   fs.writeFileSync(path.join(root,'.atl','.skill-registry.cache.json'),'{}');
   assert.equal(await capturePatch({worktreeRoot:spaces.roots.get(0),patchPath:path.join(data,'atl-solo.patch')}),null);
   await removeWorkspaces({projectPath:work,dataDir:data,runId:'run-atl-solo'});
+});
+
+test('createReviewWorkspace aplica todos los parches en una copia aparte y se retira sola',async t=>{
+  const {work,data}=repo(t);
+  const spaces=await createWorkspaces({projectPath:work,dataDir:data,runId:'run-check',indexes:[0,1]});
+  fs.writeFileSync(path.join(spaces.cwds.get(0),'a.txt'),'tocado por 0\n');
+  fs.writeFileSync(path.join(spaces.cwds.get(1),'c.txt'),'creado por 1\n');
+  const patches=[];
+  for(const index of [0,1])patches.push(await capturePatch({worktreeRoot:spaces.roots.get(index),patchPath:path.join(data,`check-${index}.patch`)}));
+  const review=await createReviewWorkspace({projectPath:work,dataDir:data,runId:'run-check',base:spaces.base,patches});
+  assert.equal(read(path.join(review.cwd,'a.txt')),'tocado por 0\n');
+  assert.equal(read(path.join(review.cwd,'c.txt')),'creado por 1\n');
+  assert.equal(read(path.join(work,'a.txt')),'uno\n','el proyecto real no se toca');
+  const reviewCopy=/run-check[\\/]review/;
+  assert.match(git(work,'worktree','list'),reviewCopy);
+  // Una segunda revisión sustituye la copia anterior sin quejarse.
+  const again=await createReviewWorkspace({projectPath:work,dataDir:data,runId:'run-check',base:spaces.base,patches});
+  assert.equal(again.cwd,review.cwd);
+  await removeWorkspace({projectPath:work,dataDir:data,runId:'run-check',name:'review'});
+  assert.doesNotMatch(git(work,'worktree','list'),reviewCopy);
+  assert.match(git(work,'worktree','list'),/run-check[\\/]0/,'las copias de las sub-tareas siguen ahí');
+  await removeWorkspaces({projectPath:work,dataDir:data,runId:'run-check'});
+});
+
+test('createReviewWorkspace falla limpiamente si un parche no aplica',async t=>{
+  const {work,data}=repo(t);
+  const spaces=await createWorkspaces({projectPath:work,dataDir:data,runId:'run-bad',indexes:[0]});
+  fs.writeFileSync(path.join(spaces.cwds.get(0),'a.txt'),'v0\n');
+  const patch=await capturePatch({worktreeRoot:spaces.roots.get(0),patchPath:path.join(data,'bad.patch')});
+  fs.writeFileSync(patch.file,'garbage that is not a patch\n');
+  await assert.rejects(createReviewWorkspace({projectPath:work,dataDir:data,runId:'run-bad',base:spaces.base,patches:[patch]}),/copia de revisión/);
+  assert.doesNotMatch(git(work,'worktree','list'),/review/);
+  await removeWorkspaces({projectPath:work,dataDir:data,runId:'run-bad'});
+});
+
+test('snapshotProject y diffSince capturan lo que cambió en la carpeta real sin tocar el índice',async t=>{
+  const {work,data}=repo(t);
+  fs.writeFileSync(path.join(work,'b.txt'),'dos sin guardar\n');
+  const snapshot=snapshotProject(work);
+  assert.ok(snapshot.base,'hay una base aunque haya trabajo sin guardar');
+  assert.equal(await diffSince({projectPath:work,snapshot,patchPath:path.join(data,'nada.diff')}),null,'sin cambios no hay diff');
+  fs.writeFileSync(path.join(work,'a.txt'),'uno cambiado por el agente\n');
+  fs.writeFileSync(path.join(work,'nuevo.txt'),'archivo nuevo\n');
+  const diff=await diffSince({projectPath:work,snapshot,patchPath:path.join(data,'directo.diff')});
+  assert.equal(diff.files,2);
+  assert.deepEqual(diff.created,['nuevo.txt']);
+  assert.match(read(diff.file),/uno cambiado por el agente/);
+  assert.doesNotMatch(read(diff.file),/dos sin guardar/,'lo que ya estaba sin guardar antes no cuenta como obra del agente');
+  assert.equal(git(work,'status','--porcelain').includes('A '),false,'no se registró nada en el índice');
+  assert.equal(snapshotProject(path.join(data)),null,'una carpeta sin git no tiene instantánea');
 });

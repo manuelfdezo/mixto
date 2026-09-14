@@ -4,6 +4,24 @@ const names={codex:'Codex',claude:'Claude Code'};
 const symbols={codex:'✳',claude:'✺'};
 const effortNames={low:'Ligero',medium:'Equilibrado',high:'Alto',xhigh:'Muy alto',max:'Máximo',ultra:'Ultra'};
 const stageNames={queued:'En espera',running:'Trabajando',waiting:'Esperando tu respuesta',completed:'Completado',error:'Sin completar',cancelled:'Detenido',stopped:'Detenida por el arquitecto',interrupted:'Interrumpido'};
+const fmtTokens=n=>n>=1e6?(n/1e6).toFixed(1).replace('.',',')+' M':n>=1000?(n/1000).toFixed(1).replace('.',',')+' k':String(n);
+const fmtCost=c=>c?(Math.round(c*1000)/1000).toString().replace('.',',')+' $':'';
+const usageText=u=>u?.total?`${fmtTokens(u.total)} tokens${u.costUsd?' · '+fmtCost(u.costUsd):''}`:'';
+const windowLabel=m=>m==null?'ventana':m<60?`${m} min`:m<1440?`${Math.round(m/60)} h`:`${Math.round(m/1440)} días`;
+function quotaText(provider){const w=state?.connections[provider]?.limits?.windows;if(!w?.length)return '';return w.map(x=>`${Math.round(x.usedPercent)} % de ${windowLabel(x.minutes)}`).join(' · ');}
+// Cada turno lleva su consumo; la respuesta directa y la revisión llevan además el total de la tarea.
+function usageBadges(m){
+  const own=usageText(m.usage);
+  const run=(m.kind==='review'||m.kind==='answer')?state.runs.find(r=>r.id===m.runId):null;
+  const total=run?.usage?.total&&run.usage.turns>1?`${usageText(run.usage)} · ${run.usage.turns} turnos`:'';
+  return (own?`<span class="message-usage" title="Consumo de este turno">${own}</span>`:'')+(total?`<span class="message-usage" title="Consumo total de la tarea, con el plan y la revisión">tarea: ${total}</span>`:'');
+}
+function limitsHtml(p,c){
+  const w=c.limits?.windows;
+  if(w?.length)return `<div class="metadata">Cuota usada: ${w.map(x=>`${Math.round(x.usedPercent)} % de ${windowLabel(x.minutes)}${x.resetsAt?` (se reinicia ${new Date(x.resetsAt).toLocaleString('es',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})})`:''}`).join(' · ')}</div>`;
+  if(p==='claude'&&c.connected)return '<div class="metadata">Claude Code no publica su cuota; el consumo se muestra por turno y por tarea en la conversación.</div>';
+  return '';
+}
 let state,projectId,conversationId,orchestrator='codex',busy=false,lastMessages='',lastAgents='',lastMemory='',lastRun='',toastTimer;
 let planChoices={},initRepo=false;
 let preferences;try{preferences=JSON.parse(localStorage.getItem('mixto-preferences')||'{}');}catch{preferences={};}
@@ -56,10 +74,11 @@ function approvalHtml(a){
 function renderMessages(){
   const messages=state.messages.filter(m=>m.conversationId===conversationId);
   const approvals=state.approvals.filter(a=>state.runs.find(r=>r.id===a.runId)?.conversationId===conversationId);
-  const signature=JSON.stringify([conversationId,messages,approvals]);
+  const runUsage=state.runs.filter(r=>r.conversationId===conversationId).map(r=>r.usage);
+  const signature=JSON.stringify([conversationId,messages,approvals,runUsage]);
   if(signature===lastMessages)return;lastMessages=signature;
   const area=$('#messages'),bottom=area.scrollHeight-area.scrollTop-area.clientHeight<130;
-  area.innerHTML=(messages.length?messages.map(m=>`<article class="message ${m.role}"><div class="message-header">${m.role==='assistant'?`<span class="agent-avatar ${m.provider}">${symbols[m.provider]}</span><strong>${names[m.provider]}</strong>${m.stage?`<span class="message-stage">${esc(m.stage)}</span>`:''}`:'<strong>Tú</strong>'}<time>${new Date(m.createdAt).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'})}</time></div><div class="message-content">${m.content?markdown(m.content):m.status==='streaming'?'<span class="typing">Preparando la respuesta</span>':''}</div>${m.error?`<div class="message-error">${esc(m.error)}</div>`:''}${m.content?`<div class="message-actions"><button data-copy="${m.id}">Copiar</button>${m.role==='assistant'?`<button data-remember="${m.id}">◇ Guardar recuerdo</button>`:''}</div>`:''}</article>`).join(''):welcome())+approvals.map(approvalHtml).join('');
+  area.innerHTML=(messages.length?messages.map(m=>`<article class="message ${m.role}"><div class="message-header">${m.role==='assistant'?`<span class="agent-avatar ${m.provider}">${symbols[m.provider]}</span><strong>${names[m.provider]}</strong>${m.stage?`<span class="message-stage">${esc(m.stage)}</span>`:''}`:'<strong>Tú</strong>'}<time>${new Date(m.createdAt).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'})}</time>${usageBadges(m)}</div><div class="message-content">${m.content?markdown(m.content):m.status==='streaming'?'<span class="typing">Preparando la respuesta</span>':''}</div>${m.error?`<div class="message-error">${esc(m.error)}</div>`:''}${m.content?`<div class="message-actions"><button data-copy="${m.id}">Copiar</button>${m.role==='assistant'?`<button data-remember="${m.id}">◇ Guardar recuerdo</button>`:''}</div>`:''}</article>`).join(''):welcome())+approvals.map(approvalHtml).join('');
   if(!messages.length)area.scrollTop=0;
   else if(bottom||approvals.length||messages.length<2)area.scrollTop=area.scrollHeight;
 }
@@ -98,14 +117,16 @@ function planRowHtml(subtask){
 }
 
 function planHtml(run){
-  const writes=run.subtasks.some(s=>!s.readOnly);
-  const needsGit=writes&&run.isolation?.kind!=='worktree';
+  const writers=run.subtasks.filter(s=>!s.readOnly).length;
+  // Una sola sub-tarea que escribe trabaja en la carpeta real: solo dos o más necesitan copias aisladas.
+  const needsGit=writers>1&&run.isolation?.kind!=='worktree';
   return `<div class="plan-card"><div class="plan-head"><strong>Plan propuesto</strong><span class="pill">${run.subtasks.length} sub-tarea${run.subtasks.length===1?'':'s'}</span></div>
   ${run.plan.summary?`<p class="muted">${esc(run.plan.summary)}</p>`:''}
   ${run.plan.status==='fallback'?'<div class="message-error">El orquestador no devolvió un plan legible; se ejecutará tu petición con un solo agente.</div>':''}
   ${(run.plan.warnings||[]).map(w=>`<div class="metadata">⚠ ${esc(w)}</div>`).join('')}
+  ${run.plan.context?`<details class="plan-context"><summary>Contexto que recibirán todas las sub-tareas</summary><p class="muted">${esc(run.plan.context)}</p></details>`:''}
   ${run.subtasks.map(planRowHtml).join('')}
-  ${needsGit?`<div class="plan-git"><div class="metadata">Esta carpeta no es un repositorio git: sin eso, los agentes no pueden escribir sobre copias aisladas.</div>
+  ${needsGit?`<div class="plan-git"><div class="metadata">Esta carpeta no es un repositorio git: sin eso, varias sub-tareas no pueden escribir a la vez sobre copias aisladas.</div>
     <label><input type="radio" name="plan-git" value="serial" ${initRepo?'':'checked'}> Ejecutar las escrituras de una en una (no cambia tu carpeta)</label>
     <label><input type="radio" name="plan-git" value="init" ${initRepo?'checked':''}> Convertirla en repositorio git para trabajar en paralelo</label></div>`:''}
   <div class="approval-actions"><button class="primary-button" id="plan-approve">Empezar</button><button class="secondary-button" id="plan-reject">Descartar</button></div></div>`;
@@ -113,31 +134,43 @@ function planHtml(run){
 
 function teamHtml(run){
   const opened=new Set([...document.querySelectorAll('#run-status details[open]')].map(d=>d.dataset.subtask));
-  const done=run.subtasks.filter(s=>['completed','error','cancelled'].includes(s.status)).length;
-  return `<div class="plan-card"><div class="plan-head"><strong>${esc(run.stage||'Trabajando')}</strong>${run.subtasks.length?`<span class="pill">${done}/${run.subtasks.length}</span>`:''}</div>
-  ${run.subtasks.length?run.subtasks.map(s=>`<details data-subtask="${esc(s.id)}" ${opened.has(s.id)?'open':''}><summary><span class="agent-avatar ${s.provider}">${symbols[s.provider]}</span> ${esc(s.title)} · ${esc(names[s.provider])} ${esc(s.model)} <span class="muted">· ${esc(stageNames[s.status]||s.stage||'')}</span></summary><div class="run-events">${s.events.map(e=>esc(e.text)).join('\n')||(s.status==='queued'?'En espera de su turno.':'Trabajando…')}</div>${s.error?`<div class="message-error">${esc(s.error)}</div>`:''}</details>`).join('')
+  const done=run.subtasks.filter(s=>['completed','error','cancelled','stopped'].includes(s.status)).length;
+  return `<div class="plan-card"><div class="plan-head"><strong>${esc(run.stage||'Trabajando')}</strong><span>${run.usage?.total?`<span class="pill" title="Consumo acumulado de la tarea">${usageText(run.usage)}</span> `:''}${run.subtasks.length?`<span class="pill">${done}/${run.subtasks.length}</span>`:''}</span></div>
+  ${run.subtasks.length?run.subtasks.map(s=>`<details data-subtask="${esc(s.id)}" ${opened.has(s.id)?'open':''}><summary><span class="agent-avatar ${s.provider}">${symbols[s.provider]}</span> ${esc(s.title)} · ${esc(names[s.provider])} ${esc(s.model)} <span class="muted">· ${esc(stageNames[s.status]||s.stage||'')}</span>${s.usage?.total?`<span class="muted"> · ${fmtTokens(s.usage.total)}</span>`:''}</summary><div class="run-events">${s.events.map(e=>esc(e.text)).join('\n')||(s.status==='queued'?'En espera de su turno.':'Trabajando…')}</div>${s.error?`<div class="message-error">${esc(s.error)}</div>`:''}</details>`).join('')
     :`<div class="run-events">${run.events.map(e=>esc(e.text)).join('\n')||'Conectando con la sesión local…'}</div>`}
   ${(run.isolation?.warnings||[]).map(w=>`<div class="metadata">⚠ ${esc(w)}</div>`).join('')}</div>`;
 }
 
-function integrationHtml(run){
-  return `<div class="plan-card"><div class="plan-head"><strong>Cambios sin integrar</strong></div>
-  ${(run.review.integration.conflicts||[]).map(c=>`<div class="metadata">${esc(c.file)}: ${esc(c.reason)}</div>`).join('')}
-  <p class="muted">El trabajo de los agentes está guardado aparte; tu carpeta no se tocó.</p>
-  <div class="approval-actions"><button class="primary-button" id="integrate-apply">Aplicar cambios</button><button class="secondary-button" id="integrate-discard">Descartar</button></div></div>`;
+// Corregir reanuda la sesión de esa sub-tarea con la revisión del arquitecto; no replanifica ni repite las demás.
+function fixFormHtml(run,open){
+  const fixable=run.subtasks.filter(s=>s.fixable);
+  if(!fixable.length)return '';
+  const form=`<div class="fix-form"><label class="form-field compact-field"><span>Sub-tarea a corregir</span><select id="fix-subtask">${fixable.map(s=>`<option value="${esc(s.id)}">#${s.index+1} ${esc(s.title)} · ${esc(names[s.provider])} ${esc(s.model)}</option>`).join('')}</select></label><label class="form-field"><span>Indicaciones (opcional; la revisión del arquitecto se incluye siempre)</span><textarea id="fix-feedback" rows="2" maxlength="8000" placeholder="Qué debe cambiar"></textarea></label><div class="approval-actions"><button type="button" class="primary-button" id="fix-run">Corregir sin replanificar</button></div></div>`;
+  return open?form:`<details class="fix-details"><summary>Corregir una sub-tarea sin replanificar</summary>${form}</details>`;
+}
+function afterRunHtml(run){
+  const integration=run.review?.integration,conflicts=integration?.conflicts||[];
+  const pending=!!run.review&&run.subtasks.some(s=>s.patch)&&!integration?.applied?.length&&!integration?.discarded;
+  const rejected=run.review?.status==='no-integrar';
+  const fixable=run.subtasks.some(s=>s.fixable);
+  if(!pending&&!rejected)return fixable?`<div class="after-run">${run.usage?.total?`<span class="pill" title="Consumo total de la tarea">${usageText(run.usage)} · ${run.usage.turns} turnos</span>`:''}${fixFormHtml(run,false)}</div>`:'';
+  return `<div class="plan-card"><div class="plan-head"><strong>${pending?'Cambios sin integrar':'El revisor no autorizó la integración'}</strong>${run.usage?.total?`<span class="pill" title="Consumo total de la tarea">${usageText(run.usage)} · ${run.usage.turns} turnos</span>`:''}</div>
+  ${conflicts.map(c=>`<div class="metadata">${esc(c.file)}: ${esc(c.reason)}</div>`).join('')}
+  ${pending?'<p class="muted">El trabajo de los agentes está guardado aparte; tu carpeta no se tocó.</p>':'<p class="muted">Los cambios ya están en tu carpeta; lee la revisión antes de darlos por buenos.</p>'}
+  ${fixFormHtml(run,true)}
+  ${pending?`<div class="approval-actions"><button class="primary-button" id="integrate-apply">Aplicar cambios</button><button class="secondary-button" id="integrate-discard">Descartar</button></div>`:''}</div>`;
 }
 
 function renderRun(){
   const run=activeRun()||lastRunOf(),status=$('#run-status');
-  const signature=JSON.stringify([run?.id,run?.status,run?.stage,run?.plan,run?.isolation,run?.review?.integration,run?.error,
-    (run?.subtasks||[]).map(s=>[s.id,s.status,s.stage,s.model,s.effort,s.events.length,s.error]),run?.events.length,planChoices,initRepo]);
+  const signature=JSON.stringify([run?.id,run?.status,run?.stage,run?.plan,run?.isolation,run?.review?.status,run?.review?.integration,run?.error,run?.usage,
+    (run?.subtasks||[]).map(s=>[s.id,s.status,s.stage,s.model,s.effort,s.events.length,s.error,s.fixable,s.usage?.total]),run?.events.length,planChoices,initRepo]);
   if(signature===lastRun)return;lastRun=signature;
   if(!run){status.hidden=true;status.innerHTML='';return;}
   if(run.status==='awaiting-plan'){status.hidden=false;status.innerHTML=planHtml(run);return;}
   if(ACTIVE.includes(run.status)){status.hidden=false;status.innerHTML=teamHtml(run);return;}
-  if(run.review?.integration?.conflicts?.length&&!run.review.integration.discarded){status.hidden=false;status.innerHTML=integrationHtml(run);return;}
-  if(run.error){status.hidden=false;status.textContent=run.error;return;}
-  status.hidden=true;status.innerHTML='';
+  const html=(run.error?`<div class="run-error">${esc(run.error)}</div>`:'')+afterRunHtml(run);
+  status.hidden=!html;status.innerHTML=html;
 }
 function renderMemory(){
   const sync=state.memorySync||{state:'pending'};
@@ -154,6 +187,7 @@ function render(){
   if(!state.conversations.some(c=>c.id===conversationId&&c.projectId===projectId))conversationId=null;
   const select=$('#project-select');if(document.activeElement!==select)select.innerHTML=state.projects.map(p=>`<option value="${p.id}" ${p.id===projectId?'selected':''}>${esc(p.name)}</option>`).join('');
   $('#project-folder').textContent=project()?.path||'';$('#project-folder').title=project()?.path||'';
+  const quota=quotaText('codex');$('#quota-hint').textContent=quota?`Codex: ${quota}`:'';
   $('#project-name').textContent=project()?.name||'';$('#conversation-title').textContent=conversation()?.title||'Nueva conversación';
   $('#conversations').innerHTML=state.conversations.filter(c=>c.projectId===projectId).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)).map(c=>`<button class="conversation-link ${c.id===conversationId?'active':''}" data-conversation="${c.id}"><span>◷</span><span>${esc(c.title)}</span></button>`).join('');
   renderAgents();renderMemory();renderMessages();renderRun();
@@ -163,7 +197,8 @@ function render(){
 }
 function updateOrchestrator(){
   const text=`${names[orchestrator]} estudia la tarea, reparte el trabajo entre los agentes que haga falta y revisa el resultado. Tú apruebas el plan antes de empezar.`;
-  $('#mode-hint').textContent=`${names[orchestrator]} orquesta: verás el plan antes de que empiece nadie.`;
+  const auto=state?.settings?.autoApproveSingle||state?.settings?.autoApproveReadOnly;
+  $('#mode-hint').textContent=`${names[orchestrator]} orquesta: ${auto?'los planes sencillos empiezan solos según tus ajustes':'verás el plan antes de que empiece nadie'}. Las preguntas se responden sin plan.`;
   $('#orchestrator-symbol').textContent=symbols[orchestrator];
   const select=$('#orchestrator');if(select.value!==orchestrator)select.value=orchestrator;
 }
@@ -198,6 +233,10 @@ $('#run-status').onclick=async e=>{
   if(e.target.id==='integrate-apply')await act('integrate',{runId:run.id},result=>
     toast(result.conflicts?.length?'No se pudo integrar: sigue habiendo conflictos.':'Cambios integrados en tu carpeta.'));
   if(e.target.id==='integrate-discard')await act('integrate',{runId:run.id,discard:true},()=>toast('Copias de trabajo descartadas.'));
+  if(e.target.id==='fix-run'){
+    const subtaskId=$('#fix-subtask')?.value,feedback=$('#fix-feedback')?.value.trim()||'';
+    if(subtaskId)await act('fix',{runId:run.id,subtaskId,feedback},()=>toast('Corrección en marcha; el arquitecto volverá a revisar al terminar.'));
+  }
 };
 $('#composer').onsubmit=async e=>{
   e.preventDefault();if(busy||activeRun())return;
@@ -269,13 +308,16 @@ function memoryList(){
 }
 $('#open-memory').onclick=memoryList;
 function connectionsModal(){
-  openModal('Agentes',`<p class="modal-note">Mixto usa las sesiones de las herramientas instaladas. Aquí solo configuras lo necesario para orquestar.</p>${['codex','claude'].map(p=>{const c=state.connections[p],levels=effortLevels(p,selections[p]);return `<section class="connection-card"><h3><span class="agent-avatar ${p}">${symbols[p]}</span> ${names[p]}</h3><p>${c.loading?'Consultando conexión…':c.connected?'Conectado · '+esc(c.plan||c.authType):'Sin conexión'}</p>${c.error?`<div class="message-error">${esc(c.error)}</div>`:''}${!c.connected?`<p>Inicia sesión con <code>${p==='codex'?'codex login':'claude auth login'}</code> y pulsa Actualizar.</p>`:''}${c.models.length?`<label class="form-field compact-field"><span>Modelo predeterminado</span><select data-agent-model="${p}">${modelOptions(p,selections[p])}</select></label>${levels.length?`<label class="form-field compact-field"><span>Razonamiento</span><select data-agent-effort="${p}">${effortOptions(p,selections[p],efforts[p])}</select></label>`:''}`:''}</section>`;}).join('')}<form id="agent-settings"><label class="form-field"><span>Persona del arquitecto</span><select name="orchestratorPersona"><option value="">Sin persona</option>${state.personas.map(p=>`<option value="${esc(p.id)}" ${p.id===state.settings.orchestratorPersona?'selected':''}>${esc(p.name)}</option>`).join('')}</select></label>${['codex','claude'].map(p=>`<label class="form-field"><span>Preferencias para ${names[p]}</span><textarea name="${p}Instructions" rows="3" maxlength="8000" placeholder="Cómo quieres que trabaje este agente…">${esc(state.settings[p+'Instructions'])}</textarea></label>`).join('')}<div class="form-footer"><button type="button" class="secondary-button" id="refresh-connections">Actualizar</button><button class="primary-button">Guardar</button></div></form>`,'connections');
+  openModal('Agentes',`<p class="modal-note">Mixto usa las sesiones de las herramientas instaladas. Aquí solo configuras lo necesario para orquestar.</p>${['codex','claude'].map(p=>{const c=state.connections[p],levels=effortLevels(p,selections[p]);return `<section class="connection-card"><h3><span class="agent-avatar ${p}">${symbols[p]}</span> ${names[p]}</h3><p>${c.loading?'Consultando conexión…':c.connected?'Conectado · '+esc(c.plan||c.authType):'Sin conexión'}</p>${limitsHtml(p,c)}${c.error?`<div class="message-error">${esc(c.error)}</div>`:''}${!c.connected?`<p>Inicia sesión con <code>${p==='codex'?'codex login':'claude auth login'}</code> y pulsa Actualizar.</p>`:''}${c.models.length?`<label class="form-field compact-field"><span>Modelo predeterminado</span><select data-agent-model="${p}">${modelOptions(p,selections[p])}</select><small>Cuando ${names[p]} orquesta, este modelo planifica y revisa: uno rápido abarata cada tarea. Los modelos potentes se eligen por sub-tarea en el plan.</small></label>${levels.length?`<label class="form-field compact-field"><span>Razonamiento</span><select data-agent-effort="${p}">${effortOptions(p,selections[p],efforts[p])}</select></label>`:''}`:''}</section>`;}).join('')}<form id="agent-settings"><label class="form-field"><span>Persona del arquitecto</span><select name="orchestratorPersona"><option value="">Sin persona</option>${state.personas.map(p=>`<option value="${esc(p.id)}" ${p.id===state.settings.orchestratorPersona?'selected':''}>${esc(p.name)}</option>`).join('')}</select><small>Añade unos 7.000 tokens de texto genérico a cada plan. Déjala en «Sin persona» salvo que la necesites.</small></label><label class="check-field"><input type="checkbox" name="autoApproveSingle" ${state.settings.autoApproveSingle?'checked':''}> Empezar sin pedir aprobación cuando el plan tiene una sola sub-tarea</label><label class="check-field"><input type="checkbox" name="autoApproveReadOnly" ${state.settings.autoApproveReadOnly?'checked':''}> Empezar sin pedir aprobación cuando todas las sub-tareas son de solo lectura</label>${['codex','claude'].map(p=>`<label class="form-field"><span>Preferencias para ${names[p]}</span><textarea name="${p}Instructions" rows="3" maxlength="8000" placeholder="Cómo quieres que trabaje este agente…">${esc(state.settings[p+'Instructions'])}</textarea></label>`).join('')}<div class="form-footer"><button type="button" class="secondary-button" id="refresh-connections">Actualizar</button><button class="primary-button">Guardar</button></div></form>`,'connections');
   $('#modal-content').onchange=e=>{
     const model=e.target.dataset.agentModel,effort=e.target.dataset.agentEffort;
     if(model){selections[model]=e.target.value;efforts[model]=defaultEffort(model,e.target.value)||'';lastAgents='';renderAgents();connectionsModal();}
     if(effort){efforts[effort]=e.target.value;remember();}
   };
-  $('#agent-settings').onsubmit=async e=>{e.preventDefault();try{await api('settings',Object.fromEntries(new FormData(e.target)));await load();toast('Preferencias guardadas.');}catch(error){toast(error.message);}};
+  $('#agent-settings').onsubmit=async e=>{e.preventDefault();const form=new FormData(e.target);
+    // Una casilla sin marcar no viaja en FormData: los booleanos se envían explícitamente.
+    const body={orchestratorPersona:form.get('orchestratorPersona')||'',codexInstructions:form.get('codexInstructions')||'',claudeInstructions:form.get('claudeInstructions')||'',autoApproveSingle:form.has('autoApproveSingle'),autoApproveReadOnly:form.has('autoApproveReadOnly')};
+    try{await api('settings',body);await load();toast('Preferencias guardadas.');}catch(error){toast(error.message);}};
   $('#refresh-connections').onclick=async()=>{
     const button=$('#refresh-connections');button.disabled=true;button.textContent='Consultando…';
     try{await api('connections',{});await load();let attempts=0;while(Object.values(state.connections).some(c=>c.loading)&&attempts++<50){await new Promise(r=>setTimeout(r,1000));await load();}if($('#modal').open&&$('#modal').dataset.type==='connections')connectionsModal();}catch(error){toast(error.message);button.disabled=false;}
