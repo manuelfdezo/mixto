@@ -55,6 +55,12 @@ Lo que hace falta para que Mixto sea el sitio donde trabajas, no solo donde lanz
 - **Avisos y búsqueda.** El botón de la campana pide permiso al navegador para avisarte cuando una tarea termina, falla o necesita algo y no estás mirando; el título de la pestaña lleva la cuenta de lo que espera. La búsqueda de la barra lateral filtra las conversaciones por título y contenido.
 - **El arquitecto recuerda.** Dentro de una conversación, el agente principal reanuda su propia sesión nativa en cada tarea nueva: no vuelve a explorar la carpeta ni se le repite el historial. Cada ocho tareas la sesión se renueva para que no crezca sin límite, y si la herramienta ha olvidado la sesión se empieza otra sin que la tarea falle.
 
+### GitHub
+
+En **Agentes y ajustes → GitHub** pegas un token de acceso personal y Mixto queda conectado a tu cuenta. Crea el token en [github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new), elige los repositorios a los que quieras acceder y dale permiso de *Contents: Read and write* (o usa un token clásico con el ámbito `repo`). Se guarda solo en tu ordenador, en la carpeta `data`, y nunca llega al navegador; **Desconectar** lo borra.
+
+Con la cuenta conectada, el botón **+** de proyectos muestra tus repositorios: buscas, pulsas **Clonar** y el repositorio se clona en tu carpeta de proyectos, ya listo para trabajar; también puedes pegar la URL de cualquier repositorio de GitHub. Junto a **Confirmar cambios** aparece **Traer cambios**, que hace `git pull --ff-only`, y **Confirmar y enviar** empuja con tu cuenta. La autorización se la da Mixto a git por variables de entorno, con el mismo mecanismo que usa GitHub Actions, así que también la heredan los agentes y el terminal del proyecto: pueden traer y enviar cambios sin que git pida credenciales. Los remotos por SSH siguen usando tus claves de siempre.
+
 ### Equipo: personas reales
 
 En **Equipo** añades a las personas que trabajan en cada proyecto: nombre, rol, correo opcional y notas con lo que el arquitecto debe saber para asignarles trabajo. Una misma persona puede estar en varios proyectos.

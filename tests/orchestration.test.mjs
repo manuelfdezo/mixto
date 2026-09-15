@@ -891,3 +891,62 @@ test('actualización desde la app: comprueba la versión publicada, descarga, su
   assert.equal(after.update.current,'9.9.9');
   await call('shutdown',{});
 });
+
+test('GitHub: conectar con un token, listar repositorios, clonar uno como proyecto, traer cambios y desconectar',async t=>{
+  // GitHub simulado: la API acepta un único token y publica dos repositorios; el clonado va por file:// a un repositorio bare.
+  const clones=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'mixto-gh-')));
+  const bare=path.join(clones,'tester','demo.git');fs.mkdirSync(path.dirname(bare),{recursive:true});
+  execFileSync('git',['init','--quiet','--bare','-b','main',bare],{env:GIT_ENV});
+  const seed=path.join(clones,'seed');execFileSync('git',['clone','--quiet',bare,seed],{env:GIT_ENV});
+  git(seed,'config','user.name','Tester');git(seed,'config','user.email','tester@example.invalid');
+  fs.writeFileSync(path.join(seed,'README.md'),'# demo\n');git(seed,'add','README.md');git(seed,'commit','-q','-m','inicial');git(seed,'push','-q','origin','main');
+  const api=http.createServer((req,res)=>{
+    const ok=req.headers.authorization==='Bearer ghp_test';
+    if(!ok){res.writeHead(401);res.end('{}');return;}
+    if(req.url==='/user'){res.end(JSON.stringify({login:'tester',name:'Tester',avatar_url:''}));return;}
+    if(req.url.startsWith('/user/repos')){res.end(JSON.stringify([{full_name:'tester/demo',name:'demo',owner:{login:'tester'},private:true,description:'Repositorio de prueba',default_branch:'main',pushed_at:'2026-09-01T00:00:00Z',html_url:'https://github.com/tester/demo',language:'JavaScript'},{full_name:'tester/otro',name:'otro',owner:{login:'tester'},private:false,description:null,default_branch:'main',pushed_at:null,html_url:'https://github.com/tester/otro'}]));return;}
+    res.writeHead(404);res.end('{}');
+  });
+  await new Promise(resolve=>api.listen(0,'127.0.0.1',resolve));
+  t.after(()=>{api.close();try{fs.rmSync(clones,{recursive:true,force:true});}catch{}});
+  const {call,project,dir,until}=await boot(t,{delay:50,env:{MIXTO_GITHUB_API:`http://127.0.0.1:${api.address().port}`,MIXTO_GITHUB_CLONE_BASE:'file://'+clones}});
+  let state=await call('state');
+  assert.deepEqual(state.github,{connected:false,web:'https://github.com'});
+  await assert.rejects(call('github/connect',{token:'malo'}),/no acepta el token/);
+  await assert.rejects(call('github/repos'),/Conecta GitHub/);
+  const connected=await call('github/connect',{token:'ghp_test'});
+  assert.equal(connected.login,'tester');assert.equal(connected.connected,true);
+  state=await call('state');
+  assert.equal(state.github.login,'tester');
+  assert.equal(JSON.stringify(state).includes('ghp_test'),false,'el token nunca sale al navegador');
+  const stored=JSON.parse(fs.readFileSync(path.join(dir,'datos','mixto.json'),'utf8'));
+  assert.equal(stored.github.token,'ghp_test','el token se guarda en local');
+  const {repos}=await call('github/repos');
+  assert.deepEqual(repos.map(r=>[r.fullName,r.private,r.project]),[['tester/demo',true,null],['tester/otro',false,null]]);
+  // Git hereda la autorización: el terminal del proyecto (y por tanto los agentes) la ven por entorno.
+  await call('exec',{projectId:project.id,command:'git config --get http.https://github.com/.extraheader'});
+  state=await until(s=>s.execs[project.id]?.status!=='running');
+  assert.equal(state.execs[project.id].output.trim(),'AUTHORIZATION: basic '+Buffer.from('x-access-token:ghp_test').toString('base64'));
+  const cloned=await call('github/clone',{fullName:'tester/demo'});
+  assert.equal(cloned.name,'demo');assert.equal(cloned.github.fullName,'tester/demo');
+  assert.equal(fs.readFileSync(path.join(cloned.path,'README.md'),'utf8'),'# demo\n');
+  assert.equal(path.dirname(cloned.path),path.join(dir,'projects'),'se clona en la carpeta de proyectos');
+  assert.equal((await call('github/repos')).repos[0].project,cloned.id,'la lista sabe que ya es un proyecto');
+  await assert.rejects(call('github/clone',{fullName:'tester/demo'}),/Ya existe la carpeta/);
+  await assert.rejects(call('github/clone',{url:'https://github.com/tester/no-existe'}),/No se pudo clonar/);
+  await assert.rejects(call('github/clone',{url:'nada'}),/owner\/nombre/);
+  // Alguien empuja un cambio al remoto: «traer cambios» lo recoge; el resumen sabe que hay remoto.
+  fs.writeFileSync(path.join(seed,'nuevo.txt'),'nuevo\n');git(seed,'add','nuevo.txt');git(seed,'commit','-q','-m','segundo');git(seed,'push','-q','origin','main');
+  const pulled=await call('pull',{projectId:cloned.id});
+  assert.equal(pulled.ok,true);
+  assert.equal(fs.readFileSync(path.join(cloned.path,'nuevo.txt'),'utf8'),'nuevo\n');
+  state=await call('state');
+  assert.equal(state.changes[cloned.id].remote,true);
+  assert.equal(state.changes[project.id].remote,false);
+  const off=await call('github/disconnect',{});
+  assert.equal(off.connected,false);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir,'datos','mixto.json'),'utf8')).github,null);
+  await call('exec',{projectId:project.id,command:'git config --get http.https://github.com/.extraheader; echo fin'});
+  state=await until(s=>s.execs[project.id]?.status!=='running'&&s.execs[project.id].command.includes('fin'));
+  assert.equal(state.execs[project.id].output.trim(),'fin','sin token, git ya no lleva la cabecera');
+});

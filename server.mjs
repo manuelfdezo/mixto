@@ -15,6 +15,7 @@ import {listPersonas,personaBody} from './lib/personas.mjs';
 import {Watcher} from './lib/supervisor.mjs';
 import {openLedger,syncLedger,publishLedger,writeLedger,gitIdentity,STATUSES as LEDGER_STATUSES} from './lib/team.mjs';
 import {updateSources,checkUpdate,downloadUpdate,applyUpdate,compareVersions} from './lib/update.mjs';
+import {githubSources,applyAuth,clearAuth,parseRepoInput,fetchViewer,fetchRepos,cloneRepo,pullProject,hasRemote} from './lib/github.mjs';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
 const VERSION=(()=>{try{return JSON.parse(fs.readFileSync(path.join(root,'package.json'),'utf8')).version||'0.0.0';}catch{return '0.0.0';}})();
@@ -129,8 +130,8 @@ function personFields(source,base={}){
 // Los comandos de la lista del proyecto los aprueba el propio proveedor; el resto llega al usuario.
 const allowCommandIn=project=>command=>commandAllowed(project.allowedCommands,command);
 async function refreshChanges(project){
-  try{const changes=await projectChanges(project.path,{withDiff:false});changesCache.set(project.id,{git:changes.git,files:changes.files.length,at:now()});}
-  catch{changesCache.set(project.id,{git:false,files:0,at:now()});}
+  try{const changes=await projectChanges(project.path,{withDiff:false});changesCache.set(project.id,{git:changes.git,files:changes.files.length,remote:changes.git&&await hasRemote(project.path),at:now()});}
+  catch{changesCache.set(project.id,{git:false,files:0,remote:false,at:now()});}
   notify();
 }
 function startExec(project,command){
@@ -387,11 +388,34 @@ async function updateHumanPart(project,{run,subtask,assignment},{status,due,note
 function snapshot(){
   const managed=syncDiscoveredProjects(store.data,managedProjectsRoot);
   if(managed.added.length)flush();
-  const {engram,...data}=store.data;
+  const {engram,github,...data}=store.data;
   return {...data,memories:sharedMemories(store.data),memorySync:memoryBridge.status,connections,personas:listPersonas(),
     approvals:[...approvals.values()].map(a=>a.public),execs:Object.fromEntries([...execs].map(([projectId,record])=>[projectId,execView(record)])),
-    changes:Object.fromEntries(changesCache),update,app:{version:VERSION,workspace:root,
+    changes:Object.fromEntries(changesCache),update,github:githubView(),app:{version:VERSION,workspace:root,
       projectsRoot:{path:managed.root,available:managed.available}}};
+}
+// GitHub: con un token guardado, git (el de Mixto, el de los agentes y el del terminal) lleva la autorización por entorno.
+const githubFrom=githubSources();
+if(store.data.github?.token)applyAuth(store.data.github.token);
+const githubView=()=>{const g=store.data.github;return g?.token?{connected:true,login:g.login,name:g.name||'',avatarUrl:g.avatarUrl||'',connectedAt:g.connectedAt,web:githubFrom.web}:{connected:false,web:githubFrom.web};};
+let repoCache={at:0,repos:[]};
+async function githubRepos(force=false){
+  const token=store.data.github?.token;if(!token)throw new Error('Conecta GitHub en Agentes y ajustes.');
+  if(force||Date.now()-repoCache.at>2*60*1000)repoCache={at:Date.now(),repos:await fetchRepos(githubFrom,token)};
+  return repoCache.repos.map(repo=>({...repo,project:store.data.projects.find(p=>p.github?.fullName===repo.fullName)?.id||null}));
+}
+async function cloneFromGithub(body){
+  const fullName=parseRepoInput(body.fullName||body.url);
+  if(!fullName)throw new Error('Indica el repositorio como owner/nombre o con su URL de GitHub.');
+  const directoryName=str(body.directoryName||fullName.split('/')[1],'Nombre de carpeta',80).replace(/[^A-Za-z0-9._-]+/g,'-').replace(/^[^A-Za-z0-9]+/,'');
+  const target=managedProjectPath(managedProjectsRoot,directoryName,{mustExist:false});
+  if(fs.existsSync(target))throw new Error(`Ya existe la carpeta ${directoryName} en tu carpeta de proyectos.`);
+  const result=await cloneRepo({sources:githubFrom,fullName,into:target});
+  if(!result.ok){try{fs.rmSync(target,{recursive:true,force:true});}catch{}throw new Error('No se pudo clonar: '+result.error);}
+  const project=createManagedProject(store.data,managedProjectsRoot,{name:str(body.name||fullName.split('/')[1],'Nombre',80),directoryName,description:str(body.description||'','Descripción',2000,true)});
+  project.github={fullName,htmlUrl:`${githubFrom.web}/${fullName}`};
+  flush();void refreshChanges(project);
+  return project;
 }
 // Actualización desde la app: la versión publicada en GitHub, comprobada al arrancar y cada seis horas.
 const updateFrom=updateSources();
@@ -1175,6 +1199,23 @@ const server=http.createServer(async(req,res)=>{
       }
       if(route==='/api/shutdown'&&req.method==='POST'){json(res,200,{ok:true});stop();return;}
       if(route==='/api/update/check'&&req.method==='POST')return json(res,200,await checkUpdates());
+      if(route==='/api/github/connect'&&req.method==='POST'){
+        const token=str(b.token,'Token',400).trim();
+        if(/\s/.test(token))throw new Error('El token no puede contener espacios.');
+        const viewer=await fetchViewer(githubFrom,token);
+        store.data.github={token,...viewer,connectedAt:now()};applyAuth(token);repoCache={at:0,repos:[]};
+        flush();return json(res,200,githubView());
+      }
+      if(route==='/api/github/disconnect'&&req.method==='POST'){store.data.github=null;clearAuth();repoCache={at:0,repos:[]};flush();return json(res,200,githubView());}
+      if(route==='/api/github/repos'&&req.method==='GET')return json(res,200,{repos:await githubRepos(url.searchParams.get('refresh')==='1')});
+      if(route==='/api/github/clone'&&req.method==='POST')return json(res,201,await cloneFromGithub(b));
+      if(route==='/api/pull'&&req.method==='POST'){
+        const project=store.project(b.projectId);
+        if([...active.keys()].some(runId=>{try{return sameFolder(projectOf(getRun(runId)).path,project.path);}catch{return false;}}))throw new Error('Espera a que terminen las tareas de este proyecto.');
+        const result=await pullProject(project.path);
+        if(!result.ok)throw new Error('No se pudo traer los cambios: '+result.error);
+        await refreshChanges(project);return json(res,200,result);
+      }
       if(route==='/api/update/apply'&&req.method==='POST')return json(res,200,await applyUpdateNow());
       if(route==='/api/run'&&req.method==='POST')return json(res,202,startRun(b));
       if(route==='/api/fix'&&req.method==='POST')return json(res,202,startFix(b));
