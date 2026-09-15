@@ -298,6 +298,7 @@ function render(){
   $('#project-folder').textContent=project()?.path||'';$('#project-folder').title=project()?.path||'';
   const quota=quotaText('codex');$('#quota-hint').textContent=quota?`Codex: ${quota}`:'';
   $('#team-count').textContent=peopleOf(project()).length;
+  refreshTeamModal();
   $('#project-name').textContent=project()?.name||'';$('#conversation-title').textContent=conversation()?.title||'Nueva conversación';
   $('#conversations').innerHTML=state.conversations.filter(c=>c.projectId===projectId).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)).map(c=>`<button class="conversation-link ${c.id===conversationId?'active':''}" data-conversation="${c.id}"><span>◷</span><span>${esc(c.title)}</span></button>`).join('');
   renderAgents();renderMemory();renderMessages();renderRun();renderManual();
@@ -446,19 +447,75 @@ function memoryList(){
   };
 }
 $('#open-memory').onclick=memoryList;
-// Equipo del proyecto: personas, sus partes en cada tarea, y el encargo listo para enviar.
+// Equipo del proyecto: personas, sus encargos (del libro del repositorio o locales) y la cooperación por git.
+function fromLocalItem(i){return {id:i.subtask.id,title:i.subtask.title,status:i.subtask.status,due:i.subtask.due,notes:i.subtask.result?[i.subtask.result]:[],instructions:i.subtask.instructions,scope:i.subtask.scope||[],context:i.run.plan?.context||'',task:i.run.prompt,run:i.run,subtask:i.subtask,conversation:i.conversation,source:'local',personId:i.subtask.personId,personName:personName(i.subtask)};}
+// Encargos de una persona: los del libro (o sueltos) más las partes de tareas locales que aún no estén en él.
+function boardItems(personId){
+  const p=project();if(!p)return [];
+  const items=[],locals=assignmentsOf(personId),source=p.cooperation?.enabled?'repo':'standalone';
+  for(const a of (p.assignments||[]).filter(a=>a.personId===personId)){
+    const [runId,subtaskId]=String(a.origin||'').split('/');
+    const local=locals.find(i=>i.run.id===runId&&i.subtask.id===subtaskId);
+    items.push({id:a.id,title:a.title,status:a.status,due:a.due,notes:a.notes||[],instructions:a.instructions,scope:a.scope||[],context:a.context,task:a.task,run:local?.run,subtask:local?.subtask,conversation:local?.conversation,source,personId,personName:a.personName});
+  }
+  for(const i of locals)if(!items.some(x=>x.run===i.run&&x.subtask===i.subtask))items.push(fromLocalItem(i));
+  return items.sort((x,y)=>((x.status==='hecha')-(y.status==='hecha'))||String(x.due||'9').localeCompare(String(y.due||'9')));
+}
+function itemControlsHtml(item){
+  return `<div class="human-controls" data-item="${esc(item.id)}" data-source="${item.source}" ${item.run?`data-run="${esc(item.run.id)}" data-subtask="${esc(item.subtask.id)}"`:''}><select data-item-status aria-label="Estado de ${esc(item.title)}">${humanStatuses.map(([v,l])=>`<option value="${v}" ${item.status===v?'selected':''}>${l}</option>`).join('')}</select><input type="date" data-item-due value="${esc(item.due||'')}" aria-label="Fecha límite"><input data-item-note placeholder="Añadir nota o resultado" aria-label="Nota"><button type="button" class="secondary-button" data-item-save>Guardar</button><button type="button" class="secondary-button" data-item-brief>Copiar encargo</button></div>
+  ${item.notes.length?`<ul class="item-notes">${item.notes.map(n=>`<li>${esc(n)}</li>`).join('')}</ul>`:''}
+  <div class="metadata">${item.task?`Tarea: ${esc(String(item.task).slice(0,120))}`:'Encargo suelto'}${item.conversation?` · <button type="button" class="text-link" data-open-conversation="${esc(item.conversation.id)}">ir a la conversación</button>`:''} · ${item.source==='repo'?'en el repositorio':'solo en este Mixto'}</div>
+  <p class="human-instructions">${inline(item.instructions||'')}</p>`;
+}
+const briefFromItems=(person,items)=>briefFor(person,items.map(i=>({run:i.run||{prompt:i.task||'',plan:{context:i.context||''}},subtask:{title:i.title,status:i.status,due:i.due,role:i.run?i.subtask.role:'',instructions:i.instructions,scope:i.scope},conversation:i.conversation})));
+function coopSectionHtml(p){
+  const coop=p.cooperation||{},identity=coop.identity;
+  let who='';
+  if(!coop.enabled)who='Activa la cooperación para que Mixto lea tu identidad de git y comparta el libro de encargos.';
+  else if(identity?.personId)who=`En este repositorio eres <strong>${esc(state.people.find(x=>x.id===identity.personId)?.name||identity.name)}</strong> (${esc(identity.email)}).`;
+  else if(identity?.email)who=`Tu git dice <strong>${esc(identity.email)}</strong>, que no está en el equipo. <button type="button" class="text-link" id="coop-add-me">Añadirme al equipo con esa identidad</button>`;
+  else if(identity)who='Tu git no tiene <code>user.email</code>; configúralo para que Mixto sepa quién eres en este repositorio.';
+  else who='Preparando el libro de encargos…';
+  const publish=coop.lastPublish,noRemote=coop.enabled&&coop.lastSync&&!coop.remote;
+  const status=[coop.lastSync?`Última sincronización ${new Date(coop.lastSync).toLocaleString('es')}`:'',
+    publish?`Última publicación ${new Date(publish.at).toLocaleString('es')}: ${publish.pushed?'enviada al remoto':publish.committed?'confirmada solo en local':'sin cambios'}`:'',
+    noRemote?'Sin remoto: los encargos solo viven en este repositorio.':'',coop.pendingPublish?'Hay cambios sin publicar.':'',
+    coop.lastEvent?esc(coop.lastEvent.text):'',coop.error?`Aviso: ${esc(coop.error)}`:''].filter(Boolean).join(' · ');
+  return `<section class="coop-card"><h3>Cooperación por git</h3><p class="modal-note">Los encargos y el equipo se guardan en la rama <code>mixto-encargos</code> del repositorio del proyecto, aparte de tus ramas de código. Cualquier Mixto que abra un clon del mismo repositorio los verá y sabrá quién es cada uno por el correo de su git. Un commit con <code>mixto:&lt;id&gt;</code> en el mensaje, en cualquier rama, da el encargo por hecho; también se puede cambiar el estado o añadir notas desde cualquier Mixto o editando el archivo.</p>
+  <label class="check-field"><input type="checkbox" id="coop-enabled" ${coop.enabled?'checked':''}> Compartir el equipo y los encargos en el repositorio</label>
+  <label class="check-field"><input type="checkbox" id="coop-auto" ${coop.autoPublish!==false?'checked':''} ${coop.enabled?'':'disabled'}> Publicar automáticamente (commit y push de la rama de encargos)</label>
+  <div class="metadata">${who}</div>${status?`<div class="metadata">${status}</div>`:''}
+  <div class="approval-actions"><button type="button" class="secondary-button" id="coop-sync" ${coop.enabled?'':'disabled'}>Sincronizar ahora</button><button type="button" class="secondary-button" id="coop-publish" ${coop.enabled?'':'disabled'}>Publicar ahora</button></div></section>`;
+}
+let lastTeam='';
+function teamKey(){const p=project();return JSON.stringify([projectId,p?.members,p?.assignments,p?.cooperation,state?.people,state?.runs.map(r=>r.subtasks.filter(s=>s.human).map(s=>[s.id,s.status,s.due,s.result]))]);}
+// Si el tablero está abierto y no estás escribiendo en él, se repinta cuando llegan cambios del repositorio.
+function refreshTeamModal(){
+  if(!$('#modal').open||$('#modal').dataset.type!=='team')return;
+  const focus=document.activeElement;
+  if(focus&&$('#modal').contains(focus)&&['INPUT','TEXTAREA','SELECT'].includes(focus.tagName))return;
+  if(teamKey()===lastTeam)return;
+  teamModal();
+}
 function teamModal(){
   const p=project();if(!p){toast('Crea o añade un proyecto antes.');return;}
   const members=peopleOf(p),others=state.people.filter(person=>!(p.members||[]).includes(person.id));
-  const board=members.map(person=>{
-    const items=assignmentsOf(person.id),pending=items.filter(i=>i.subtask.status!=='hecha');
-    return `<section class="person-card" data-person="${esc(person.id)}"><header><span class="agent-avatar human">👤</span><div><h3>${esc(person.name)}</h3><div class="metadata">${esc(person.role||'sin rol')}${person.email?` · ${esc(person.email)}`:''}${person.notes?` · ${esc(person.notes)}`:''}</div></div><span class="pill">${items.length-pending.length}/${items.length} hechas</span></header>
-    ${items.length?items.map(({run,subtask,conversation})=>`<details data-subtask="${esc(subtask.id)}" ${subtask.status!=='hecha'?'open':''}><summary>${esc(subtask.title)} <span class="muted">· ${esc(stageNames[subtask.status]||subtask.status)}${subtask.due?` · límite ${esc(subtask.due)}`:''}</span></summary><div class="metadata">Tarea: ${esc(run.prompt.slice(0,120))} · <button type="button" class="text-link" data-open-conversation="${esc(conversation.id)}">ir a la conversación</button></div>${humanControlsHtml(run,subtask)}</details>`).join(''):'<p class="muted">Sin partes asignadas todavía. Asígnale una desde el reparto a mano o desde el plan del arquitecto.</p>'}
+  const meId=p.cooperation?.identity?.personId;
+  const ordered=[...members].sort((x,y)=>(y.id===meId)-(x.id===meId));
+  const personCard=person=>{
+    const items=boardItems(person.id),pending=items.filter(i=>i.status!=='hecha');
+    return `<section class="person-card" data-person="${esc(person.id)}"><header><span class="agent-avatar human">👤</span><div><h3>${esc(person.name)}${person.id===meId?' <span class="pill">tú</span>':''}</h3><div class="metadata">${esc(person.role||'sin rol')}${person.email?` · ${esc(person.email)}`:''}${person.notes?` · ${esc(person.notes)}`:''}</div></div><span class="pill">${items.length-pending.length}/${items.length} hechas</span></header>
+    ${items.length?items.map(item=>`<details data-subtask="${esc(item.id)}" ${item.status!=='hecha'?'open':''}><summary>${esc(item.title)} <span class="muted">· ${esc(stageNames[item.status]||item.status)}${item.due?` · límite ${esc(item.due)}`:''}</span></summary>${itemControlsHtml(item)}</details>`).join(''):'<p class="muted">Sin encargos todavía. Asígnale una parte desde el reparto a mano, desde el plan del arquitecto o con «Nuevo encargo».</p>'}
     <footer>${pending.length?`<button type="button" class="secondary-button" data-brief-copy="${esc(person.id)}">Copiar encargo (${pending.length})</button><button type="button" class="secondary-button" data-brief-download="${esc(person.id)}">Descargar .md</button>${person.email?`<button type="button" class="secondary-button" data-brief-mail="${esc(person.id)}">Enviar por correo</button>`:''}`:''}<button type="button" class="secondary-button" data-person-edit="${esc(person.id)}">Editar</button><button type="button" class="danger-button" data-person-remove="${esc(person.id)}">Quitar del proyecto</button></footer></section>`;
-  }).join('');
-  openModal(`Equipo de ${p.name}`,`<p class="modal-note">Personas reales que trabajan en este proyecto. Asígnales partes desde el reparto a mano o desde el plan del arquitecto; aquí anotas su estado y su resultado y les preparas el encargo. Mixto no ejecuta sus partes, y el arquitecto las tiene en cuenta al planificar y al revisar.</p>
-    <div id="team-board">${board||'<div class="memory-empty">Todavía no hay nadie en el equipo.</div>'}</div>
-    <form id="person-form" class="person-form"><h3 id="person-form-title">Añadir persona</h3><input type="hidden" name="id"><div class="person-grid"><label class="form-field"><span>Nombre</span><input name="name" required maxlength="80" placeholder="Ana"></label><label class="form-field"><span>Rol</span><input name="role" maxlength="80" placeholder="frontend, QA, producto…"></label><label class="form-field"><span>Correo (opcional)</span><input name="email" type="email" maxlength="200" placeholder="ana@ejemplo.com"></label></div><label class="form-field"><span>Notas (lo que el arquitecto debe saber para asignarle trabajo)</span><textarea name="notes" rows="2" maxlength="2000" placeholder="Sabe React; no tiene acceso al servidor; disponible por las tardes"></textarea></label><div class="form-footer">${others.length?`<select id="person-existing" aria-label="Añadir una persona de otro proyecto"><option value="">Añadir de otro proyecto…</option>${others.map(person=>`<option value="${esc(person.id)}">${esc(person.name)}${person.role?` · ${esc(person.role)}`:''}</option>`).join('')}</select>`:''}<button type="button" class="secondary-button" id="person-cancel" hidden>Cancelar</button><button class="primary-button" id="person-save">Añadir al equipo</button></div></form>`,'team');
+  };
+  const strays=(p.assignments||[]).filter(a=>!members.some(m=>m.id===a.personId));
+  const strayHtml=strays.length?`<section class="person-card"><header><span class="agent-avatar human">👤</span><div><h3>Encargos de personas fuera del equipo</h3></div></header>${strays.map(a=>`<details data-subtask="${esc(a.id)}"><summary>${esc(a.title)} <span class="muted">· ${esc(a.personName||'?')} · ${esc(stageNames[a.status]||a.status)}</span></summary>${itemControlsHtml({id:a.id,title:a.title,status:a.status,due:a.due,notes:a.notes||[],instructions:a.instructions,scope:a.scope||[],context:a.context,task:a.task,source:p.cooperation?.enabled?'repo':'standalone'})}</details>`).join('')}</section>`:'';
+  openModal(`Equipo de ${p.name}`,`<p class="modal-note">Personas reales que trabajan en este proyecto. Asígnales partes desde el reparto a mano, desde el plan del arquitecto o con un encargo suelto; aquí anotas su estado y sus notas y les preparas el encargo. Mixto no ejecuta sus partes, y el arquitecto las tiene en cuenta al planificar y al revisar.</p>
+    ${coopSectionHtml(p)}
+    <div id="team-board">${(ordered.map(personCard).join('')+strayHtml)||'<div class="memory-empty">Todavía no hay nadie en el equipo.</div>'}</div>
+    ${members.length?`<form id="assignment-form" class="person-form"><h3>Nuevo encargo</h3><div class="person-grid"><label class="form-field"><span>Título</span><input name="title" required maxlength="120" placeholder="Probar el flujo de pago"></label><label class="form-field"><span>Para</span><select name="personId" required>${members.map(person=>`<option value="${esc(person.id)}">${esc(person.name)}</option>`).join('')}</select></label><label class="form-field"><span>Fecha límite (opcional)</span><input type="date" name="due"></label></div><label class="form-field"><span>Encargo</span><textarea name="instructions" rows="3" required maxlength="12000" placeholder="Qué debe hacer, con detalle suficiente para trabajar sin verte"></textarea></label><label class="form-field"><span>Alcance (rutas separadas por comas, opcional)</span><input name="scope"></label><div class="form-footer"><button class="primary-button">Crear encargo</button></div></form>`:''}
+    <form id="person-form" class="person-form"><h3 id="person-form-title">Añadir persona</h3><input type="hidden" name="id"><div class="person-grid"><label class="form-field"><span>Nombre</span><input name="name" required maxlength="80" placeholder="Ana"></label><label class="form-field"><span>Rol</span><input name="role" maxlength="80" placeholder="frontend, QA, producto…"></label><label class="form-field"><span>Correo (el de su git, para reconocerla en el repositorio)</span><input name="email" type="email" maxlength="200" placeholder="ana@ejemplo.com"></label></div><label class="form-field"><span>Notas (lo que el arquitecto debe saber para asignarle trabajo)</span><textarea name="notes" rows="2" maxlength="2000" placeholder="Sabe React; no tiene acceso al servidor; disponible por las tardes"></textarea></label><div class="form-footer">${others.length?`<select id="person-existing" aria-label="Añadir una persona de otro proyecto"><option value="">Añadir de otro proyecto…</option>${others.map(person=>`<option value="${esc(person.id)}">${esc(person.name)}${person.role?` · ${esc(person.role)}`:''}</option>`).join('')}</select>`:''}<button type="button" class="secondary-button" id="person-cancel" hidden>Cancelar</button><button class="primary-button" id="person-save">Añadir al equipo</button></div></form>`,'team');
+  lastTeam=teamKey();
   const form=$('#person-form');
   const resetForm=()=>{form.reset();form.elements.id.value='';$('#person-form-title').textContent='Añadir persona';$('#person-save').textContent='Añadir al equipo';$('#person-cancel').hidden=true;};
   $('#person-cancel').onclick=resetForm;
@@ -471,17 +528,31 @@ function teamModal(){
     }catch(error){toast(error.message);}
   };
   if($('#person-existing'))$('#person-existing').onchange=async e=>{if(!e.target.value)return;try{await api('members',{projectId,personId:e.target.value});await load();teamModal();}catch(error){toast(error.message);}};
+  if($('#assignment-form'))$('#assignment-form').onsubmit=async e=>{e.preventDefault();const values=Object.fromEntries(new FormData(e.target));try{await api('assignments',{...values,projectId});await load();teamModal();toast('Encargo creado.');}catch(error){toast(error.message);}};
+  $('#coop-enabled').onchange=async e=>{try{await api('cooperation',{projectId,enabled:e.target.checked});await load();teamModal();toast(e.target.checked?'Cooperación activada: el libro de encargos se está preparando en el repositorio.':'Cooperación desactivada; el libro queda como está en el repositorio.');}catch(error){toast(error.message);await load();teamModal();}};
+  $('#coop-auto').onchange=async e=>{try{await api('cooperation',{projectId,autoPublish:e.target.checked});await load();}catch(error){toast(error.message);}};
+  $('#coop-sync').onclick=async()=>{const b=$('#coop-sync');b.disabled=true;b.textContent='Sincronizando…';try{const r=await api('cooperation/sync',{projectId});await load();teamModal();toast(r.fetchError?'Sincronizado en local; no se pudo traer del remoto: '+r.fetchError:r.autoDone.length?`Sincronizado: ${r.autoDone.length} encargo(s) dados por hechos por sus commits.`:'Sincronizado con el repositorio.');}catch(error){toast(error.message);await load();teamModal();}};
+  $('#coop-publish').onclick=async()=>{const b=$('#coop-publish');b.disabled=true;b.textContent='Publicando…';try{const r=await api('cooperation/publish',{projectId});await load();teamModal();toast(r.pushed?'Encargos publicados en el remoto.':r.committed?'Confirmado en local. '+(r.error||''):r.error||'No había cambios que publicar.');}catch(error){toast(error.message);await load();teamModal();}};
+  if($('#coop-add-me'))$('#coop-add-me').onclick=async()=>{const identity=project().cooperation?.identity;try{await api('people',{name:identity.name||identity.email.split('@')[0],email:identity.email,role:'',notes:'',projectId});await api('cooperation/sync',{projectId,fetch:false});await load();teamModal();toast('Ya estás en el equipo de este repositorio.');}catch(error){toast(error.message);}};
+  const personFor=id=>state.people.find(x=>x.id===id);
   $('#team-board').onclick=async e=>{
     const b=e.target.closest('button');if(!b)return;
-    if(b.dataset.personEdit){const person=state.people.find(x=>x.id===b.dataset.personEdit);if(!person)return;form.elements.id.value=person.id;form.elements.name.value=person.name;form.elements.role.value=person.role||'';form.elements.email.value=person.email||'';form.elements.notes.value=person.notes||'';$('#person-form-title').textContent=`Editar a ${person.name}`;$('#person-save').textContent='Guardar';$('#person-cancel').hidden=false;form.elements.name.focus();return;}
-    if(b.dataset.personRemove){try{await api('members',{projectId,personId:b.dataset.personRemove,remove:true});await load();teamModal();toast('Persona quitada del proyecto; sus partes ya asignadas se conservan.');}catch(error){toast(error.message);}return;}
+    if(b.dataset.personEdit){const person=personFor(b.dataset.personEdit);if(!person)return;form.elements.id.value=person.id;form.elements.name.value=person.name;form.elements.role.value=person.role||'';form.elements.email.value=person.email||'';form.elements.notes.value=person.notes||'';$('#person-form-title').textContent=`Editar a ${person.name}`;$('#person-save').textContent='Guardar';$('#person-cancel').hidden=false;form.elements.name.focus();return;}
+    if(b.dataset.personRemove){try{await api('members',{projectId,personId:b.dataset.personRemove,remove:true});await load();teamModal();toast('Persona quitada del proyecto; sus encargos se conservan.');}catch(error){toast(error.message);}return;}
     if(b.dataset.openConversation){conversationId=b.dataset.openConversation;closeModal();lastMessages='';lastRun='';render();return;}
-    const personFor=id=>state.people.find(x=>x.id===id);
-    if(b.dataset.briefCopy){const person=personFor(b.dataset.briefCopy);await copyText(briefFor(person,assignmentsOf(person.id).filter(i=>i.subtask.status!=='hecha')),`Encargo de ${person.name} copiado.`);return;}
-    if(b.dataset.briefDownload){const person=personFor(b.dataset.briefDownload);downloadText(`encargo-${person.name.replace(/[^\w.-]+/g,'-').toLowerCase()}.md`,briefFor(person,assignmentsOf(person.id).filter(i=>i.subtask.status!=='hecha')));return;}
-    if(b.dataset.briefMail){const person=personFor(b.dataset.briefMail);const brief=briefFor(person,assignmentsOf(person.id).filter(i=>i.subtask.status!=='hecha'));location.href=`mailto:${encodeURIComponent(person.email)}?subject=${encodeURIComponent(`Encargo · ${project()?.name||'Mixto'}`)}&body=${encodeURIComponent(brief.slice(0,1800))}`;return;}
-    if(b.hasAttribute('data-human-save')){if(await saveHuman(b.closest('[data-human]')))teamModal();return;}
-    if(b.dataset.humanBrief){const container=b.closest('[data-human]');const found=humanSubtaskById(container.dataset.run,b.dataset.humanBrief);if(found){const person=personFor(found.subtask.personId)||{name:found.subtask.personName};await copyText(briefFor(person,[{run:found.run,subtask:found.subtask,conversation:conversationOf(found.run)}]),`Encargo de ${person.name} copiado.`);}}
+    if(b.dataset.briefCopy){const person=personFor(b.dataset.briefCopy);await copyText(briefFromItems(person,boardItems(person.id).filter(i=>i.status!=='hecha')),`Encargo de ${person.name} copiado.`);return;}
+    if(b.dataset.briefDownload){const person=personFor(b.dataset.briefDownload);downloadText(`encargo-${person.name.replace(/[^\w.-]+/g,'-').toLowerCase()}.md`,briefFromItems(person,boardItems(person.id).filter(i=>i.status!=='hecha')));return;}
+    if(b.dataset.briefMail){const person=personFor(b.dataset.briefMail);const brief=briefFromItems(person,boardItems(person.id).filter(i=>i.status!=='hecha'));location.href=`mailto:${encodeURIComponent(person.email)}?subject=${encodeURIComponent(`Encargo · ${project()?.name||'Mixto'}`)}&body=${encodeURIComponent(brief.slice(0,1800))}`;return;}
+    if(b.hasAttribute('data-item-save')){
+      const c=b.closest('[data-item]');const status=c.querySelector('[data-item-status]').value,due=c.querySelector('[data-item-due]').value,note=c.querySelector('[data-item-note]').value.trim();
+      try{
+        if(c.dataset.source==='local')await api('subtask',{runId:c.dataset.run,subtaskId:c.dataset.subtask,status,due,...(note?{result:note}:{})});
+        else await api('assignments/'+c.dataset.item,{projectId,status,due,...(note?{note}:{})},'PATCH');
+        await load();teamModal();toast('Anotado.');
+      }catch(error){toast(error.message);}
+      return;
+    }
+    if(b.hasAttribute('data-item-brief')){const c=b.closest('[data-item]'),card=b.closest('[data-person]');const person=personFor(card?.dataset.person)||{name:'persona'};const item=(card?boardItems(person.id):[]).find(i=>i.id===c.dataset.item)||(project().assignments||[]).map(a=>({...a,notes:a.notes||[],scope:a.scope||[],source:'repo'})).find(i=>i.id===c.dataset.item);if(item)await copyText(briefFromItems(person,[item]),'Encargo copiado.');}
   };
 }
 $('#open-team').onclick=teamModal;

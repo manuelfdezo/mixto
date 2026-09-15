@@ -39,7 +39,20 @@ En **Equipo** añades a las personas que trabajan en cada proyecto: nombre, rol,
 - **Copiar encargo**, **Descargar .md** o **Enviar por correo** preparan para cada persona un documento con sus partes pendientes: tarea, instrucciones, alcance y el contexto que descubrió el arquitecto.
 - Cuando las personas terminen, **Revisar de nuevo** hace que el revisor compruebe el conjunto en la carpeta del proyecto, con lo que ellas hayan integrado y lo que tú hayas anotado. Cuesta un turno. Una tarea que solo tiene partes de personas no se revisa hasta que lo pidas.
 
-Mixto sigue siendo una app local de un solo usuario: tú coordinas, las personas reciben su encargo por el medio que prefieras y tú registras lo que entregan. No hay acceso por red ni cuentas para ellas.
+Mixto sigue siendo una app local de un solo usuario: no hay acceso por red ni cuentas. La cooperación entre personas pasa por el repositorio, que ya comparten.
+
+### Cooperación por git
+
+Actívala en **Equipo**. El equipo y los encargos se guardan en una rama propia del repositorio del proyecto, `mixto-encargos`, con un archivo markdown por encargo y `equipo.json`. Mixto la maneja desde una copia oculta en su carpeta de datos: nunca toca tus ramas de código, ni tu copia de trabajo, ni empuja tus commits.
+
+- **Cada persona trabaja en su clon.** Su Mixto, apuntando a ese clon, lee la misma rama, importa el equipo con los mismos identificadores, la reconoce por el `user.email` de su git y le muestra sus encargos. Si su correo no está en el equipo, un botón la añade con esa identidad.
+- **Un encargo se da por hecho solo** cuando aparece en cualquier rama un commit con `mixto:<id corto>` en el mensaje (los ocho primeros caracteres del id, que figuran en el propio archivo). La nota registra el commit y su autor.
+- **Estado y notas** se cambian desde cualquier Mixto, desde la tarjeta de la tarea o el tablero, o editando el archivo en el repositorio. Los cambios se mezclan por fecha y las notas se unen, así que dos personas pueden anotar a la vez sin conflictos.
+- **Publicar** es commit y push de la rama de encargos. Con **Publicar automáticamente** ocurre en cada cambio; si no, el botón **Publicar ahora**. Un push rechazado se resuelve solo: se trae lo del otro, se mezcla y se reintenta.
+- **Sincronizar** trae las ramas del remoto y actualiza el tablero y las tareas locales. Ocurre al activar la cooperación, al arrancar, cada minuto en local y cada cinco minutos con el remoto, siempre que no haya una tarea activa en esa carpeta. Un encargo hecho por otra persona actualiza la parte correspondiente de tu tarea y su registro de memoria, sin gastar turnos.
+- **Encargos sueltos**: desde el tablero puedes crear un encargo para alguien sin pasar por una tarea. Los agentes de tu Mixto reciben, al planificar, cuántos encargos pendientes tiene ya cada persona.
+
+Sin remoto, el libro queda confirmado solo en tu repositorio. Si dos Mixto usan clones distintos con remotos distintos, cada uno ve su propio libro.
 
 ### Consumo y cuota
 

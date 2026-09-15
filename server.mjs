@@ -11,6 +11,7 @@ import {inspect,initRepository,createWorkspaces,createReviewWorkspace,capturePat
 import {createManagedProject,managedProjectPath,projectsRoot,syncDiscoveredProjects} from './lib/projects.mjs';
 import {listPersonas,personaBody} from './lib/personas.mjs';
 import {Watcher} from './lib/supervisor.mjs';
+import {openLedger,syncLedger,publishLedger,writeLedger,gitIdentity,STATUSES as LEDGER_STATUSES} from './lib/team.mjs';
 
 const VERSION='1.1.0';
 const root=path.dirname(fileURLToPath(import.meta.url));
@@ -64,7 +65,7 @@ const flush=()=>{store.save();dirty=false;notify();};
 const keepalive=setInterval(()=>{for(const client of clients){try{client.write(': ping\n\n');}catch{clients.delete(client);}}},20000);
 keepalive.unref();
 const toSubtask=(item,index)=>({id:id(),index,human:false,personId:null,personName:null,...item,cwd:null,patch:null,diff:null,text:'',
-  status:item.human?'pendiente':'queued',stage:item.human?`Asignada a ${item.personName}`:'En espera',result:'',due:null,
+  status:item.human?'pendiente':'queued',stage:item.human?`Asignada a ${item.personName}`:'En espera',result:'',due:null,assignmentId:null,updatedAt:null,
   events:[],messageId:null,sessionKey:null,sessionId:null,usage:null,error:null,startedAt:null,finishedAt:null,fixable:false,self:false});
 const checkpoint=setInterval(()=>{if(dirty)try{flush();}catch(e){console.error('No se pudo guardar:',e.message);}},2000);
 checkpoint.unref();
@@ -113,6 +114,179 @@ function personFields(source,base={}){
   const email=str(source.email||'','Correo',200,true);
   if(email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))throw new Error('Correo: escribe una dirección válida o déjalo vacío.');
   return {...base,name:str(source.name,'Nombre',80),role:str(source.role||'','Rol',80,true),email,notes:str(source.notes||'','Notas',2000,true)};
+}
+
+// Cooperación por git: el libro de encargos del proyecto vive en la rama `mixto-encargos` del repositorio.
+// Todas las operaciones sobre el libro de un proyecto van en fila, para no pisarse entre sí.
+const coopChains=new Map();
+function coopSerial(project,fn){
+  const previous=coopChains.get(project.id)||Promise.resolve();
+  const next=previous.then(fn,fn);
+  coopChains.set(project.id,next.catch(()=>{}));
+  return next;
+}
+function coopOf(project){
+  project.cooperation||={enabled:false,autoPublish:true,lastSync:null,lastPublish:null,pendingPublish:false,error:null,identity:null,remote:null};
+  project.assignments||=[];
+  return project.cooperation;
+}
+const coopEnabled=project=>!!project.cooperation?.enabled;
+const humanStage=(status,name)=>status==='hecha'?`Hecha por ${name}`:status==='en-curso'?`En curso · ${name}`:`Asignada a ${name}`;
+function pendingFor(project,personId){
+  let count=project.assignments?.filter(a=>a.personId===personId&&a.status!=='hecha').length||0;
+  const known=new Set((project.assignments||[]).map(a=>a.origin));
+  for(const run of store.data.runs){
+    if(store.conversation(run.conversationId)?.projectId!==project.id)continue;
+    for(const subtask of run.subtasks||[])if(subtask.human&&subtask.personId===personId&&subtask.status!=='hecha'&&!known.has(`${run.id}/${subtask.id}`))count++;
+  }
+  return count;
+}
+function assignmentFromSubtask(run,subtask,project){
+  const person=store.data.people.find(candidate=>candidate.id===subtask.personId);
+  const identity=coopOf(project).identity;
+  return {id:subtask.id,project:project.name,title:subtask.title,personId:subtask.personId,personName:person?.name||subtask.personName,personEmail:person?.email||'',
+    status:subtask.status,due:subtask.due||null,createdBy:identity?.email?`${identity.name} <${identity.email}>`:'Mixto',createdAt:run.createdAt,updatedAt:subtask.updatedAt||run.createdAt,
+    task:run.prompt.slice(0,300),origin:`${run.id}/${subtask.id}`,instructions:`Rol: ${subtask.role}\n\n${subtask.instructions}`,scope:subtask.scope||[],
+    context:run.plan?.context||'',notes:subtask.result?[subtask.result]:[]};
+}
+function cacheAssignment(project,entry){
+  const list=coopOf(project)&&project.assignments;
+  const index=list.findIndex(candidate=>candidate.id===entry.id);
+  if(index>=0)list[index]=entry;else list.push(entry);
+}
+// Lo que llega del libro pasa a las personas, a la caché del proyecto y a las partes humanas de las tareas locales.
+function applyLedgerToState(project,synced){
+  const coop=coopOf(project);
+  for(const person of synced.people){
+    let local=store.data.people.find(candidate=>candidate.id===person.id);
+    if(!local){local={...person,createdAt:now(),imported:true};store.data.people.push(local);}
+    project.members||=[];
+    if(!project.members.includes(local.id))project.members.push(local.id);
+  }
+  project.assignments=synced.assignments.map(entry=>({...entry}));
+  const touched=new Set();
+  for(const entry of synced.assignments){
+    const [runId,subtaskId]=String(entry.origin||'').split('/');
+    if(!runId)continue;
+    const run=store.data.runs.find(candidate=>candidate.id===runId),subtask=run?.subtasks.find(candidate=>candidate.id===subtaskId);
+    if(!run||!subtask?.human)continue;
+    subtask.assignmentId=entry.id;
+    if((subtask.updatedAt||'')>=entry.updatedAt)continue;
+    subtask.status=entry.status;subtask.due=entry.due;subtask.updatedAt=entry.updatedAt;
+    if(entry.notes.length)subtask.result=entry.notes[entry.notes.length-1];
+    subtask.stage=humanStage(entry.status,subtask.personName);
+    subtask.finishedAt=entry.status==='hecha'?(subtask.finishedAt||now()):null;
+    touched.add(run);
+  }
+  for(const run of touched){humansRollup(run);if(run.phase==='done')recordRunMemory(run);}
+  coop.lastSync=now();coop.remote=synced.remote||null;coop.error=synced.status.fetchError||null;
+  touch();
+}
+async function coopPublishNow(project,opened){
+  const coop=coopOf(project);
+  const {dir,remote}=opened||await openLedger({projectPath:project.path,dataDir,projectId:project.id});
+  let result=await publishLedger({dir,remote});
+  // Un push rechazado significa que otro Mixto publicó antes: se mezcla lo suyo y se vuelve a intentar una vez.
+  if(!result.pushed&&result.error&&/rejected|fetch first|non-fast-forward|behind/i.test(result.error)){
+    const synced=await syncLedger({projectPath:project.path,dataDir,projectId:project.id,fetch:true,localPeople:membersOf(project)});
+    applyLedgerToState(project,synced);
+    result=await publishLedger({dir,remote});
+  }
+  coop.lastPublish={at:now(),committed:result.committed,pushed:result.pushed,error:result.error};
+  coop.pendingPublish=!!result.error&&!result.pushed;
+  coop.error=result.error;
+  touch();
+  return result;
+}
+function coopSync(project,{fetch=false,publish=false}={}){
+  return coopSerial(project,async()=>{
+    const coop=coopOf(project);
+    try{
+      const identity=await gitIdentity(project.path);
+      const synced=await syncLedger({projectPath:project.path,dataDir,projectId:project.id,fetch,localPeople:membersOf(project)});
+      applyLedgerToState(project,synced);
+      const me=synced.people.find(person=>person.email&&identity.email&&person.email.toLowerCase()===identity.email.toLowerCase());
+      coop.identity={name:identity.name,email:identity.email,personId:me?.id||null};
+      if(synced.autoDone.length)pushEventProject(project,`Encargos dados por hechos por sus commits: ${synced.autoDone.length}.`);
+      const dirty=synced.changed>0||synced.autoDone.length>0||coop.pendingPublish;
+      if((publish||dirty)&&coop.autoPublish)await coopPublishNow(project,synced);
+      else if(dirty)coop.pendingPublish=true;
+      touch();
+      return synced;
+    }catch(error){coop.error=error.message;touch();throw error;}
+  });
+}
+function pushEventProject(project,text){coopOf(project).lastEvent={at:now(),text};}
+// Escribe encargos (y el equipo) en el libro y, si procede, publica.
+function coopUpsert(project,entries){
+  return coopSerial(project,async()=>{
+    const coop=coopOf(project);
+    try{
+      const opened=await openLedger({projectPath:project.path,dataDir,projectId:project.id});
+      writeLedger(opened.dir,{assignments:entries,people:membersOf(project)});
+      for(const entry of entries)cacheAssignment(project,entry);
+      touch();
+      if(coop.autoPublish)await coopPublishNow(project,opened);else{coop.pendingPublish=true;touch();}
+    }catch(error){coop.error=error.message;touch();throw error;}
+  });
+}
+// Al asignar partes a personas en una tarea de un proyecto cooperativo, cada una pasa al libro.
+function coopBackfillRun(run,project){
+  const entries=[];
+  for(const subtask of run.subtasks){
+    if(!subtask.human||subtask.assignmentId)continue;
+    subtask.assignmentId=subtask.id;subtask.updatedAt=subtask.updatedAt||now();
+    entries.push(assignmentFromSubtask(run,subtask,project));
+  }
+  if(!entries.length)return Promise.resolve();
+  return coopUpsert(project,entries);
+}
+async function coopEnableNow(project){
+  await coopSync(project,{fetch:true});
+  for(const run of store.data.runs){
+    if(store.conversation(run.conversationId)?.projectId!==project.id)continue;
+    await coopBackfillRun(run,project).catch(()=>{});
+  }
+  await coopSync(project,{fetch:false,publish:true});
+}
+// Cambio de estado, fecha o nota de una parte humana: vale para la tarjeta de la tarea, el tablero y el libro.
+async function updateHumanPart(project,{run,subtask,assignment},{status,due,note}){
+  const stamp=now();
+  if(status!==undefined&&!LEDGER_STATUSES.includes(status))throw new Error('Estado no válido: pendiente, en-curso o hecha.');
+  if(due!==undefined&&due&&!/^\d{4}-\d{2}-\d{2}$/.test(due))throw new Error('Fecha límite: usa el formato AAAA-MM-DD.');
+  const who=coopOf(project).identity?.name||'';
+  const line=note?`${stamp.slice(0,10)}${who?` · ${who}`:''}: ${note}`:null;
+  if(subtask){
+    if(status!==undefined){
+      subtask.status=status;subtask.stage=humanStage(status,subtask.personName);
+      subtask.finishedAt=status==='hecha'?stamp:null;
+      if(status!=='pendiente'&&!subtask.startedAt)subtask.startedAt=stamp;
+    }
+    if(due!==undefined)subtask.due=due||null;
+    if(note)subtask.result=note;
+    subtask.updatedAt=stamp;
+    if(run){humansRollup(run);if(run.phase==='done')recordRunMemory(run);}
+  }
+  let entry=assignment||(subtask?.assignmentId?project.assignments?.find(candidate=>candidate.id===subtask.assignmentId):null);
+  if(!entry&&subtask&&run&&coopEnabled(project)){entry=assignmentFromSubtask(run,subtask,project);subtask.assignmentId=entry.id;}
+  if(entry){
+    if(status!==undefined)entry.status=status;
+    if(due!==undefined)entry.due=due||null;
+    if(line)entry.notes=[...(entry.notes||[]),line];
+    entry.updatedAt=stamp;
+    if(!subtask){
+      // Un encargo con origen en una tarea local de este mismo Mixto también actualiza esa parte.
+      const [runId,subtaskId]=String(entry.origin||'').split('/');
+      const localRun=store.data.runs.find(candidate=>candidate.id===runId),localSubtask=localRun?.subtasks.find(candidate=>candidate.id===subtaskId);
+      if(localSubtask?.human){
+        localSubtask.status=entry.status;localSubtask.due=entry.due;localSubtask.updatedAt=stamp;localSubtask.stage=humanStage(entry.status,localSubtask.personName);
+        localSubtask.finishedAt=entry.status==='hecha'?stamp:null;if(line)localSubtask.result=note;
+        humansRollup(localRun);if(localRun.phase==='done')recordRunMemory(localRun);
+      }
+    }
+    if(coopEnabled(project))await coopUpsert(project,[entry]);else cacheAssignment(project,entry);
+  }
+  touch();
 }
 function snapshot(){
   const managed=syncDiscoveredProjects(store.data,managedProjectsRoot);
@@ -243,7 +417,7 @@ async function planPhase(run,controller){
   // La persona da el enfoque; las preferencias del usuario van después para que, si chocan, ganen las suyas.
   const instructions=[personaBody(store.data.settings.orchestratorPersona),
     store.data.settings[run.orchestrator.provider+'Instructions']||''].filter(Boolean).join('\n\n');
-  const people=membersOf(project);
+  const people=membersOf(project).map(person=>({...person,pending:pendingFor(project,person.id)}));
   let prompt=buildPlanPrompt({request:run.prompt,connections,memory,history,
     instructions,maxSubtasks:MAX_SUBTASKS,maxParallel:maxParallel(),readOnly:run.readOnly,people});
   let parsed=null,sessionId,lastError;
@@ -327,6 +501,7 @@ async function prepare(run,decision){
   const only=agents.length===1?agents[0]:null;
   if(only&&only.provider===run.orchestrator.provider&&run.orchestrator.sessionId&&only.cwd===project.path)only.self=true;
   run.waves=assignWaves(agents,{isolated,maxParallel:maxParallel()});
+  if(coopEnabled(project))void coopBackfillRun(run,project).catch(()=>{});
   flush();
 }
 
@@ -821,7 +996,7 @@ const server=http.createServer(async(req,res)=>{
       if(route==='/api/people'&&req.method==='POST'){
         const person=personFields(b,{id:id(),createdAt:now()});
         store.data.people.push(person);
-        if(b.projectId){const project=store.project(b.projectId);project.members||=[];if(!project.members.includes(person.id))project.members.push(person.id);}
+        if(b.projectId){const project=store.project(b.projectId);project.members||=[];if(!project.members.includes(person.id))project.members.push(person.id);if(coopEnabled(project))void coopUpsert(project,[]).catch(()=>{});}
         flush();return json(res,201,person);
       }
       if(route.startsWith('/api/people/')&&['PATCH','DELETE'].includes(req.method)){
@@ -830,6 +1005,7 @@ const server=http.createServer(async(req,res)=>{
           store.data.people=store.data.people.filter(candidate=>candidate!==person);
           for(const project of store.data.projects)project.members=(project.members||[]).filter(member=>member!==person.id);
         } else Object.assign(person,personFields({...person,...b}),{updatedAt:now()});
+        for(const project of store.data.projects)if(coopEnabled(project)&&(project.members||[]).includes(person.id))void coopUpsert(project,[]).catch(()=>{});
         flush();return json(res,200,{ok:true});
       }
       if(route==='/api/members'&&req.method==='POST'){
@@ -838,29 +1014,60 @@ const server=http.createServer(async(req,res)=>{
         project.members||=[];
         if(b.remove===true)project.members=project.members.filter(member=>member!==person.id);
         else if(!project.members.includes(person.id))project.members.push(person.id);
+        if(coopEnabled(project))void coopUpsert(project,[]).catch(()=>{});
         flush();return json(res,200,{ok:true});
       }
       if(route==='/api/subtask'&&req.method==='POST'){
-        const run=getRun(b.runId);
+        const run=getRun(b.runId),project=projectOf(run);
         const subtask=run.subtasks.find(candidate=>candidate.id===b.subtaskId);
         if(!subtask?.human)throw new Error('Solo las sub-tareas asignadas a personas se actualizan a mano.');
-        if(b.status!==undefined){
-          if(!HUMAN_STATUSES.includes(b.status))throw new Error('Estado no válido: pendiente, en-curso o hecha.');
-          subtask.status=b.status;
-          subtask.stage=b.status==='hecha'?`Hecha por ${subtask.personName}`:b.status==='en-curso'?`En curso · ${subtask.personName}`:`Asignada a ${subtask.personName}`;
-          subtask.finishedAt=b.status==='hecha'?now():null;
-          if(b.status!=='pendiente'&&!subtask.startedAt)subtask.startedAt=now();
-        }
-        if(b.result!==undefined)subtask.result=str(b.result,'Resultado',12000,true);
-        if(b.due!==undefined){
-          const due=String(b.due||'').trim();
-          if(due&&!/^\d{4}-\d{2}-\d{2}$/.test(due))throw new Error('Fecha límite: usa el formato AAAA-MM-DD.');
-          subtask.due=due||null;
-        }
-        humansRollup(run);
-        // El registro de memoria refleja lo que las personas entregaron, sin gastar ningún turno.
-        if(run.phase==='done')recordRunMemory(run);
+        const note=b.result!==undefined?str(b.result,'Resultado',12000,true):undefined;
+        await updateHumanPart(project,{run,subtask},{status:b.status,due:b.due!==undefined?String(b.due||'').trim():undefined,note:note&&note!==subtask.result?note:undefined});
         flush();return json(res,200,{ok:true});
+      }
+      if(route==='/api/assignments'&&req.method==='POST'){
+        const project=store.project(b.projectId),coop=coopOf(project);
+        const person=membersOf(project).find(candidate=>candidate.id===b.personId);
+        if(!person)throw new Error('Elige a una persona del equipo del proyecto.');
+        const due=String(b.due||'').trim();
+        if(due&&!/^\d{4}-\d{2}-\d{2}$/.test(due))throw new Error('Fecha límite: usa el formato AAAA-MM-DD.');
+        const scope=typeof b.scope==='string'?b.scope.split(',').map(entry=>entry.trim()).filter(Boolean).slice(0,20):[];
+        const entry={id:id(),project:project.name,title:str(b.title,'Título',120),personId:person.id,personName:person.name,personEmail:person.email||'',
+          status:'pendiente',due:due||null,createdBy:coop.identity?.email?`${coop.identity.name} <${coop.identity.email}>`:'Mixto',createdAt:now(),updatedAt:now(),
+          task:str(b.task||'','Tarea',300,true),origin:'',instructions:str(b.instructions,'Encargo',12000),scope,context:'',notes:[]};
+        if(coopEnabled(project))await coopUpsert(project,[entry]);else cacheAssignment(project,entry);
+        flush();return json(res,201,entry);
+      }
+      if(route.startsWith('/api/assignments/')&&req.method==='PATCH'){
+        const project=store.project(b.projectId);coopOf(project);
+        const entry=project.assignments.find(candidate=>candidate.id===route.split('/').pop());
+        if(!entry)throw new Error('Encargo no encontrado en este proyecto.');
+        const note=b.note!==undefined?str(b.note,'Nota',12000,true):undefined;
+        await updateHumanPart(project,{assignment:entry},{status:b.status,due:b.due!==undefined?String(b.due||'').trim():undefined,note:note||undefined});
+        flush();return json(res,200,{ok:true});
+      }
+      if(route==='/api/cooperation'&&req.method==='POST'){
+        const project=store.project(b.projectId),coop=coopOf(project);
+        if(b.autoPublish!==undefined)coop.autoPublish=b.autoPublish===true;
+        if(b.enabled===true&&!coop.enabled){
+          const info=inspect(project.path);
+          if(info.kind!=='worktree')throw new Error('La cooperación por git necesita que la carpeta sea un repositorio git con al menos un commit.');
+          coop.enabled=true;coop.error=null;flush();
+          void coopEnableNow(project).catch(error=>{coop.error=error.message;touch();});
+        } else if(b.enabled===false)coop.enabled=false;
+        flush();return json(res,200,{ok:true});
+      }
+      if(route==='/api/cooperation/sync'&&req.method==='POST'){
+        const project=store.project(b.projectId);
+        if(!coopEnabled(project))throw new Error('La cooperación por git no está activada en este proyecto.');
+        const synced=await coopSync(project,{fetch:b.fetch!==false});
+        flush();return json(res,200,{ok:true,fetched:synced.status.fetched,fetchError:synced.status.fetchError,autoDone:synced.autoDone,assignments:project.assignments.length});
+      }
+      if(route==='/api/cooperation/publish'&&req.method==='POST'){
+        const project=store.project(b.projectId);
+        if(!coopEnabled(project))throw new Error('La cooperación por git no está activada en este proyecto.');
+        const result=await coopSerial(project,()=>coopPublishNow(project));
+        flush();return json(res,200,result);
       }
       if(route==='/api/plan'&&req.method==='POST'){
         const gate=planGates.get(b.runId);
@@ -893,7 +1100,20 @@ const server=http.createServer(async(req,res)=>{
 });
 
 server.on('error',e=>{console.error(e.code==='EADDRINUSE'?`El puerto ${port} ya está ocupado.`:e.message);process.exit(1);});
-server.listen(port,'127.0.0.1',()=>{console.log(`Mixto · ${origin}`);void refreshConnections();void syncMemory();});
+// Los proyectos cooperativos se ponen al día solos: cada minuto en local y cada cinco con el remoto,
+// nunca mientras haya una tarea activa en esa carpeta.
+let coopTick=0;
+const coopTimer=setInterval(()=>{
+  coopTick++;
+  for(const project of store.data.projects){
+    if(!coopEnabled(project))continue;
+    if([...active.keys()].some(runId=>{try{return sameFolder(projectOf(getRun(runId)).path,project.path);}catch{return false;}}))continue;
+    void coopSync(project,{fetch:coopTick%5===0}).catch(()=>{});
+  }
+},60000);
+coopTimer.unref();
+server.listen(port,'127.0.0.1',()=>{console.log(`Mixto · ${origin}`);void refreshConnections();void syncMemory();
+  for(const project of store.data.projects)if(coopEnabled(project))void coopSync(project,{fetch:true}).catch(()=>{});});
 let stopping=false;
 function stop(){if(stopping)return;stopping=true;for(const c of active.values())c.abort();setTimeout(()=>{flush();for(const client of clients){try{client.end();}catch{}}server.close();process.exit(0);},750);}
 process.on('SIGINT',stop);process.on('SIGTERM',stop);

@@ -12,16 +12,22 @@ const agent=path.join(here,'fake-agent.mjs');
 const git=(cwd,...args)=>execFileSync('git',['-C',cwd,...args],{windowsHide:true,encoding:'utf8'});
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
-async function boot(t,{delay=600,scenario}={}) {
+const GIT_ENV={...process.env,GIT_TERMINAL_PROMPT:'0'};
+async function boot(t,{delay=600,scenario,remote=false,cloneOf=null,identity={name:'Mixto Test',email:'test@example.invalid'}}={}) {
   const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'mixto-orq-')));
   const projectsRoot=path.join(dir,'projects');fs.mkdirSync(projectsRoot);
-  const work=path.join(projectsRoot,'proyecto');fs.mkdirSync(work);
-  git(work,'init','-b','main');
-  git(work,'config','user.name','Mixto Test');
-  git(work,'config','user.email','test@example.invalid');
+  const work=path.join(projectsRoot,'proyecto');
+  let bare=null;
+  if(cloneOf)execFileSync('git',['clone','--quiet',cloneOf,work],{env:GIT_ENV});
+  else{fs.mkdirSync(work);git(work,'init','-b','main');}
+  git(work,'config','user.name',identity.name);
+  git(work,'config','user.email',identity.email);
   git(work,'config','core.autocrlf','false');
-  fs.writeFileSync(path.join(work,'base.txt'),'base\n');
-  git(work,'add','base.txt');git(work,'commit','-m','inicial');
+  if(!cloneOf){
+    fs.writeFileSync(path.join(work,'base.txt'),'base\n');
+    git(work,'add','base.txt');git(work,'commit','-m','inicial');
+    if(remote){bare=path.join(dir,'remote.git');execFileSync('git',['init','--bare','-b','main',bare],{env:GIT_ENV});git(work,'remote','add','origin',bare);git(work,'push','-q','-u','origin','main');}
+  }
   const port=20000+Math.floor(Math.random()*20000);
   const child=spawn(process.execPath,['server.mjs'],{cwd:root,windowsHide:true,stdio:['ignore','pipe','pipe'],
     env:{...process.env,MIXTO_PORT:String(port),MIXTO_DATA_DIR:path.join(dir,'datos'),
@@ -66,7 +72,7 @@ async function boot(t,{delay=600,scenario}={}) {
   assert.ok(state.connections.claude.connected,'el agente falso no se reportó conectado: '+log);
   // Nunca usar el proyecto por defecto: apunta a la carpeta de Mixto, no a esta copia de prueba.
   const project=await call('projects',{name:'Proyecto de prueba',path:work,description:''});
-  return {call,work,dir,project,origin,cookie,log:()=>log,
+  return {call,work,dir,project,origin,cookie,bare,log:()=>log,
     until:async predicate=>{
       for(let attempt=0;attempt<200;attempt++) {
         const current=await call('state');
@@ -606,4 +612,69 @@ test('en el plan del arquitecto se puede pasar una sub-tarea a una persona, y de
   const only=runOf(await until(s=>s.runs.length===2&&['completed','error'].includes(runOf(s).status)));
   assert.equal(only.status,'completed');assert.equal(only.review,null);assert.equal(only.usage,null);
   assert.equal(only.stage,'Pendiente de 1 persona');
+});
+
+test('cooperación por git: dos Mixto sobre clones del mismo repositorio comparten equipo y encargos, y un commit da el encargo por hecho',async t=>{
+  // Manuel: su Mixto, su clon, su equipo.
+  const A=await boot(t,{delay:50,remote:true});
+  const ana=await A.call('people',{name:'Ana',role:'QA',email:'ana@example.invalid',projectId:A.project.id});
+  await A.call('cooperation',{projectId:A.project.id,enabled:true});
+  let stateA=await A.until(s=>s.projects.find(p=>p.id===A.project.id).cooperation.lastPublish?.pushed===true);
+  let projectA=stateA.projects.find(p=>p.id===A.project.id);
+  assert.equal(projectA.cooperation.enabled,true);
+  assert.equal(projectA.cooperation.identity.email,'test@example.invalid');
+  assert.equal(projectA.cooperation.identity.personId,null,'Manuel no está en el equipo con ese correo');
+  assert.match(git(A.bare,'branch'),/mixto-encargos/);
+  assert.equal(git(A.work,'status','--porcelain').trim(),'','la carpeta del proyecto no se toca');
+  // Un reparto a mano con una parte para Ana pasa al libro del repositorio.
+  const conversation=await A.call('conversations',{projectId:A.project.id});
+  await A.call('run',{conversationId:conversation.id,prompt:'Saca la versión',readOnly:false,mode:'manual',orchestrator:{provider:'claude',model:'claude-fake'},
+    plan:{review:false,subtasks:[{title:'Probar en móvil',provider:'persona',personId:ana.id,instructions:'Prueba el flujo en un móvil real.',scope:'app/'}]}});
+  stateA=await A.until(s=>['completed','error'].includes(runOf(s).status)&&s.projects.find(p=>p.id===A.project.id).assignments.length===1);
+  let run=runOf(stateA);
+  const subtask=run.subtasks[0];
+  assert.equal(subtask.assignmentId,subtask.id);
+  for(let attempt=0;attempt<60;attempt++){try{if(git(A.bare,'ls-tree','--name-only','mixto-encargos','encargos/').includes(subtask.id))break;}catch{}await wait(250);}
+  assert.match(git(A.bare,'ls-tree','--name-only','mixto-encargos','encargos/'),new RegExp(subtask.id),'el encargo está publicado en el remoto');
+  // Ana trabaja en su clon y cita el encargo en un commit.
+  const B=await boot(t,{delay:50,cloneOf:A.bare,identity:{name:'Ana',email:'ana@example.invalid'}});
+  const short=subtask.id.replace(/-/g,'').slice(0,8);
+  fs.writeFileSync(path.join(B.work,'movil.txt'),'probado\n');git(B.work,'add','movil.txt');
+  git(B.work,'commit','-q','-m',`test: prueba en móvil\n\nmixto:${short}`);git(B.work,'push','-q','origin','main');
+  // Manuel sincroniza: el encargo se da por hecho solo, y su tarea local lo refleja.
+  const synced=await A.call('cooperation/sync',{projectId:A.project.id});
+  assert.deepEqual(synced.autoDone,[subtask.id]);
+  stateA=await A.call('state');run=runOf(stateA);projectA=stateA.projects.find(p=>p.id===A.project.id);
+  assert.equal(projectA.assignments[0].status,'hecha');
+  assert.match(projectA.assignments[0].notes.at(-1),/hecho en el commit [0-9a-f]{7} de Ana: test: prueba en móvil/);
+  assert.equal(run.subtasks[0].status,'hecha');
+  assert.equal(run.stage,'Completado');
+  assert.match(stateA.memories.find(m=>m.automatic&&m.conversationId===conversation.id).content,/hecho en el commit/);
+  // El Mixto de Ana abre el mismo repositorio: importa el equipo, se reconoce por su correo y ve el encargo.
+  await B.call('cooperation',{projectId:B.project.id,enabled:true});
+  let stateB=await B.until(s=>s.projects.find(p=>p.id===B.project.id).cooperation.identity?.personId===ana.id);
+  let projectB=stateB.projects.find(p=>p.id===B.project.id);
+  assert.ok(stateB.people.some(p=>p.id===ana.id&&p.name==='Ana'),'la persona llegó con el mismo identificador');
+  assert.deepEqual(projectB.members,[ana.id]);
+  assert.equal(projectB.assignments.length,1);
+  assert.equal(projectB.assignments[0].status,'hecha');
+  // Ana reabre el encargo con una nota desde su Mixto; Manuel lo recibe.
+  await B.call('assignments/'+subtask.id,{projectId:B.project.id,status:'en-curso',note:'Falta el scroll en Android'},'PATCH');
+  stateB=await B.until(s=>s.projects.find(p=>p.id===B.project.id).cooperation.lastPublish?.pushed===true&&s.projects.find(p=>p.id===B.project.id).assignments[0].status==='en-curso');
+  await A.call('cooperation/sync',{projectId:A.project.id});
+  stateA=await A.call('state');run=runOf(stateA);projectA=stateA.projects.find(p=>p.id===A.project.id);
+  assert.equal(projectA.assignments[0].status,'en-curso');
+  assert.ok(projectA.assignments[0].notes.some(n=>/Ana: Falta el scroll en Android/.test(n)),JSON.stringify(projectA.assignments[0].notes));
+  assert.equal(run.subtasks[0].status,'en-curso');
+  assert.equal(run.stage,'Pendiente de 1 persona');
+  // Un encargo suelto creado por Manuel aparece en el Mixto de Ana, y el arquitecto de Manuel sabe cuántos tiene pendientes.
+  await A.call('assignments',{projectId:A.project.id,personId:ana.id,title:'Revisar textos',instructions:'Repasa los textos de la pantalla de pago.',due:'2026-10-01'});
+  stateA=await A.until(s=>s.projects.find(p=>p.id===A.project.id).assignments.length===2&&s.projects.find(p=>p.id===A.project.id).cooperation.lastPublish?.pushed===true);
+  await B.call('cooperation/sync',{projectId:B.project.id});
+  stateB=await B.call('state');projectB=stateB.projects.find(p=>p.id===B.project.id);
+  assert.equal(projectB.assignments.length,2);
+  assert.ok(projectB.assignments.some(a=>a.title==='Revisar textos'&&a.due==='2026-10-01'&&a.origin===''));
+  assert.equal(git(A.work,'status','--porcelain').trim(),'');
+  assert.equal(git(B.work,'status','--porcelain').trim(),'');
+  await assert.rejects(A.call('cooperation/sync',{projectId:(await A.call('projects',{name:'Suelto',directoryName:'suelto',description:''})).id}),/no está activada/);
 });
