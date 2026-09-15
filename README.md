@@ -2,9 +2,19 @@
 
 App local para Windows que reúne **Claude Code y Codex** con proyectos, conversaciones y memoria compartida. Usa las sesiones de las herramientas oficiales instaladas; no guarda ni extrae sus contraseñas o tokens.
 
+## Descargar e instalar
+
+1. Descarga Mixto: **[mixto-main.zip](https://github.com/manuelfdezo/mixto/archive/refs/heads/main.zip)**.
+2. Descomprime la carpeta donde quieras tenerla, por ejemplo en `C:\Mixto`.
+3. Haz doble clic en **Abrir-Mixto.cmd**. La primera vez comprueba qué falta en tu ordenador e instala lo necesario tras preguntarte: Node.js 24 y Git quedan dentro de la carpeta de Mixto, en `.runtime`, sin tocar el resto del sistema; Codex y Claude Code se instalan con npm. Después te ofrece iniciar sesión en los dos agentes, que abren tu navegador, y crear un acceso directo **Mixto** en el escritorio.
+
+Si Windows muestra «Windows protegió tu PC» al abrir el archivo por primera vez, pulsa **Más información → Ejecutar de todas formas**: es la marca que llevan los archivos descargados de internet. No hace falta instalar nada a mano; si ya tienes Node.js 22 o posterior, Git, Codex o Claude Code, se usan tal cual.
+
+Para actualizar, descarga el zip de nuevo y sustituye los archivos, o usa `git pull` si clonaste el repositorio. Tus datos viven en `data` y `.runtime`, que no se tocan.
+
 ## Abrir
 
-Haz doble clic en **Abrir-Mixto.cmd**. La interfaz se abre en tu navegador, en `http://127.0.0.1:4317`. Necesita Node.js 24 o posterior, Claude Code y Codex instalados y con sesión iniciada. No hay paquetes adicionales que instalar.
+Haz doble clic en **Abrir-Mixto.cmd** o en el acceso directo del escritorio. La interfaz se abre en tu navegador, en `http://127.0.0.1:4317`. Necesita Claude Code y Codex con sesión iniciada: **Terminal-Mixto.cmd** abre una consola con las herramientas ya en el PATH para `codex login` y `claude auth login`, aunque no estén instaladas en el sistema.
 
 También puedes ejecutar `npm start` desde esta carpeta. Cierra esa terminal para detener ese servidor. Si lo abriste con el acceso de doble clic, el servidor queda en segundo plano. Haz doble clic en **Cerrar-Mixto.cmd** para detenerlo y conservar los datos.
 

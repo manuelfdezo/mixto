@@ -1315,12 +1315,13 @@ const server=http.createServer(async(req,res)=>{
       return json(res,404,{error:'Acción no encontrada.'});
     }
     if(req.method!=='GET')return json(res,405,{error:'Método no permitido.'});
-    const files={'/':'index.html','/app.js':'app.js','/style.css':'style.css','/favicon.svg':'favicon.svg'};
+    const files={'/':'index.html','/app.js':'app.js','/style.css':'style.css','/favicon.svg':'favicon.svg','/favicon.ico':'mixto.ico'};
     if(!files[route])return json(res,404,{error:'Página no encontrada.'});
     if(route==='/')res.setHeader('Set-Cookie',`mixto_session=${secret}; HttpOnly; SameSite=Strict; Path=/`);
     const file=path.join(root,'dist',files[route]);
-    const mime={'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml'};
-    res.writeHead(200,{'Content-Type':mime[path.extname(file)]+'; charset=utf-8','Cache-Control':'no-cache'});res.end(fs.readFileSync(file));
+    const mime={'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.ico':'image/x-icon'};
+    const binary=path.extname(file)==='.ico';
+    res.writeHead(200,{'Content-Type':mime[path.extname(file)]+(binary?'':'; charset=utf-8'),'Cache-Control':'no-cache'});res.end(fs.readFileSync(file));
   }catch(e){json(res,400,{error:e.code==='ENOENT'?'No se encontró la carpeta. Comprueba la ruta.':e.message});}
 });
 
