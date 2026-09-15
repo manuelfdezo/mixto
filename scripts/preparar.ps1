@@ -1,9 +1,11 @@
 ﻿# Prepara este ordenador para Mixto y lo abre. Lo llama Abrir-Mixto.cmd.
-# Con -Cerrar detiene el servidor; con -Terminal deja abierta una consola con las herramientas en el PATH.
+# Con -Cerrar detiene el servidor; con -Terminal deja abierta una consola con las herramientas en el PATH;
+# con -Actualizar descarga la última versión publicada y sustituye los archivos de Mixto antes de abrirlo.
 # Todo lo que descarga queda dentro de la carpeta de Mixto, en .runtime: no toca el resto del sistema.
 param(
   [switch]$Cerrar,
-  [switch]$Terminal
+  [switch]$Terminal,
+  [switch]$Actualizar
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -141,6 +143,40 @@ function Add-NpmPrefixToPath($node) {
     if ($prefix) { Add-ToPath $prefix.Trim() }
   } catch {}
 }
+function Update-Mixto {
+  # La versión publicada en GitHub sustituye los archivos de Mixto; data y .runtime no se tocan y lo anterior queda en .runtime\backup.
+  $zipUrl = 'https://github.com/manuelfdezo/mixto/archive/refs/heads/main.zip'
+  if ($env:MIXTO_UPDATE_ZIP) { $zipUrl = $env:MIXTO_UPDATE_ZIP }
+  $zip = Join-Path $env:TEMP 'mixto-main.zip'
+  Get-Download $zipUrl $zip
+  $tmp = Join-Path $env:TEMP ('mixto-update-' + [guid]::NewGuid().ToString())
+  Expand-Archive -Path $zip -DestinationPath $tmp -Force
+  $inner = Get-ChildItem -Path $tmp -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'server.mjs') } | Select-Object -First 1
+  if (-not $inner) { throw 'La descarga no contiene Mixto.' }
+  $source = $inner.FullName
+  $backup = Join-Path $runtime ('backup\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+  $copied = 0
+  Get-ChildItem -Path $source -Recurse -File | ForEach-Object {
+    $rel = $_.FullName.Substring($source.Length + 1)
+    $top = ($rel -split '[\\/]')[0]
+    if (@('data', '.runtime', 'node_modules', '.git') -contains $top) { return }
+    $dest = Join-Path $root $rel
+    if (Test-Path $dest) {
+      $same = (Get-FileHash -Algorithm SHA256 -Path $dest).Hash -eq (Get-FileHash -Algorithm SHA256 -Path $_.FullName).Hash
+      if ($same) { return }
+      $keep = Join-Path $backup $rel
+      New-Item -ItemType Directory -Path (Split-Path -Parent $keep) -Force | Out-Null
+      Copy-Item -Path $dest -Destination $keep -Force
+    }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force | Out-Null
+    Copy-Item -Path $_.FullName -Destination $dest -Force
+    $script:copied = $script:copied + 1
+  }
+  Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item $zip -Force -ErrorAction SilentlyContinue
+  $version = (Get-Content -Path (Join-Path $root 'package.json') -Raw | ConvertFrom-Json).version
+  Say ("Mixto " + $version + " instalado (" + $script:copied + " archivos cambiados).")
+}
 function New-DesktopShortcut {
   $desktop = [Environment]::GetFolderPath('Desktop')
   $shell = New-Object -ComObject WScript.Shell
@@ -166,6 +202,11 @@ if ($Cerrar) {
     Say ('Mixto no está abierto o no se pudo cerrar: ' + $_.Exception.Message)
   }
   exit 0
+}
+
+if ($Actualizar) {
+  Say 'Descargando la última versión de Mixto...'
+  Update-Mixto
 }
 
 $node = Find-Node

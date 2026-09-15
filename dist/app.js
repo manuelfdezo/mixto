@@ -351,6 +351,7 @@ function render(){
   if(pending?.files)$('#commit-button').textContent=`Confirmar cambios (${pending.files})`;
   $('#notify-toggle').classList.toggle('on',notifyEnabled);$('#terminal-toggle').classList.toggle('on',terminalOpen);
   $('#update-count').hidden=!state.update?.available;
+  $('#github-state').hidden=!state.github?.connected;
   if(state.update?.available&&!updateNoticed){updateNoticed=true;toast(`Hay una versión nueva de Mixto (${state.update.latest}). Actualiza desde Agentes y ajustes.`);}
   renderTerminal();checkNotifications();
   updateOrchestrator();remember();
@@ -565,9 +566,8 @@ $('#new-project').onclick=()=>{
   const managed=state.app.projectsRoot;
   if(!managed.available){openModal('Carpeta de proyectos no disponible',`<p class="modal-note">Crea esta carpeta fuera del repositorio de Mixto y vuelve a abrir la aplicación:</p><p><code>${esc(managed.path)}</code></p><p class="modal-note">Mixto detectará automáticamente cada carpeta de proyecto que haya dentro.</p>`);return;}
   const gh=state.github?.connected;
-  openModal(gh?'Añadir proyecto':'Crear proyecto',`${gh?`<section id="github-picker"><p class="modal-note">Repositorios de <strong>${esc(state.github.login)}</strong> en GitHub. Al clonar, la carpeta se crea dentro de ${esc(managed.path)}.</p><div class="terminal-form"><input id="repo-search" placeholder="Buscar por nombre o descripción" autocomplete="off"><button type="button" class="secondary-button" id="repo-refresh">Actualizar lista</button></div><div id="repo-picker"></div><form id="repo-url-form" class="terminal-form"><input name="url" placeholder="O pega la URL de un repositorio: https://github.com/owner/nombre" autocomplete="off"><button class="secondary-button">Clonar</button></form></section><details class="diff-file"><summary>O crea una carpeta vacía</summary>`:'<p class="modal-note">Conecta GitHub en Agentes y ajustes para clonar tus repositorios desde aquí.</p>'}<form id="project-form"><label class="form-field"><span>Nombre</span><input name="name" required maxlength="80" placeholder="Paper shop POS" autofocus></label><label class="form-field"><span>Nombre de carpeta</span><input name="directoryName" required maxlength="80" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="tpv-papeleria"><small>Se creará dentro de ${esc(managed.path)}. Las carpetas que ya existan ahí se detectan automáticamente.</small></label><label class="form-field"><span>Descripción (opcional)</span><textarea name="description" rows="2" maxlength="2000"></textarea></label><div class="form-footer"><button class="primary-button">Crear proyecto</button></div></form>${gh?'</details>':''}`);
-  if(gh){renderRepoPicker();$('#repo-refresh').onclick=()=>renderRepoPicker(true);
-    $('#repo-url-form').onsubmit=async e=>{e.preventDefault();const b=e.target.querySelector('button');b.disabled=true;b.textContent='Clonando…';try{const p=await api('github/clone',{url:e.target.elements.url.value});projectId=p.id;conversationId=null;lastMessages='';closeModal();await load();toast(`${p.name} clonado y listo.`);}catch(error){toast(error.message);b.disabled=false;b.textContent='Clonar';}};}
+  openModal(gh?'Añadir proyecto':'Crear proyecto',`${gh?`${repoPickerHtml()}<details class="diff-file"><summary>O crea una carpeta vacía</summary>`:'<p class="modal-note">Conecta tu cuenta con el botón GitHub de la barra lateral para clonar tus repositorios desde aquí.</p>'}<form id="project-form"><label class="form-field"><span>Nombre</span><input name="name" required maxlength="80" placeholder="Paper shop POS" autofocus></label><label class="form-field"><span>Nombre de carpeta</span><input name="directoryName" required maxlength="80" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="tpv-papeleria"><small>Se creará dentro de ${esc(managed.path)}. Las carpetas que ya existan ahí se detectan automáticamente.</small></label><label class="form-field"><span>Descripción (opcional)</span><textarea name="description" rows="2" maxlength="2000"></textarea></label><div class="form-footer"><button class="primary-button">Crear proyecto</button></div></form>${gh?'</details>':''}`);
+  if(gh)bindRepoPicker();
   $('#project-form').onsubmit=async e=>{e.preventDefault();try{const p=await api('projects',Object.fromEntries(new FormData(e.target)));projectId=p.id;conversationId=null;closeModal();await load();toast('Proyecto añadido.');}catch(error){toast(error.message);}};
 };
 
@@ -709,19 +709,35 @@ function teamModal(){
 }
 $('#open-team').onclick=teamModal;
 // GitHub: un token de acceso guardado en local para listar y clonar tus repositorios y para que git no pida credenciales.
-function githubSectionHtml(){
+function githubSectionHtml({picker=false}={}){
   const g=state.github||{};
-  if(g.connected)return `<section class="connection-card" id="github-section"><h3>GitHub</h3><p>Conectado como <strong>${esc(g.login)}</strong>${g.name?' · '+esc(g.name):''}. Git ya puede traer y enviar cambios de tus repositorios, también desde los agentes y el terminal.</p><div class="approval-actions"><button type="button" class="primary-button" id="github-add">Añadir un repositorio</button><button type="button" class="secondary-button" id="github-disconnect">Desconectar</button></div></section>`;
+  if(g.connected)return `<section class="connection-card" id="github-section"><h3>GitHub</h3><p>Conectado como <strong>${esc(g.login)}</strong>${g.name?' · '+esc(g.name):''}. Git ya puede traer y enviar cambios de tus repositorios, también desde los agentes y el terminal.</p><div class="approval-actions">${picker?'':'<button type="button" class="primary-button" id="github-add">Añadir un repositorio</button>'}<button type="button" class="secondary-button" id="github-disconnect">Desconectar</button></div></section>`;
   return `<section class="connection-card" id="github-section"><h3>GitHub</h3><p>Conecta tu cuenta con un token de acceso personal para clonar tus repositorios en la carpeta de proyectos y trabajar sobre ellos.</p><form id="github-form" class="terminal-form"><input name="token" placeholder="github_pat_… o ghp_…" autocomplete="off" spellcheck="false" required><button class="primary-button">Conectar</button></form><small>Crea el token en <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>: elige los repositorios a los que quieras acceder y dale permiso de <em>Contents: Read and write</em> (o un token clásico con el ámbito <em>repo</em>). Se guarda solo en este ordenador, en la carpeta data.</small></section>`;
 }
-function bindGithubSection(){
+function bindGithubSection(refresh=connectionsModal){
   const form=$('#github-form');
-  if(form)form.onsubmit=async e=>{e.preventDefault();const b=form.querySelector('button');b.disabled=true;b.textContent='Conectando…';try{const g=await api('github/connect',{token:form.elements.token.value.trim()});state.github=g;toast(`GitHub conectado como ${g.login}.`);lastAgents='';connectionsModal();}catch(error){toast(error.message);b.disabled=false;b.textContent='Conectar';}};
+  if(form)form.onsubmit=async e=>{e.preventDefault();const b=form.querySelector('button');b.disabled=true;b.textContent='Conectando…';try{const g=await api('github/connect',{token:form.elements.token.value.trim()});state.github=g;toast(`GitHub conectado como ${g.login}.`);lastAgents='';render();refresh();}catch(error){toast(error.message);b.disabled=false;b.textContent='Conectar';}};
   const off=$('#github-disconnect');
-  if(off)off.onclick=async()=>{try{state.github=await api('github/disconnect',{});toast('GitHub desconectado; el token se ha borrado.');lastAgents='';connectionsModal();}catch(error){toast(error.message);}};
+  if(off)off.onclick=async()=>{try{state.github=await api('github/disconnect',{});toast('GitHub desconectado; el token se ha borrado.');lastAgents='';render();refresh();}catch(error){toast(error.message);}};
   const add=$('#github-add');
-  if(add)add.onclick=()=>{closeModal();$('#new-project').click();};
+  if(add)add.onclick=()=>{closeModal();githubModal();};
 }
+// El selector de repositorios como bloque reutilizable: en el modal de GitHub y al añadir un proyecto.
+function repoPickerHtml(){
+  return `<section id="github-picker"><p class="modal-note">Repositorios de <strong>${esc(state.github?.login||'')}</strong> en GitHub. Al clonar, la carpeta se crea dentro de ${esc(state.app.projectsRoot.path)}.</p><div class="terminal-form"><input id="repo-search" placeholder="Buscar por nombre o descripción" autocomplete="off"><button type="button" class="secondary-button" id="repo-refresh">Actualizar lista</button></div><div id="repo-picker"></div><form id="repo-url-form" class="terminal-form"><input name="url" placeholder="O pega la URL de un repositorio: https://github.com/owner/nombre" autocomplete="off"><button class="secondary-button">Clonar</button></form></section>`;
+}
+function bindRepoPicker(){
+  renderRepoPicker();$('#repo-refresh').onclick=()=>renderRepoPicker(true);
+  $('#repo-url-form').onsubmit=async e=>{e.preventDefault();const b=e.target.querySelector('button');b.disabled=true;b.textContent='Clonando…';try{const p=await api('github/clone',{url:e.target.elements.url.value});projectId=p.id;conversationId=null;lastMessages='';closeModal();await load();toast(`${p.name} clonado y listo.`);}catch(error){toast(error.message);b.disabled=false;b.textContent='Clonar';}};
+}
+// El botón GitHub de la barra lateral: conectar, ver los repositorios y clonarlos, todo en un sitio.
+function githubModal(){
+  const connected=!!state.github?.connected;
+  openModal('GitHub',`${githubSectionHtml({picker:connected})}${connected?repoPickerHtml():''}`,'github');
+  bindGithubSection(githubModal);
+  if(connected)bindRepoPicker();
+}
+$('#open-github').onclick=githubModal;
 // El selector de repositorios: búsqueda, estado (ya clonado) y clonado con un clic en la carpeta de proyectos.
 async function renderRepoPicker(refresh=false){
   const box=$('#repo-picker');if(!box)return;

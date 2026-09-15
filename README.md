@@ -12,6 +12,8 @@ Si Windows muestra «Windows protegió tu PC» al abrir el archivo por primera v
 
 Para actualizar no hace falta descargar nada a mano: en **Agentes y ajustes → Aplicación** verás la versión instalada y, cuando haya una nueva, el botón **Actualizar**. Mixto comprueba la versión publicada en GitHub al arrancar y cada seis horas, y avisa con una marca en el botón de ajustes. Actualizar descarga el zip de la rama principal, sustituye los archivos de Mixto, guarda una copia de los anteriores en `.runtime/backup` y reinicia el servidor. Tus datos viven en `data` y `.runtime`, que nunca se tocan. Ahí mismo está **Descargar Mixto (zip)** para instalarlo en otro ordenador. Si clonaste el repositorio, `git pull` sigue funcionando igual.
 
+Si tu instalación es anterior a este botón, o algo impide actualizar desde la app, haz doble clic en **Actualizar-Mixto.cmd**: descarga la última versión, sustituye los archivos y abre Mixto. Abrir Mixto con archivos más nuevos que el servidor que sigue abierto también lo reinicia solo.
+
 Para publicar una versión nueva basta con subir el número de `version` en `package.json` y empujar a `main`: todas las instalaciones la verán en su siguiente comprobación.
 
 ## Abrir
@@ -57,9 +59,9 @@ Lo que hace falta para que Mixto sea el sitio donde trabajas, no solo donde lanz
 
 ### GitHub
 
-En **Agentes y ajustes → GitHub** pegas un token de acceso personal y Mixto queda conectado a tu cuenta. Crea el token en [github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new), elige los repositorios a los que quieras acceder y dale permiso de *Contents: Read and write* (o usa un token clásico con el ámbito `repo`). Se guarda solo en tu ordenador, en la carpeta `data`, y nunca llega al navegador; **Desconectar** lo borra.
+Con el botón **GitHub** de la barra lateral (también en **Agentes y ajustes → GitHub**) pegas un token de acceso personal y Mixto queda conectado a tu cuenta. Crea el token en [github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new), elige los repositorios a los que quieras acceder y dale permiso de *Contents: Read and write* (o usa un token clásico con el ámbito `repo`). Se guarda solo en tu ordenador, en la carpeta `data`, y nunca llega al navegador; **Desconectar** lo borra.
 
-Con la cuenta conectada, el botón **+** de proyectos muestra tus repositorios: buscas, pulsas **Clonar** y el repositorio se clona en tu carpeta de proyectos, ya listo para trabajar; también puedes pegar la URL de cualquier repositorio de GitHub. Junto a **Confirmar cambios** aparece **Traer cambios**, que hace `git pull --ff-only`, y **Confirmar y enviar** empuja con tu cuenta. La autorización se la da Mixto a git por variables de entorno, con el mismo mecanismo que usa GitHub Actions, así que también la heredan los agentes y el terminal del proyecto: pueden traer y enviar cambios sin que git pida credenciales. Los remotos por SSH siguen usando tus claves de siempre.
+Con la cuenta conectada, ese mismo botón y el **+** de proyectos muestran tus repositorios: buscas, pulsas **Clonar** y el repositorio se clona en tu carpeta de proyectos, ya listo para trabajar; también puedes pegar la URL de cualquier repositorio de GitHub. Junto a **Confirmar cambios** aparece **Traer cambios**, que hace `git pull --ff-only`, y **Confirmar y enviar** empuja con tu cuenta. La autorización se la da Mixto a git por variables de entorno, con el mismo mecanismo que usa GitHub Actions, así que también la heredan los agentes y el terminal del proyecto: pueden traer y enviar cambios sin que git pida credenciales. Los remotos por SSH siguen usando tus claves de siempre.
 
 ### Equipo: personas reales
 
