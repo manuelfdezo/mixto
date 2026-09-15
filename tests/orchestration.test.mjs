@@ -4,6 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {spawn,execFileSync} from 'node:child_process';
+import http from 'node:http';
+import {buildZip} from '../lib/zip.mjs';
+import {listFiles} from '../lib/update.mjs';
 import {fileURLToPath} from 'node:url';
 
 const here=path.dirname(fileURLToPath(import.meta.url));
@@ -13,7 +16,7 @@ const git=(cwd,...args)=>execFileSync('git',['-C',cwd,...args],{windowsHide:true
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
 const GIT_ENV={...process.env,GIT_TERMINAL_PROMPT:'0'};
-async function boot(t,{delay=600,scenario,remote=false,cloneOf=null,identity={name:'Mixto Test',email:'test@example.invalid'}}={}) {
+async function boot(t,{delay=600,scenario,remote=false,cloneOf=null,identity={name:'Mixto Test',email:'test@example.invalid'},appRoot=root,env={}}={}) {
   const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'mixto-orq-')));
   const projectsRoot=path.join(dir,'projects');fs.mkdirSync(projectsRoot);
   const work=path.join(projectsRoot,'proyecto');
@@ -29,15 +32,15 @@ async function boot(t,{delay=600,scenario,remote=false,cloneOf=null,identity={na
     if(remote){bare=path.join(dir,'remote.git');execFileSync('git',['init','--bare','-b','main',bare],{env:GIT_ENV});git(work,'remote','add','origin',bare);git(work,'push','-q','-u','origin','main');}
   }
   const port=20000+Math.floor(Math.random()*20000);
-  const child=spawn(process.execPath,['server.mjs'],{cwd:root,windowsHide:true,stdio:['ignore','pipe','pipe'],
-    env:{...process.env,MIXTO_PORT:String(port),MIXTO_DATA_DIR:path.join(dir,'datos'),
+  const child=spawn(process.execPath,['server.mjs'],{cwd:appRoot,windowsHide:true,stdio:['ignore','pipe','pipe'],
+    env:{...process.env,MIXTO_UPDATE_CHECK:'off',MIXTO_PORT:String(port),MIXTO_DATA_DIR:path.join(dir,'datos'),
       MIXTO_PROJECTS_ROOT:projectsRoot,
       ENGRAM_DATA_DIR:path.join(dir,'engram'),FAKE_AGENT_DELAY:String(delay),MIXTO_MAX_PARALLEL:'3',
       ...(scenario?{FAKE_AGENT_SCENARIO:scenario}:{}),
       // Esta prueba es del motor de orquestación: no debe tocar la memoria compartida real.
       MIXTO_ENGRAM_PATH:path.join(dir,'sin-engram.exe'),
       MIXTO_CODEX_PATH:JSON.stringify([process.execPath,agent,'codex']),
-      MIXTO_CLAUDE_PATH:JSON.stringify([process.execPath,agent,'claude'])}});
+      MIXTO_CLAUDE_PATH:JSON.stringify([process.execPath,agent,'claude']),...env}});
   let log='';
   child.stdout.on('data',d=>{log+=d;});child.stderr.on('data',d=>{log+=d;});
   t.after(async()=>{
@@ -54,6 +57,8 @@ async function boot(t,{delay=600,scenario,remote=false,cloneOf=null,identity={na
     } catch {await wait(150);}
   }
   assert.ok(cookie,'el servidor local no arrancó: '+log);
+  // Un servidor reiniciado estrena secreto: la cookie se renueva como haría el navegador al recargar.
+  const refreshCookie=async()=>{const page=await fetch(origin+'/');cookie=(page.headers.get('set-cookie')||'').split(';')[0];};
   const call=async(route,body,method=body===undefined?'GET':'POST')=>{
     const response=await fetch(`${origin}/api/${route}`,{method,
       headers:{cookie,...(body===undefined?{}:{'Content-Type':'application/json','X-Mixto-Client':'1'})},
@@ -72,7 +77,7 @@ async function boot(t,{delay=600,scenario,remote=false,cloneOf=null,identity={na
   assert.ok(state.connections.claude.connected,'el agente falso no se reportó conectado: '+log);
   // Nunca usar el proyecto por defecto: apunta a la carpeta de Mixto, no a esta copia de prueba.
   const project=await call('projects',{name:'Proyecto de prueba',path:work,description:''});
-  return {call,work,dir,project,origin,cookie,bare,log:()=>log,
+  return {call,refreshCookie,work,dir,project,origin,cookie,bare,log:()=>log,
     until:async predicate=>{
       for(let attempt=0;attempt<200;attempt++) {
         const current=await call('state');
@@ -841,4 +846,48 @@ test('el arquitecto reanuda su sesión en la misma conversación',async t=>{
   assert.equal((await call('state')).conversations.find(c=>c.id===conversation.id).sessions['architect:claude'],'native-claude');
   const second=await ask(2);
   assert.match(second.events.map(e=>e.text).join('\n'),/reanuda su sesión/);
+});
+
+test('actualización desde la app: comprueba la versión publicada, descarga, sustituye archivos y se reinicia',async t=>{
+  // Una instalación aparte, copia de los archivos de trabajo del repositorio, para no tocar los reales.
+  const install=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'mixto-install-')));
+  for(const rel of listFiles(root)){fs.mkdirSync(path.dirname(path.join(install,rel)),{recursive:true});fs.copyFileSync(path.join(root,rel),path.join(install,rel));}
+  const current=JSON.parse(fs.readFileSync(path.join(root,'package.json'),'utf8')).version;
+  // La «versión nueva»: la misma instalación con package.json 9.9.9 y un archivo más, envuelta como hace GitHub.
+  const files=listFiles(install).map(rel=>({name:'mixto-main/'+rel,data:rel==='package.json'?Buffer.from(fs.readFileSync(path.join(install,rel),'utf8').replace(current,'9.9.9')):fs.readFileSync(path.join(install,rel))}));
+  const zip=buildZip([{name:'mixto-main',dir:true},...files,{name:'mixto-main/NUEVO.txt',data:Buffer.from('nuevo\n')}]);
+  const github=http.createServer((req,res)=>{
+    if(req.url==='/package.json'){res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({name:'mixto',version:'9.9.9'}));}
+    else if(req.url==='/mixto.zip'){res.writeHead(200,{'Content-Type':'application/zip'});res.end(zip);}
+    else{res.writeHead(404);res.end();}
+  });
+  await new Promise(resolve=>github.listen(0,'127.0.0.1',resolve));
+  const base=`http://127.0.0.1:${github.address().port}/`;
+  t.after(()=>{github.close();try{fs.rmSync(install,{recursive:true,force:true});}catch{}});
+  const {call,refreshCookie,project,until,origin}=await boot(t,{delay:50,appRoot:install,env:{MIXTO_UPDATE_CHECK:'on',MIXTO_UPDATE_BASE:base,MIXTO_UPDATE_ZIP:base+'mixto.zip'}});
+  let state=await call('state');
+  assert.equal(state.app.version,current,'la versión sale de package.json');
+  assert.equal(state.update.current,current);
+  assert.equal(state.update.downloadUrl,base+'mixto.zip');
+  const check=await call('update/check',{});
+  assert.equal(check.latest,'9.9.9');assert.equal(check.available,true);assert.equal(check.error,null);
+  state=await until(s=>s.update.available===true);
+  const applied=await call('update/apply',{});
+  assert.equal(applied.version,'9.9.9');
+  assert.ok(applied.copied>=2,'package.json y el archivo nuevo, al menos');
+  assert.equal(fs.readFileSync(path.join(install,'NUEVO.txt'),'utf8'),'nuevo\n');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(install,'package.json'),'utf8')).version,'9.9.9');
+  assert.equal(fs.readFileSync(path.join(install,'.runtime','backup',current,'package.json'),'utf8').includes(current),true,'copia de lo sustituido');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(install,'.runtime','instalado.json'),'utf8')).version,'9.9.9');
+  assert.equal(fs.readdirSync(path.join(install,'.runtime','updates')).length,0,'la descarga extraída se limpia');
+  // El servidor se reinicia solo, en el mismo puerto, ya con la versión nueva y los mismos datos.
+  let health=null;
+  for(let attempt=0;attempt<150&&health?.version!=='9.9.9';attempt++){await wait(200);try{health=await (await fetch(origin+'/api/health')).json();}catch{}}
+  assert.equal(health?.version,'9.9.9','el servidor nuevo responde');
+  await assert.rejects(call('state'),/Recarga Mixto/,'la cookie anterior ya no vale: el navegador recarga');
+  await refreshCookie();
+  const after=await call('state');
+  assert.ok(after.projects.find(p=>p.id===project.id),'los datos siguen ahí');
+  assert.equal(after.update.current,'9.9.9');
+  await call('shutdown',{});
 });

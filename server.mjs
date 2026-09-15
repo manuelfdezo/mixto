@@ -14,9 +14,10 @@ import {createManagedProject,managedProjectPath,projectsRoot,syncDiscoveredProje
 import {listPersonas,personaBody} from './lib/personas.mjs';
 import {Watcher} from './lib/supervisor.mjs';
 import {openLedger,syncLedger,publishLedger,writeLedger,gitIdentity,STATUSES as LEDGER_STATUSES} from './lib/team.mjs';
+import {updateSources,checkUpdate,downloadUpdate,applyUpdate,compareVersions} from './lib/update.mjs';
 
-const VERSION='1.2.0';
 const root=path.dirname(fileURLToPath(import.meta.url));
+const VERSION=(()=>{try{return JSON.parse(fs.readFileSync(path.join(root,'package.json'),'utf8')).version||'0.0.0';}catch{return '0.0.0';}})();
 const dataDir=path.resolve(process.env.MIXTO_DATA_DIR||path.join(root,'data'));
 const managedProjectsRoot=projectsRoot(root);
 const port=Number(process.env.MIXTO_PORT||4317);
@@ -27,9 +28,11 @@ const lockFile=path.join(dataDir,'server.lock');
 try{
   if(fs.existsSync(lockFile)){
     const old=Number(fs.readFileSync(lockFile,'utf8'));
-    let alive=false;try{process.kill(old,0);alive=true;}catch{}
-    if(alive)throw new Error('Mixto ya está abierto. Abre http://127.0.0.1:4317');
-    fs.unlinkSync(lockFile);
+    const alive=()=>{try{process.kill(old,0);return true;}catch{return false;}};
+    // Tras una actualización el servidor anterior aún se está retirando: se le dan hasta veinte segundos.
+    if(process.env.MIXTO_RESTART==='1'){const deadline=Date.now()+20000;while(alive()&&Date.now()<deadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,100);}
+    if(alive())throw new Error(`Mixto ya está abierto. Abre ${origin}`);
+    try{fs.unlinkSync(lockFile);}catch{} // el proceso anterior puede haberlo borrado justo al salir
   }
   fs.writeFileSync(lockFile,String(process.pid),{flag:'wx'});
 }catch(e){console.error(e.message);process.exit(1);}
@@ -387,8 +390,35 @@ function snapshot(){
   const {engram,...data}=store.data;
   return {...data,memories:sharedMemories(store.data),memorySync:memoryBridge.status,connections,personas:listPersonas(),
     approvals:[...approvals.values()].map(a=>a.public),execs:Object.fromEntries([...execs].map(([projectId,record])=>[projectId,execView(record)])),
-    changes:Object.fromEntries(changesCache),app:{version:VERSION,workspace:root,
+    changes:Object.fromEntries(changesCache),update,app:{version:VERSION,workspace:root,
       projectsRoot:{path:managed.root,available:managed.available}}};
+}
+// Actualización desde la app: la versión publicada en GitHub, comprobada al arrancar y cada seis horas.
+const updateFrom=updateSources();
+let update={current:VERSION,latest:null,available:false,checkedAt:null,error:null,applying:false,applied:null,downloadUrl:updateFrom.zipUrl,pageUrl:updateFrom.pageUrl};
+async function checkUpdates(){
+  if(!updateFrom.enabled)return update;
+  try{update={...update,...await checkUpdate({current:VERSION,sources:updateFrom}),checkedAt:now(),error:null};}
+  catch(error){update={...update,checkedAt:now(),error:error.message};}
+  touch();return update;
+}
+async function applyUpdateNow(){
+  if(active.size)throw new Error('Espera a que terminen las tareas activas antes de actualizar.');
+  if(update.applying)throw new Error('Ya hay una actualización en marcha.');
+  update={...update,applying:true};touch();
+  let downloaded=null;
+  try{
+    if(!update.available){await checkUpdates();if(!update.available)throw new Error(update.error||'No hay ninguna versión nueva.');}
+    const runtime=path.join(root,'.runtime');fs.mkdirSync(runtime,{recursive:true});
+    downloaded=await downloadUpdate({sources:updateFrom,into:path.join(runtime,'updates')});
+    const version=JSON.parse(fs.readFileSync(path.join(downloaded.sourceDir,'package.json'),'utf8')).version;
+    if(compareVersions(version,VERSION)<=0)throw new Error(`La descarga es la versión ${version}, no más nueva que la ${VERSION}.`);
+    const result=applyUpdate({root,sourceDir:downloaded.sourceDir,manifestFile:path.join(runtime,'instalado.json'),backupDir:path.join(runtime,'backup',VERSION)});
+    update={...update,applying:false,applied:result.version};touch();
+    setTimeout(restart,400);
+    return {ok:true,...result};
+  }catch(error){update={...update,applying:false};touch();throw error;}
+  finally{if(downloaded)try{fs.rmSync(downloaded.dir,{recursive:true,force:true});}catch{}}
 }
 function message(conversationId,role,content,extra={}){const m={id:id(),conversationId,role,content,createdAt:now(),...extra};store.data.messages.push(m);return m;}
 
@@ -1144,6 +1174,8 @@ const server=http.createServer(async(req,res)=>{
         flush();return json(res,200,{ok:true});
       }
       if(route==='/api/shutdown'&&req.method==='POST'){json(res,200,{ok:true});stop();return;}
+      if(route==='/api/update/check'&&req.method==='POST')return json(res,200,await checkUpdates());
+      if(route==='/api/update/apply'&&req.method==='POST')return json(res,200,await applyUpdateNow());
       if(route==='/api/run'&&req.method==='POST')return json(res,202,startRun(b));
       if(route==='/api/fix'&&req.method==='POST')return json(res,202,startFix(b));
       if(route==='/api/review'&&req.method==='POST')return json(res,202,startReview(b));
@@ -1325,7 +1357,12 @@ const server=http.createServer(async(req,res)=>{
   }catch(e){json(res,400,{error:e.code==='ENOENT'?'No se encontró la carpeta. Comprueba la ruta.':e.message});}
 });
 
-server.on('error',e=>{console.error(e.code==='EADDRINUSE'?`El puerto ${port} ya está ocupado.`:e.message);process.exit(1);});
+// Tras una actualización, el servidor nuevo arranca mientras el anterior aún suelta el puerto: espera un poco.
+let listenRetries=process.env.MIXTO_RESTART==='1'?60:0;
+server.on('error',e=>{
+  if(e.code==='EADDRINUSE'&&listenRetries-->0){setTimeout(()=>server.listen(port,'127.0.0.1'),250);return;}
+  console.error(e.code==='EADDRINUSE'?`El puerto ${port} ya está ocupado.`:e.message);process.exit(1);
+});
 // Los proyectos cooperativos se ponen al día solos: cada minuto en local y cada cinco con el remoto,
 // nunca mientras haya una tarea activa en esa carpeta.
 let coopTick=0;
@@ -1339,7 +1376,20 @@ const coopTimer=setInterval(()=>{
 },60000);
 coopTimer.unref();
 server.listen(port,'127.0.0.1',()=>{console.log(`Mixto · ${origin}`);void refreshConnections();void syncMemory();
-  for(const project of store.data.projects)if(coopEnabled(project))void coopSync(project,{fetch:true}).catch(()=>{});});
+  for(const project of store.data.projects)if(coopEnabled(project))void coopSync(project,{fetch:true}).catch(()=>{});
+  if(updateFrom.enabled){setTimeout(()=>void checkUpdates(),4000).unref();setInterval(()=>void checkUpdates(),6*60*60*1000).unref();}});
 let stopping=false;
+// Reinicio tras actualizar: arranca el servidor nuevo (ya con los archivos nuevos) y este proceso se retira.
+function restart(){
+  if(stopping)return;stopping=true;
+  for(const c of active.values())c.abort();
+  flush();
+  const logs=path.join(root,'.runtime');fs.mkdirSync(logs,{recursive:true});
+  const out=fs.openSync(path.join(logs,'server.log'),'a'),err=fs.openSync(path.join(logs,'server-error.log'),'a');
+  const child=spawn(process.execPath,[path.join(root,'server.mjs')],{cwd:root,windowsHide:true,detached:true,stdio:['ignore',out,err],env:{...process.env,MIXTO_RESTART:'1'}});
+  child.on('error',e=>console.error('No se pudo reiniciar Mixto: '+e.message));child.unref();
+  fs.closeSync(out);fs.closeSync(err);
+  setTimeout(()=>{for(const client of clients){try{client.end();}catch{}}server.close();process.exit(0);},300);
+}
 function stop(){if(stopping)return;stopping=true;for(const c of active.values())c.abort();setTimeout(()=>{flush();for(const client of clients){try{client.end();}catch{}}server.close();process.exit(0);},750);}
 process.on('SIGINT',stop);process.on('SIGTERM',stop);

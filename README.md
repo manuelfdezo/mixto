@@ -10,7 +10,9 @@ App local para Windows que reúne **Claude Code y Codex** con proyectos, convers
 
 Si Windows muestra «Windows protegió tu PC» al abrir el archivo por primera vez, pulsa **Más información → Ejecutar de todas formas**: es la marca que llevan los archivos descargados de internet. No hace falta instalar nada a mano; si ya tienes Node.js 22 o posterior, Git, Codex o Claude Code, se usan tal cual.
 
-Para actualizar, descarga el zip de nuevo y sustituye los archivos, o usa `git pull` si clonaste el repositorio. Tus datos viven en `data` y `.runtime`, que no se tocan.
+Para actualizar no hace falta descargar nada a mano: en **Agentes y ajustes → Aplicación** verás la versión instalada y, cuando haya una nueva, el botón **Actualizar**. Mixto comprueba la versión publicada en GitHub al arrancar y cada seis horas, y avisa con una marca en el botón de ajustes. Actualizar descarga el zip de la rama principal, sustituye los archivos de Mixto, guarda una copia de los anteriores en `.runtime/backup` y reinicia el servidor. Tus datos viven en `data` y `.runtime`, que nunca se tocan. Ahí mismo está **Descargar Mixto (zip)** para instalarlo en otro ordenador. Si clonaste el repositorio, `git pull` sigue funcionando igual.
+
+Para publicar una versión nueva basta con subir el número de `version` en `package.json` y empujar a `main`: todas las instalaciones la verán en su siguiente comprobación.
 
 ## Abrir
 

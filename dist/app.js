@@ -32,6 +32,7 @@ function limitsHtml(p,c){
 let state,projectId,conversationId,orchestrator='codex',busy=false,lastMessages='',lastAgents='',lastMemory='',lastRun='',toastTimer;
 let planChoices={},initRepo=false;
 let mode='orquestar',manualRows=[],manualOptions={review:true,initRepo:false},manualVersion=0,lastManual='';
+let updateNoticed=false;
 let attachments=[],notifyEnabled=false,terminalOpen=false,lastTerminal='',conversationQuery='';
 const lastRunStates=new Map();
 const statusLabel={added:'nuevo',modified:'modificado',deleted:'eliminado',renamed:'renombrado',untracked:'nuevo'};
@@ -348,6 +349,8 @@ function render(){
   $('#commit-button').hidden=!(pending?.git&&pending.files>0);
   if(pending?.files)$('#commit-button').textContent=`Confirmar cambios (${pending.files})`;
   $('#notify-toggle').classList.toggle('on',notifyEnabled);$('#terminal-toggle').classList.toggle('on',terminalOpen);
+  $('#update-count').hidden=!state.update?.available;
+  if(state.update?.available&&!updateNoticed){updateNoticed=true;toast(`Hay una versión nueva de Mixto (${state.update.latest}). Actualiza desde Agentes y ajustes.`);}
   renderTerminal();checkNotifications();
   updateOrchestrator();remember();
 }
@@ -700,13 +703,43 @@ function teamModal(){
   };
 }
 $('#open-team').onclick=teamModal;
+// Aplicación: versión instalada, comprobación y actualización desde GitHub, y el zip para instalar en otro equipo.
+function appSectionHtml(){
+  const u=state.update||{};
+  const status=u.applying?'Actualizando…':u.available?`<strong>Nueva versión ${esc(u.latest)} disponible.</strong>`:u.error?`No se pudo comprobar: ${esc(u.error)}`:u.checkedAt?'Estás al día.':'Sin comprobar todavía.';
+  return `<section class="connection-card" id="app-section"><h3>Aplicación</h3><p>Mixto ${esc(u.current||state.app.version)} · ${status}</p><div class="approval-actions">${u.available&&!u.applying?`<button type="button" class="primary-button" id="update-apply">Actualizar a ${esc(u.latest)}</button>`:''}<button type="button" class="secondary-button" id="update-check" ${u.applying?'disabled':''}>Buscar actualizaciones</button><a class="secondary-button" id="update-download" href="${esc(u.downloadUrl||'')}" target="_blank" rel="noopener">Descargar Mixto (zip)</a></div><small>Actualizar descarga la última versión desde GitHub, sustituye los archivos de Mixto y reinicia el servidor; tus datos (carpetas data y .runtime) no se tocan. Mixto lo comprueba solo al arrancar y cada seis horas. El zip sirve para instalar Mixto en otro ordenador: descomprímelo y abre Abrir-Mixto.cmd.</small></section>`;
+}
+async function waitForRestart(version){
+  for(let attempt=0;attempt<90;attempt++){
+    await new Promise(resolve=>setTimeout(resolve,1000));
+    try{const health=await (await fetch('/api/health',{cache:'no-store'})).json();if(health.version===version)return true;}catch{}
+  }
+  return false;
+}
+function bindAppSection(){
+  const check=$('#update-check');
+  if(check)check.onclick=async()=>{check.disabled=true;check.textContent='Comprobando…';try{const u=await api('update/check',{});state.update=u;toast(u.available?`Hay una versión nueva: ${u.latest}.`:u.error?u.error:'Estás al día.');}catch(error){toast(error.message);}lastAgents='';connectionsModal();};
+  const apply=$('#update-apply');
+  if(apply)apply.onclick=async()=>{
+    if(!confirm('Mixto descargará la versión nueva, sustituirá sus archivos y se reiniciará. Tus datos se conservan. ¿Continuar?'))return;
+    apply.disabled=true;apply.textContent='Descargando…';if(check)check.disabled=true;
+    try{
+      const result=await api('update/apply',{});
+      apply.textContent=`Reiniciando con la ${result.version}…`;
+      toast(`Versión ${result.version} instalada. Mixto se reinicia…`);
+      if(await waitForRestart(result.version))location.reload();
+      else toast('Mixto no ha vuelto a responder. Cierra esta pestaña y abre Mixto de nuevo con Abrir-Mixto.cmd.');
+    }catch(error){toast(error.message);lastAgents='';connectionsModal();}
+  };
+}
 function connectionsModal(){
-  openModal('Agentes',`<p class="modal-note">Mixto usa las sesiones de las herramientas instaladas. Aquí solo configuras lo necesario para orquestar.</p>${['codex','claude'].map(p=>{const c=state.connections[p],levels=effortLevels(p,selections[p]);return `<section class="connection-card"><h3><span class="agent-avatar ${p}">${symbols[p]}</span> ${names[p]}</h3><p>${c.loading?'Consultando conexión…':c.connected?'Conectado · '+esc(c.plan||c.authType):'Sin conexión'}</p>${limitsHtml(p,c)}${c.error?`<div class="message-error">${esc(c.error)}</div>`:''}${!c.connected?`<p>Inicia sesión con <code>${p==='codex'?'codex login':'claude auth login'}</code> y pulsa Actualizar.</p>`:''}${c.models.length?`<label class="form-field compact-field"><span>Modelo predeterminado</span><select data-agent-model="${p}">${modelOptions(p,selections[p])}</select><small>Cuando ${names[p]} orquesta, este modelo planifica y revisa: uno rápido abarata cada tarea. Los modelos potentes se eligen por sub-tarea en el plan.</small></label>${levels.length?`<label class="form-field compact-field"><span>Razonamiento</span><select data-agent-effort="${p}">${effortOptions(p,selections[p],efforts[p])}</select></label>`:''}`:''}</section>`;}).join('')}<form id="agent-settings"><label class="form-field"><span>Persona del arquitecto</span><select name="orchestratorPersona"><option value="">Sin persona</option>${state.personas.map(p=>`<option value="${esc(p.id)}" ${p.id===state.settings.orchestratorPersona?'selected':''}>${esc(p.name)}</option>`).join('')}</select><small>Añade unos 7.000 tokens de texto genérico a cada plan. Déjala en «Sin persona» salvo que la necesites.</small></label><label class="check-field"><input type="checkbox" name="autoApproveSingle" ${state.settings.autoApproveSingle?'checked':''}> Empezar sin pedir aprobación cuando el plan tiene una sola sub-tarea</label><label class="check-field"><input type="checkbox" name="autoApproveReadOnly" ${state.settings.autoApproveReadOnly?'checked':''}> Empezar sin pedir aprobación cuando todas las sub-tareas son de solo lectura</label><label class="form-field"><span>Comandos permitidos en ${esc(project()?.name||'este proyecto')} (uno por línea; «npm test» permite «npm test» y «npm test -- x»)</span><textarea name="allowedCommands" rows="3" placeholder="npm test&#10;npm run check&#10;git status">${esc((project()?.allowedCommands||[]).join('\n'))}</textarea><small>Los agentes ejecutan estos comandos sin preguntar, también el revisor. El botón «Permitir siempre» de cada petición los añade aquí.</small></label><label class="form-field"><span>Tope de tokens por tarea (0 = sin tope)</span><input type="number" name="tokenBudget" min="0" step="1000" value="${Number(state.settings.tokenBudget)||0}"><small>Se comprueba al cerrar cada turno, así que puede excederse por un turno. Al superarlo la tarea se detiene y te lo dice; una corrección la reanuda.</small></label>${['codex','claude'].map(p=>`<label class="form-field"><span>Preferencias para ${names[p]}</span><textarea name="${p}Instructions" rows="3" maxlength="8000" placeholder="Cómo quieres que trabaje este agente…">${esc(state.settings[p+'Instructions'])}</textarea></label>`).join('')}<div class="form-footer"><button type="button" class="secondary-button" id="refresh-connections">Actualizar</button><button class="primary-button">Guardar</button></div></form>`,'connections');
+  openModal('Agentes y ajustes',`<p class="modal-note">Mixto usa las sesiones de las herramientas instaladas. Aquí solo configuras lo necesario para orquestar.</p>${['codex','claude'].map(p=>{const c=state.connections[p],levels=effortLevels(p,selections[p]);return `<section class="connection-card"><h3><span class="agent-avatar ${p}">${symbols[p]}</span> ${names[p]}</h3><p>${c.loading?'Consultando conexión…':c.connected?'Conectado · '+esc(c.plan||c.authType):'Sin conexión'}</p>${limitsHtml(p,c)}${c.error?`<div class="message-error">${esc(c.error)}</div>`:''}${!c.connected?`<p>Inicia sesión con <code>${p==='codex'?'codex login':'claude auth login'}</code> y pulsa Actualizar.</p>`:''}${c.models.length?`<label class="form-field compact-field"><span>Modelo predeterminado</span><select data-agent-model="${p}">${modelOptions(p,selections[p])}</select><small>Cuando ${names[p]} orquesta, este modelo planifica y revisa: uno rápido abarata cada tarea. Los modelos potentes se eligen por sub-tarea en el plan.</small></label>${levels.length?`<label class="form-field compact-field"><span>Razonamiento</span><select data-agent-effort="${p}">${effortOptions(p,selections[p],efforts[p])}</select></label>`:''}`:''}</section>`;}).join('')}${appSectionHtml()}<form id="agent-settings"><label class="form-field"><span>Persona del arquitecto</span><select name="orchestratorPersona"><option value="">Sin persona</option>${state.personas.map(p=>`<option value="${esc(p.id)}" ${p.id===state.settings.orchestratorPersona?'selected':''}>${esc(p.name)}</option>`).join('')}</select><small>Añade unos 7.000 tokens de texto genérico a cada plan. Déjala en «Sin persona» salvo que la necesites.</small></label><label class="check-field"><input type="checkbox" name="autoApproveSingle" ${state.settings.autoApproveSingle?'checked':''}> Empezar sin pedir aprobación cuando el plan tiene una sola sub-tarea</label><label class="check-field"><input type="checkbox" name="autoApproveReadOnly" ${state.settings.autoApproveReadOnly?'checked':''}> Empezar sin pedir aprobación cuando todas las sub-tareas son de solo lectura</label><label class="form-field"><span>Comandos permitidos en ${esc(project()?.name||'este proyecto')} (uno por línea; «npm test» permite «npm test» y «npm test -- x»)</span><textarea name="allowedCommands" rows="3" placeholder="npm test&#10;npm run check&#10;git status">${esc((project()?.allowedCommands||[]).join('\n'))}</textarea><small>Los agentes ejecutan estos comandos sin preguntar, también el revisor. El botón «Permitir siempre» de cada petición los añade aquí.</small></label><label class="form-field"><span>Tope de tokens por tarea (0 = sin tope)</span><input type="number" name="tokenBudget" min="0" step="1000" value="${Number(state.settings.tokenBudget)||0}"><small>Se comprueba al cerrar cada turno, así que puede excederse por un turno. Al superarlo la tarea se detiene y te lo dice; una corrección la reanuda.</small></label>${['codex','claude'].map(p=>`<label class="form-field"><span>Preferencias para ${names[p]}</span><textarea name="${p}Instructions" rows="3" maxlength="8000" placeholder="Cómo quieres que trabaje este agente…">${esc(state.settings[p+'Instructions'])}</textarea></label>`).join('')}<div class="form-footer"><button type="button" class="secondary-button" id="refresh-connections">Actualizar</button><button class="primary-button">Guardar</button></div></form>`,'connections');
   $('#modal-content').onchange=e=>{
     const model=e.target.dataset.agentModel,effort=e.target.dataset.agentEffort;
     if(model){selections[model]=e.target.value;efforts[model]=defaultEffort(model,e.target.value)||'';lastAgents='';renderAgents();connectionsModal();}
     if(effort){efforts[effort]=e.target.value;remember();}
   };
+  bindAppSection();
   $('#agent-settings').onsubmit=async e=>{e.preventDefault();const form=new FormData(e.target);
     // Una casilla sin marcar no viaja en FormData: los booleanos se envían explícitamente.
     const body={orchestratorPersona:form.get('orchestratorPersona')||'',codexInstructions:form.get('codexInstructions')||'',claudeInstructions:form.get('claudeInstructions')||'',autoApproveSingle:form.has('autoApproveSingle'),autoApproveReadOnly:form.has('autoApproveReadOnly'),tokenBudget:Number(form.get('tokenBudget'))||0};
