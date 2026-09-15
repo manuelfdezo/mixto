@@ -16,17 +16,18 @@ const git=(cwd,...args)=>execFileSync('git',['-C',cwd,...args],{windowsHide:true
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
 const GIT_ENV={...process.env,GIT_TERMINAL_PROMPT:'0'};
-async function boot(t,{delay=600,scenario,remote=false,cloneOf=null,identity={name:'Mixto Test',email:'test@example.invalid'},appRoot=root,env={}}={}) {
+async function boot(t,{delay=600,scenario,remote=false,cloneOf=null,identity={name:'Mixto Test',email:'test@example.invalid'},appRoot=root,env={},noProject=false}={}) {
   const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'mixto-orq-')));
-  const projectsRoot=path.join(dir,'projects');fs.mkdirSync(projectsRoot);
+  const projectsRoot=env.MIXTO_PROJECTS_ROOT||path.join(dir,'projects');if(!env.MIXTO_PROJECTS_ROOT)fs.mkdirSync(projectsRoot);
   const work=path.join(projectsRoot,'proyecto');
   let bare=null;
-  if(cloneOf)execFileSync('git',['clone','--quiet',cloneOf,work],{env:GIT_ENV});
+  if(noProject){}
+  else if(cloneOf)execFileSync('git',['clone','--quiet',cloneOf,work],{env:GIT_ENV});
   else{fs.mkdirSync(work);git(work,'init','-b','main');}
-  git(work,'config','user.name',identity.name);
+  if(!noProject){git(work,'config','user.name',identity.name);
   git(work,'config','user.email',identity.email);
-  git(work,'config','core.autocrlf','false');
-  if(!cloneOf){
+  git(work,'config','core.autocrlf','false');}
+  if(!cloneOf&&!noProject){
     fs.writeFileSync(path.join(work,'base.txt'),'base\n');
     git(work,'add','base.txt');git(work,'commit','-m','inicial');
     if(remote){bare=path.join(dir,'remote.git');execFileSync('git',['init','--bare','-b','main',bare],{env:GIT_ENV});git(work,'remote','add','origin',bare);git(work,'push','-q','-u','origin','main');}
@@ -76,7 +77,7 @@ async function boot(t,{delay=600,scenario,remote=false,cloneOf=null,identity={na
   }
   assert.ok(state.connections.claude.connected,'el agente falso no se reportó conectado: '+log);
   // Nunca usar el proyecto por defecto: apunta a la carpeta de Mixto, no a esta copia de prueba.
-  const project=await call('projects',{name:'Proyecto de prueba',path:work,description:''});
+  const project=noProject?null:await call('projects',{name:'Proyecto de prueba',path:work,description:''});
   return {call,refreshCookie,work,dir,project,origin,cookie,bare,log:()=>log,
     until:async predicate=>{
       for(let attempt=0;attempt<200;attempt++) {
@@ -949,4 +950,15 @@ test('GitHub: conectar con un token, listar repositorios, clonar uno como proyec
   await call('exec',{projectId:project.id,command:'git config --get http.https://github.com/.extraheader; echo fin'});
   state=await until(s=>s.execs[project.id]?.status!=='running'&&s.execs[project.id].command.includes('fin'));
   assert.equal(state.execs[project.id].output.trim(),'fin','sin token, git ya no lleva la cabecera');
+});
+
+test('la carpeta de proyectos se crea sola al arrancar, y crear o clonar un proyecto funciona a la primera',async t=>{
+  const fresh=path.join(fs.realpathSync(os.tmpdir()),'mixto-root-'+Date.now()+'-'+Math.floor(Math.random()*1e6));
+  t.after(()=>{try{fs.rmSync(fresh,{recursive:true,force:true});}catch{}});
+  const {call}=await boot(t,{delay:50,noProject:true,env:{MIXTO_PROJECTS_ROOT:fresh}});
+  const state=await call('state');
+  assert.equal(fs.existsSync(fresh),true,'la carpeta se ha creado');
+  assert.deepEqual(state.app.projectsRoot,{path:fresh,available:true});
+  const created=await call('projects',{name:'Nuevo',directoryName:'nuevo'});
+  assert.equal(path.dirname(created.path),fresh);
 });

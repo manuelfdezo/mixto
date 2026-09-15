@@ -21,6 +21,8 @@ const root=path.dirname(fileURLToPath(import.meta.url));
 const VERSION=(()=>{try{return JSON.parse(fs.readFileSync(path.join(root,'package.json'),'utf8')).version||'0.0.0';}catch{return '0.0.0';}})();
 const dataDir=path.resolve(process.env.MIXTO_DATA_DIR||path.join(root,'data'));
 const managedProjectsRoot=projectsRoot(root);
+// La carpeta de proyectos se crea sola la primera vez: nadie debería tener que crearla a mano.
+try{fs.mkdirSync(managedProjectsRoot,{recursive:true});}catch(e){console.error('No se pudo crear la carpeta de proyectos '+managedProjectsRoot+': '+e.message);}
 const port=Number(process.env.MIXTO_PORT||4317);
 const origin=`http://127.0.0.1:${port}`;
 const secret=randomBytes(32).toString('hex');
@@ -111,6 +113,11 @@ function str(value,label,max=10000,empty=false){
 function getRun(runId){const r=store.data.runs.find(r=>r.id===runId);if(!r)throw new Error('Tarea no encontrada.');return r;}
 function sameFolder(a,b){return process.platform==='win32'?a.toLowerCase()===b.toLowerCase():a===b;}
 function folder(value){const p=str(value,'Carpeta',2000);if(!path.isAbsolute(p))throw new Error('Escribe la ruta completa de una carpeta.');const real=fs.realpathSync(p);if(!fs.statSync(real).isDirectory())throw new Error('La ruta debe ser una carpeta.');return real;}
+// Un ENOENT puede ser una carpeta que no existe o un programa que no está instalado: se dice cuál.
+function missingMessage(e){
+  if(typeof e.syscall==='string'&&e.syscall.startsWith('spawn'))return `No se encontró el programa «${e.path||e.syscall.slice(6)}». Abre Mixto con Abrir-Mixto.cmd para que instale lo que falta.`;
+  return `No se encontró la carpeta o el archivo${e.path?' «'+e.path+'»':''}. Comprueba la ruta.`;
+}
 function projectOf(run){return store.project(store.conversation(run.conversationId).projectId);}
 const membersOf=project=>store.data.people.filter(person=>(project.members||[]).includes(person.id));
 const assigneeName=subtask=>subtask.human?`${subtask.personName} (persona)`:`${agentName(subtask.provider)} ${subtask.model}`;
@@ -1395,7 +1402,7 @@ const server=http.createServer(async(req,res)=>{
     const mime={'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.ico':'image/x-icon'};
     const binary=path.extname(file)==='.ico';
     res.writeHead(200,{'Content-Type':mime[path.extname(file)]+(binary?'':'; charset=utf-8'),'Cache-Control':'no-cache'});res.end(fs.readFileSync(file));
-  }catch(e){json(res,400,{error:e.code==='ENOENT'?'No se encontró la carpeta. Comprueba la ruta.':e.message});}
+  }catch(e){json(res,400,{error:e.code==='ENOENT'?missingMessage(e):e.message});}
 });
 
 // Tras una actualización, el servidor nuevo arranca mientras el anterior aún suelta el puerto: espera un poco.

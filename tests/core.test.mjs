@@ -122,6 +122,12 @@ test('normalizeLimits encuentra las ventanas de cuota sin depender de la forma e
   assert.equal(normalizeLimits({}),null);
   assert.equal(normalizeLimits(null),null);
   assert.equal(normalizeLimits({used_percent:250}).windows[0].usedPercent,100,'se acota a 100');
+  // Codex real: los mismos límites llegan también en rateLimitsByLimitId; no deben salir por duplicado.
+  const doubled=normalizeLimits({rateLimits:{primary:{usedPercent:0,windowDurationMins:300},secondary:{usedPercent:0,windowDurationMins:10080}},
+    rateLimitsByLimitId:{codex:{primary:{usedPercent:0,windowDurationMins:300},secondary:{usedPercent:0,windowDurationMins:10080}}}});
+  assert.deepEqual(doubled.windows.map(w=>[w.minutes,w.usedPercent]),[[300,0],[10080,0]]);
+  const repeated=normalizeLimits({limits:[{usedPercent:5,windowMinutes:300},{usedPercent:9,windowMinutes:300,resetsAt:1800000000}]});
+  assert.deepEqual(repeated.windows.map(w=>[w.minutes,w.usedPercent,w.resetsAt]),[[300,9,new Date(1800000000*1000).toISOString()]],'una ventana repetida se queda una vez, con el mayor uso');
 });
 
 test('los comandos permitidos casan por prefijo de palabra completa y se guardan limpios',()=>{
