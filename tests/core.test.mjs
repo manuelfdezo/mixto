@@ -6,6 +6,8 @@ import os from 'node:os';
 import {fileURLToPath} from 'node:url';
 import {Store,memoryContext} from '../lib/store.mjs';
 import {runProvider,executables,resolveCommand,normalizeUsage,normalizeLimits} from '../lib/providers.mjs';
+import {commandAllowed,commandPrefix,cleanCommandList,claudeAllowedTools,looksLikeSessionLoss} from '../lib/commands.mjs';
+import {parseDiff} from '../lib/isolation.mjs';
 
 test('La memoria y las conversaciones sobreviven al reinicio, con copia anterior',()=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mixto-test-store-'));
@@ -120,4 +122,31 @@ test('normalizeLimits encuentra las ventanas de cuota sin depender de la forma e
   assert.equal(normalizeLimits({}),null);
   assert.equal(normalizeLimits(null),null);
   assert.equal(normalizeLimits({used_percent:250}).windows[0].usedPercent,100,'se acota a 100');
+});
+
+test('los comandos permitidos casan por prefijo de palabra completa y se guardan limpios',()=>{
+  const list=['npm test','git status'];
+  assert.equal(commandAllowed(list,'npm test'),true);
+  assert.equal(commandAllowed(list,'npm   test -- --watch'),true,'los espacios de más no importan');
+  assert.equal(commandAllowed(list,'npm testing'),false,'no vale un prefijo a medias');
+  assert.equal(commandAllowed(list,'rm -rf /'),false);
+  assert.equal(commandAllowed([],'npm test'),false);
+  assert.equal(commandPrefix('pytest tests/test_x.py -q'),'pytest tests/test_x.py');
+  assert.equal(commandPrefix('ls'),'ls');
+  assert.deepEqual(cleanCommandList([' npm test ','npm test','','git status',42]),['npm test','git status']);
+  assert.deepEqual(claudeAllowedTools(['npm test']),['Bash(npm test)','Bash(npm test:*)','Bash(npm test *)']);
+  assert.equal(looksLikeSessionLoss(new Error('No conversation found with session ID x')),true);
+  assert.equal(looksLikeSessionLoss(new Error('ENOENT')),false);
+});
+
+test('parseDiff separa archivos, cuenta líneas y reconoce nuevos, borrados y binarios',()=>{
+  const text=['diff --git a/a.txt b/a.txt','index 1..2 100644','--- a/a.txt','+++ b/a.txt','@@ -1 +1,2 @@','-uno','+uno','+dos',
+    'diff --git a/nuevo.txt b/nuevo.txt','new file mode 100644','--- /dev/null','+++ b/nuevo.txt','@@ -0,0 +1 @@','+hola',
+    'diff --git a/viejo.txt b/viejo.txt','deleted file mode 100644','--- a/viejo.txt','+++ /dev/null','@@ -1 +0,0 @@','-adiós',
+    'diff --git a/img.png b/img.png','Binary files a/img.png and b/img.png differ'].join('\n');
+  const files=parseDiff(text);
+  assert.deepEqual(files.map(f=>[f.path,f.status,f.additions,f.deletions,f.binary]),[['a.txt','modified',2,1,false],['nuevo.txt','added',1,0,false],['viejo.txt','deleted',0,1,false],['img.png','modified',0,0,true]]);
+  assert.match(files[0].text,/^diff --git a\/a\.txt/);
+  assert.deepEqual(parseDiff(''),[]);
+  assert.equal(parseDiff('diff --git "a/con espacio.txt" "b/con espacio.txt"\n+x')[0].path,'con espacio.txt');
 });

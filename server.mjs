@@ -3,17 +3,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {randomBytes} from 'node:crypto';
+import {spawn,execFile} from 'node:child_process';
 import {Store,id,now,memoryContext,sessionKey,rememberSession} from './lib/store.mjs';
 import {discover,runProvider,readLimits} from './lib/providers.mjs';
 import {EngramBridge,sharedMemories,cleanupOrphanTransfers} from './lib/engram.mjs';
-import {buildPlanPrompt,parsePlan,parseManualPlan,assignWaves,buildReviewPrompt,readVerdict,PlanError,buildSupervisionPrompt,parseDecision,buildWorkPrompt,buildFixPrompt,buildDirectPrompt,buildSelfPrompt,HUMAN,HUMAN_STATUSES,humanStatusLabel,findPerson} from './lib/orchestrator.mjs';
-import {inspect,initRepository,createWorkspaces,createReviewWorkspace,capturePatch,checkPatches,applyPatches,removeWorkspaces,cleanupOrphanWorkspaces,snapshotProject,diffSince} from './lib/isolation.mjs';
+import {buildPlanPrompt,parsePlan,parseManualPlan,assignWaves,buildReviewPrompt,readVerdict,PlanError,buildSupervisionPrompt,parseDecision,buildWorkPrompt,buildFixPrompt,buildDirectPrompt,buildSelfPrompt,buildOpinionPrompt,buildCommitPrompt,steerPrefix,HUMAN,HUMAN_STATUSES,humanStatusLabel,findPerson} from './lib/orchestrator.mjs';
+import {inspect,initRepository,createWorkspaces,createReviewWorkspace,capturePatch,checkPatches,applyPatches,removeWorkspaces,cleanupOrphanWorkspaces,snapshotProject,diffSince,parseDiff,revertPatch,projectChanges,commitFiles,pushBranch} from './lib/isolation.mjs';
+import {commandAllowed,commandPrefix,cleanCommandList,claudeAllowedTools,looksLikeSessionLoss} from './lib/commands.mjs';
 import {createManagedProject,managedProjectPath,projectsRoot,syncDiscoveredProjects} from './lib/projects.mjs';
 import {listPersonas,personaBody} from './lib/personas.mjs';
 import {Watcher} from './lib/supervisor.mjs';
 import {openLedger,syncLedger,publishLedger,writeLedger,gitIdentity,STATUSES as LEDGER_STATUSES} from './lib/team.mjs';
 
-const VERSION='1.1.0';
+const VERSION='1.2.0';
 const root=path.dirname(fileURLToPath(import.meta.url));
 const dataDir=path.resolve(process.env.MIXTO_DATA_DIR||path.join(root,'data'));
 const managedProjectsRoot=projectsRoot(root);
@@ -64,6 +66,10 @@ const touch=()=>{dirty=true;notify();};
 const flush=()=>{store.save();dirty=false;notify();};
 const keepalive=setInterval(()=>{for(const client of clients){try{client.write(': ping\n\n');}catch{clients.delete(client);}}},20000);
 keepalive.unref();
+const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+// Terminal de proyecto (un comando a la vez por carpeta) y resumen de cambios sin confirmar por proyecto.
+const execs=new Map(),changesCache=new Map();
+const execView=record=>record?{id:record.id,command:record.command,status:record.status,code:record.code,startedAt:record.startedAt,finishedAt:record.finishedAt,output:record.output.slice(-65536)}:null;
 const toSubtask=(item,index)=>({id:id(),index,human:false,personId:null,personName:null,...item,cwd:null,patch:null,diff:null,text:'',
   status:item.human?'pendiente':'queued',stage:item.human?`Asignada a ${item.personName}`:'En espera',result:'',due:null,assignmentId:null,updatedAt:null,
   events:[],messageId:null,sessionKey:null,sessionId:null,usage:null,error:null,startedAt:null,finishedAt:null,fixable:false,self:false});
@@ -115,6 +121,93 @@ function personFields(source,base={}){
   if(email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))throw new Error('Correo: escribe una dirección válida o déjalo vacío.');
   return {...base,name:str(source.name,'Nombre',80),role:str(source.role||'','Rol',80,true),email,notes:str(source.notes||'','Notas',2000,true)};
 }
+
+// Aprobación automática de los comandos permitidos en el proyecto; todo lo demás sigue pasando por el usuario.
+// Los comandos de la lista del proyecto los aprueba el propio proveedor; el resto llega al usuario.
+const allowCommandIn=project=>command=>commandAllowed(project.allowedCommands,command);
+async function refreshChanges(project){
+  try{const changes=await projectChanges(project.path,{withDiff:false});changesCache.set(project.id,{git:changes.git,files:changes.files.length,at:now()});}
+  catch{changesCache.set(project.id,{git:false,files:0,at:now()});}
+  notify();
+}
+function startExec(project,command){
+  const current=execs.get(project.id);
+  if(current?.status==='running')throw new Error('Ya hay un comando en marcha en este proyecto. Detenlo o espera a que termine.');
+  const record={id:id(),command,status:'running',code:null,output:'',startedAt:now(),finishedAt:null,child:null};
+  const [shell,args]=process.platform==='win32'?[process.env.ComSpec||'cmd.exe',['/d','/s','/c',command]]:['/bin/sh',['-c',command]];
+  const child=spawn(shell,args,{cwd:project.path,windowsHide:true,stdio:['ignore','pipe','pipe'],env:{...process.env,GIT_TERMINAL_PROMPT:'0'}});
+  record.child=child;
+  const append=chunk=>{record.output=(record.output+chunk.toString()).slice(-1024*1024);notify();};
+  child.stdout.on('data',append);child.stderr.on('data',append);
+  const timer=setTimeout(()=>{if(record.status==='running'){record.output+='\n[Mixto] Detenido tras 10 minutos.';stopExec(project);}},600000);
+  timer.unref();
+  child.on('exit',(code,signal)=>{clearTimeout(timer);record.status=signal||record.stopping?'stopped':'finished';record.code=code;record.finishedAt=now();void refreshChanges(project);notify();});
+  child.on('error',error=>{clearTimeout(timer);record.status='error';record.output+='\n'+error.message;record.finishedAt=now();notify();});
+  execs.set(project.id,record);notify();
+  return record;
+}
+function stopExec(project){
+  const record=execs.get(project.id);
+  if(!record||record.status!=='running')return;
+  record.stopping=true;
+  if(process.platform==='win32'&&record.child?.pid)execFile('taskkill.exe',['/PID',String(record.child.pid),'/T','/F'],{windowsHide:true},()=>{});
+  else record.child?.kill();
+}
+// Mensaje de commit propuesto por un agente en un solo turno, sin sesión ni memoria: solo el diff.
+async function proposeCommit(project,body){
+  const changes=await projectChanges(project.path);
+  if(!changes.git)throw new Error('La carpeta no es un repositorio git.');
+  if(!changes.files.length)throw new Error('No hay cambios sin confirmar.');
+  const provider=PROVIDERS.includes(body.provider)?body.provider:'codex';
+  if(!connections[provider].connected)throw new Error(`${agentName(provider)} no está conectado.`);
+  const chosen=modelChoice(provider,body.model,body.effort);
+  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),180000);
+  try{
+    const result=await runProvider(provider,{cwd:project.path,model:chosen.model,effort:chosen.effort,prompt:buildCommitPrompt(changes),readOnly:true,
+      signal:controller.signal,onSession:()=>{},onText:()=>{},onEvent:()=>{},approve:()=>Promise.resolve({allow:false})});
+    const message=String(result.text||'').replace(/^```[\w-]*\n?/,'').replace(/\n?```\s*$/,'').trim();
+    if(!message)throw new Error('El agente no propuso ningún mensaje.');
+    return {message,files:changes.files,usage:result.usage};
+  }finally{clearTimeout(timer);}
+}
+// Redirigir: detener el turno en directo y reanudar la misma sesión con la nueva indicación.
+async function steerRun(body){
+  const run=getRun(body.runId);
+  if(run.mode!=='directo')throw new Error('Solo se puede redirigir un turno del modo directo.');
+  const controller=active.get(run.id);
+  if(!controller)throw new Error('Ese turno ya ha terminado; envía un mensaje nuevo.');
+  const text=str(body.prompt,'Indicación',20000);
+  controller.abort({steer:true});
+  for(let attempt=0;attempt<100&&active.has(run.id);attempt++)await wait(100);
+  if(active.has(run.id))throw new Error('El turno no se detuvo a tiempo; inténtalo de nuevo.');
+  return startRun({conversationId:run.conversationId,prompt:steerPrefix(text),display:text,mode:'directo',readOnly:run.readOnly,
+    attachments:body.attachments,orchestrator:{provider:run.orchestrator.provider,model:run.orchestrator.model,effort:run.orchestrator.effort}});
+}
+function diffOf(runId,subtaskId){
+  const run=getRun(runId),project=projectOf(run);
+  const subtask=run.subtasks.find(candidate=>candidate.id===subtaskId);
+  if(!subtask)throw new Error('Sub-tarea no encontrada.');
+  const change=subtask.patch||subtask.diff;
+  if(!change?.file)throw new Error('Esta parte no dejó cambios en archivos.');
+  let text='';
+  try{text=fs.readFileSync(change.file,'utf8');}catch{throw new Error('El diff ya no está disponible.');}
+  const files=parseDiff(text);
+  let toplevel=run.snapshot?.toplevel;
+  if(!toplevel){try{toplevel=inspect(project.path).toplevel||project.path;}catch{toplevel=project.path;}}
+  const created=[];
+  for(const relative of change.created||[]){
+    const full=path.join(toplevel,relative);
+    let content=null,exists=false,binary=false;
+    try{const stat=fs.statSync(full);exists=true;if(stat.size<=200*1024){const raw=fs.readFileSync(full);if(raw.includes(0))binary=true;else content=raw.toString('utf8');}}catch{}
+    created.push({path:relative,status:'added',exists,binary,text:content===null?'':content.replace(/\n$/,'').split('\n').map(line=>'+'+line).join('\n')});
+  }
+  const applied=run.review?.integration?.applied||[];
+  const pending=!!subtask.patch&&!applied.includes(subtask.patch.file)&&!run.review?.integration?.discarded;
+  return {source:subtask.patch?'patch':'diff',pending,applied:subtask.patch?applied.includes(subtask.patch.file):!subtask.reverted,
+    reverted:!!subtask.reverted,revertedFiles:subtask.revertedFiles||[],excluded:subtask.patchExcludes||[],files,created,
+    summary:{files:files.length+created.length,additions:files.reduce((n,file)=>n+file.additions,0)+created.reduce((n,file)=>n+(file.text?file.text.split('\n').length:0),0),deletions:files.reduce((n,file)=>n+file.deletions,0)}};
+}
+const patchExcludesOf=run=>Object.fromEntries(run.subtasks.filter(subtask=>subtask.patch).map(subtask=>[subtask.patch.file,subtask.patchExcludes||[]]));
 
 // Cooperación por git: el libro de encargos del proyecto vive en la rama `mixto-encargos` del repositorio.
 // Todas las operaciones sobre el libro de un proyecto van en fila, para no pisarse entre sí.
@@ -293,7 +386,8 @@ function snapshot(){
   if(managed.added.length)flush();
   const {engram,...data}=store.data;
   return {...data,memories:sharedMemories(store.data),memorySync:memoryBridge.status,connections,personas:listPersonas(),
-    approvals:[...approvals.values()].map(a=>a.public),app:{version:VERSION,workspace:root,
+    approvals:[...approvals.values()].map(a=>a.public),execs:Object.fromEntries([...execs].map(([projectId,record])=>[projectId,execView(record)])),
+    changes:Object.fromEntries(changesCache),app:{version:VERSION,workspace:root,
       projectsRoot:{path:managed.root,available:managed.available}}};
 }
 function message(conversationId,role,content,extra={}){const m={id:id(),conversationId,role,content,createdAt:now(),...extra};store.data.messages.push(m);return m;}
@@ -391,16 +485,26 @@ function applyPlanChoices(run,choices){
   }
 }
 
-async function orchestratorRun(run,{prompt,sessionId,controller,onText,cwd,extraTools,allowedTools,approve}){
+async function orchestratorRun(run,{prompt,sessionId,controller,onText,cwd,extraTools,allowedTools,approve,attachments,allowCommand}){
   const project=projectOf(run);
-  const result=await runProvider(run.orchestrator.provider,{
-    cwd:cwd||project.path,model:run.orchestrator.model,effort:run.orchestrator.effort,prompt,readOnly:true,extraTools,allowedTools,
+  const options=sid=>({
+    cwd:cwd||project.path,model:run.orchestrator.model,effort:run.orchestrator.effort,prompt,readOnly:true,extraTools,allowedTools,attachments,allowCommand,
     // The architect's session is kept alive across plan, supervision and review turns: it never re-explains itself.
-    sessionId:sessionId??run.orchestrator.sessionId,signal:controller.signal,
-    onSession:sid=>{run.orchestrator.sessionId=sid;touch();},onText,
+    sessionId:sid,signal:controller.signal,
+    onSession:next=>{run.orchestrator.sessionId=next;touch();},onText,
     onEvent:text=>pushEvent(run,text),
     approve:approve||(()=>Promise.resolve({allow:false}))
   });
+  const resume=sessionId??run.orchestrator.sessionId??undefined;
+  let result;
+  try{result=await runProvider(run.orchestrator.provider,options(resume));}
+  catch(error){
+    // Una sesión nativa que ya no existe no debe tumbar la tarea: se empieza otra y se sigue.
+    if(!resume||controller.signal.aborted||!looksLikeSessionLoss(error))throw error;
+    pushEvent(run,'La sesión nativa del arquitecto no se pudo reanudar; empieza una nueva.');
+    run.orchestrator.sessionId=null;
+    result=await runProvider(run.orchestrator.provider,options(undefined));
+  }
   addUsage(run,result.usage);
   return result;
 }
@@ -418,11 +522,14 @@ async function planPhase(run,controller){
   const instructions=[personaBody(store.data.settings.orchestratorPersona),
     store.data.settings[run.orchestrator.provider+'Instructions']||''].filter(Boolean).join('\n\n');
   const people=membersOf(project).map(person=>({...person,pending:pendingFor(project,person.id)}));
-  let prompt=buildPlanPrompt({request:run.prompt,connections,memory,history,
+  // Con la sesión del arquitecto reanudada, el historial ya está en su contexto: no se repite.
+  const resumed=!!run.orchestrator.sessionId;
+  if(resumed)pushEvent(run,'El arquitecto reanuda su sesión de esta conversación.');
+  let prompt=buildPlanPrompt({request:run.prompt,connections,memory,history:resumed?'':history,
     instructions,maxSubtasks:MAX_SUBTASKS,maxParallel:maxParallel(),readOnly:run.readOnly,people});
   let parsed=null,sessionId,lastError;
   for(let attempt=0;attempt<2&&!parsed;attempt++){
-    const result=await orchestratorRun(run,{prompt,sessionId,controller,onText:text=>{current.content=text;touch();}});
+    const result=await orchestratorRun(run,{prompt,sessionId,controller,attachments:attempt===0?run.attachments:undefined,onText:text=>{current.content=text;touch();}});
     sessionId=result.sessionId||sessionId;
     current.content=result.text||current.content;current.usage=result.usage;
     try {parsed=parsePlan(result.text,{connections,maxSubtasks:MAX_SUBTASKS,runReadOnly:run.readOnly,people});}
@@ -433,6 +540,7 @@ async function planPhase(run,controller){
       prompt=`Tu respuesta anterior no se pudo interpretar como plan: ${error.message}\n\nDevuelve únicamente el bloque \`\`\`json, sin nada alrededor.`;
     }
   }
+  if(run.orchestrator.sessionId)rememberSession(conv,'architect:'+run.orchestrator.provider,run.orchestrator.sessionId);
   // Una respuesta directa cierra la tarea aquí: el arquitecto ya exploró lo necesario y no hay nada que repartir.
   if(parsed?.direct){
     current.content=parsed.answer;current.status='completed';current.kind='answer';current.stage='Respuesta';
@@ -507,15 +615,16 @@ async function prepare(run,decision){
 
 // `options.kind`: 'work' (una sub-tarea del plan), 'self' (el arquitecto la hace en su propia sesión),
 // 'direct' (modo directo, sin arquitecto) o 'fix' (corrección que reanuda la sesión de la sub-tarea).
+// `options.prompt` sustituye el prompt (segunda opinión); `options.messageKind` y `options.stage` etiquetan el mensaje.
 async function runSubtask(run,subtask,controller,options=null){
   const conv=store.conversation(run.conversationId),project=store.project(conv.projectId);
   const kind=options?.kind||'work';
   const direct=subtask.cwd===project.path;
-  const stageLabel=kind==='fix'?`Corrección: ${subtask.title}`:kind==='direct'?'Directo':subtask.title;
+  const stageLabel=options?.stage||(kind==='fix'?`Corrección: ${subtask.title}`:kind==='direct'?'Directo':subtask.title);
   subtask.status='running';subtask.stage=kind==='fix'?'Corrigiendo':subtask.readOnly?'Investigando':'Trabajando';
   subtask.startedAt=now();subtask.finishedAt=null;subtask.error=null;rollup(run);
   const current=message(conv.id,'assistant','',{provider:subtask.provider,model:subtask.model,status:'streaming',
-    runId:run.id,subtaskId:subtask.id,kind:kind==='direct'?'direct':'work',stage:stageLabel});
+    runId:run.id,subtaskId:subtask.id,kind:options?.messageKind||(kind==='direct'?'direct':'work'),stage:stageLabel});
   subtask.messageId=current.id;flush();
   if(kind==='self')pushEvent(run,'Una sola sub-tarea para el mismo agente: el arquitecto la hace en su propia sesión, sin arrancar otro proceso en frío.');
   const instructions=store.data.settings[subtask.provider+'Instructions']||'';
@@ -525,7 +634,8 @@ async function runSubtask(run,subtask,controller,options=null){
   subtask.sessionKey=key;
   const sessionId=kind==='fix'?subtask.sessionId:kind==='self'?run.orchestrator.sessionId:(key?conv.sessions?.[key]:undefined);
   let prompt;
-  if(kind==='fix')prompt=buildFixPrompt({request:run.prompt,subtask,review:run.review?.summary||'',feedback:options?.feedback||''});
+  if(options?.prompt)prompt=options.prompt;
+  else if(kind==='fix')prompt=buildFixPrompt({request:run.prompt,subtask,review:run.review?.summary||'',feedback:options?.feedback||''});
   else if(kind==='self')prompt=buildSelfPrompt({subtask});
   else{
     const memory=memoryContext({...store.data,memories:sharedMemories(store.data)},project.id,conv.id,subtask.instructions);
@@ -538,14 +648,23 @@ async function runSubtask(run,subtask,controller,options=null){
       prompt=buildWorkPrompt({request:run.prompt,subtask,memory,instructions,context:run.plan.context,direct,teamNote});
     }
   }
+  const providerOptions=sid=>({
+    cwd:subtask.cwd,model:subtask.model,effort:subtask.effort,prompt,readOnly:subtask.readOnly,
+    sessionId:sid,signal:controller.signal,onSession:next=>{subtask.sessionId=next;touch();},
+    allowedTools:claudeAllowedTools(project.allowedCommands),allowCommand:allowCommandIn(project),attachments:kind==='direct'?run.attachments:undefined,
+    onText:text=>{current.content=text;touch();},
+    onEvent:text=>{subtask.events.push({time:now(),text:String(text).slice(0,1500)});subtask.events=subtask.events.slice(-40);touch();},
+    approve:request=>ask(run,subtask,request,controller.signal)
+  });
   try{
-    const result=await runProvider(subtask.provider,{
-      cwd:subtask.cwd,model:subtask.model,effort:subtask.effort,prompt,readOnly:subtask.readOnly,
-      sessionId,signal:controller.signal,onSession:sid=>{subtask.sessionId=sid;touch();},
-      onText:text=>{current.content=text;touch();},
-      onEvent:text=>{subtask.events.push({time:now(),text:String(text).slice(0,1500)});subtask.events=subtask.events.slice(-40);touch();},
-      approve:request=>ask(run,subtask,request,controller.signal)
-    });
+    let result;
+    try{result=await runProvider(subtask.provider,providerOptions(sessionId));}
+    catch(error){
+      if(!sessionId||controller.signal.aborted||!looksLikeSessionLoss(error))throw error;
+      pushEvent(run,`${subtask.title}: la sesión nativa no se pudo reanudar; empieza una nueva.`);
+      if(kind==='self')run.orchestrator.sessionId=null;
+      result=await runProvider(subtask.provider,providerOptions(undefined));
+    }
     if(controller.signal.aborted)throw new Error('Tarea detenida.');
     if(!result.text?.trim())throw new Error('El agente terminó sin devolver texto. Revisa la actividad e inténtalo de nuevo.');
     if(result.sessionId)subtask.sessionId=result.sessionId;
@@ -564,11 +683,11 @@ async function runSubtask(run,subtask,controller,options=null){
   }catch(error){
     // A subtask-specific abort carries a reason object; a run-wide cancel or a real failure does not.
     const reason=controller.signal.aborted?controller.signal.reason:null;
-    const byArchitect=reason?.architect===true,byBudget=reason?.budget===true;
+    const byArchitect=reason?.architect===true,byBudget=reason?.budget===true,bySteer=reason?.steer===true;
     subtask.status=byArchitect?'stopped':controller.signal.aborted?'cancelled':'error';
-    subtask.stage=byArchitect?'Detenida por el arquitecto':byBudget?'Detenida por tope de consumo':'Sin completar';
-    subtask.error=byArchitect?reason.motivo:byBudget?`La tarea superó el tope de ${reason.limit} tokens.`:(noteAuthFailure(subtask.provider,error.message)||error.message);
-    current.status=subtask.status;current.error=subtask.error;current.stage=subtask.stage;
+    subtask.stage=byArchitect?'Detenida por el arquitecto':byBudget?'Detenida por tope de consumo':bySteer?'Redirigido':'Sin completar';
+    subtask.error=byArchitect?reason.motivo:byBudget?`La tarea superó el tope de ${reason.limit} tokens.`:bySteer?'':(noteAuthFailure(subtask.provider,error.message)||error.message);
+    current.status=subtask.status;current.error=subtask.error||null;current.stage=subtask.stage;
     if(current.content.trim()===error.message.trim())current.content='';
   }finally{subtask.finishedAt=now();rollup(run);flush();}
 }
@@ -581,7 +700,8 @@ async function reviewPhase(run,controller){
   // Al revisar de nuevo tras una integración, los parches ya están en la carpeta: no se vuelven a comprobar.
   const alreadyApplied=(run.review?.integration?.applied?.length||0)>0;
   const patches=alreadyApplied?[]:run.subtasks.map(subtask=>subtask.patch).filter(Boolean);
-  const verified=patches.length?await checkPatches({projectPath:project.path,patches}):{ok:true,failures:[],overlaps:[]};
+  const excludes=patchExcludesOf(run);
+  const verified=patches.length?await checkPatches({projectPath:project.path,patches,excludes}):{ok:true,failures:[],overlaps:[]};
   const patchText={};
   if(!alreadyApplied)for(const subtask of run.subtasks){const change=subtask.patch||subtask.diff;if(change?.file){try{patchText[subtask.id]=fs.readFileSync(change.file,'utf8');}catch{}}}
   // El revisor juzga el resultado integrado: una copia con todos los parches aplicados, o la carpeta
@@ -598,8 +718,8 @@ async function reviewPhase(run,controller){
     status:'streaming',runId:run.id,subtaskId:null,kind:'review',stage:'Revisión'});
   flush();
   const reviewer={id:'review:'+run.id,index:-1,title:'Revisión',model:run.orchestrator.model,provider:run.orchestrator.provider,status:'running'};
-  const turn=where=>orchestratorRun(run,{controller,cwd:where,extraTools:['Bash'],allowedTools:REVIEW_ALLOWED,
-    approve:request=>ask(run,reviewer,request,controller.signal,`Revisión · ${run.orchestrator.model}`),
+  const turn=where=>orchestratorRun(run,{controller,cwd:where,extraTools:['Bash'],allowedTools:[...REVIEW_ALLOWED,...claudeAllowedTools(project.allowedCommands)],
+    allowCommand:allowCommandIn(project),approve:request=>ask(run,reviewer,request,controller.signal,`Revisión · ${run.orchestrator.model}`),
     onText:text=>{current.content=text;touch();},
     prompt:buildReviewPrompt({request:run.prompt,subtasks:run.subtasks,overlaps:verified.overlaps,failures:verified.failures,patchText,workspace})});
   let result;
@@ -618,7 +738,7 @@ async function reviewPhase(run,controller){
   if(!patches.length){flush();return;}
   run.status='integrating';run.stage='Integrando';flush();
   if(verdict.integrate&&verified.ok){
-    run.review.integration=await applyPatches({projectPath:project.path,patches});
+    run.review.integration=await applyPatches({projectPath:project.path,patches,excludes});
     pushEvent(run,run.review.integration.conflicts.length?'La integración no se aplicó: hay conflictos.'
       :`Se integraron los cambios de ${run.review.integration.applied.length} sub-tarea(s).`);
   }else{
@@ -660,7 +780,7 @@ async function finishWorkspaces(run){
 function markFixable(run){
   const project=projectOf(run);
   for(const subtask of run.subtasks||[]){
-    subtask.fixable=run.mode!=='directo'&&!subtask.human&&!!subtask.sessionId&&!subtask.readOnly&&['completed','error','stopped'].includes(subtask.status)
+    subtask.fixable=!['directo','opinion'].includes(run.mode)&&!subtask.human&&!!subtask.sessionId&&!subtask.readOnly&&['completed','error','stopped'].includes(subtask.status)
       &&(subtask.cwd===project.path||(!!subtask.cwd&&fs.existsSync(subtask.cwd)));
   }
   touch();
@@ -746,10 +866,10 @@ async function skipReview(run){
 function failRun(run,controller,error){
   const reason=controller.signal.aborted?controller.signal.reason:null;
   run.status=controller.signal.aborted?'cancelled':'error';
-  run.error=reason?.budget===true
+  run.error=reason?.steer===true?null:reason?.budget===true
     ?`La tarea se detuvo al superar el tope de ${reason.limit} tokens (llevaba ${reason.total}). Sube el tope en Agentes, corrige una sub-tarea o vuelve a pedirla.`
     :(noteAuthFailure(run.orchestrator.provider,error.message)||error.message);
-  run.stage=reason?.budget===true?'Detenida por tope de consumo':'Sin completar';
+  run.stage=reason?.steer===true?'Redirigido':reason?.budget===true?'Detenida por tope de consumo':'Sin completar';
   for(const message of store.data.messages)if(message.runId===run.id&&message.status==='streaming'){
     message.status=run.status;message.stage=run.stage;message.error=run.error;
   }
@@ -763,11 +883,12 @@ async function settle(run){
   flush();
   void syncMemory();
   void refreshLimits();
+  try{void refreshChanges(projectOf(run));}catch{}
 }
 
 async function execute(run,controller){
   try{
-    if(run.mode==='directo'){await directPhase(run,controller);return;}
+    if(run.mode==='directo'||run.mode==='opinion'){await directPhase(run,controller);return;}
     let decision;
     if(run.mode==='manual'){decision={approve:true,initRepo:run.initRepo===true,subtasks:[]};run.status='running';run.stage='Preparando';flush();}
     else{
@@ -784,13 +905,26 @@ async function execute(run,controller){
 }
 
 // Modo directo: un solo agente en la carpeta real, con sesión continua, sin plan ni revisión.
+// La segunda opinión es un turno directo de solo lectura sobre los cambios sin confirmar del proyecto.
 async function directPhase(run,controller){
   const project=projectOf(run);
+  const opinion=run.mode==='opinion';
   run.phase='work';run.plan={status:'direct-mode',summary:'',warnings:[],context:''};
-  const subtask=toSubtask({title:'Directo',role:'Responder o resolver la petición',instructions:run.prompt,justification:'',
-    provider:run.orchestrator.provider,model:run.orchestrator.model,effort:run.orchestrator.effort,scope:[],readOnly:run.readOnly===true,order:1},0);
-  subtask.cwd=project.path;run.subtasks=[subtask];run.waves=[[subtask.id]];rollup(run);flush();
-  await runSubtask(run,subtask,controller,{kind:'direct'});
+  const subtask=toSubtask({title:opinion?'Segunda opinión':'Directo',role:opinion?'Revisar los cambios sin confirmar':'Responder o resolver la petición',instructions:run.prompt,justification:'',
+    provider:run.orchestrator.provider,model:run.orchestrator.model,effort:run.orchestrator.effort,scope:[],readOnly:opinion||run.readOnly===true,order:1},0);
+  subtask.cwd=project.path;run.subtasks=[subtask];run.waves=[[subtask.id]];rollup(run);
+  // Con escritura, el diff desde aquí es lo que se muestra en «Ver cambios» y lo que «Deshacer» revierte.
+  if(!subtask.readOnly)run.snapshot=snapshotProject(project.path);
+  flush();
+  let options={kind:'direct'};
+  if(opinion){
+    const changes=await projectChanges(project.path);
+    if(!changes.git)throw new Error('La carpeta no es un repositorio git: no hay cambios sin confirmar que revisar.');
+    if(!changes.files.length)throw new Error('No hay cambios sin confirmar que revisar.');
+    options={kind:'direct',messageKind:'opinion',stage:'Segunda opinión',
+      prompt:buildOpinionPrompt({focus:run.focus||'',status:changes.status,diff:changes.diff,untracked:changes.untracked,truncated:!!changes.truncated})};
+  }
+  await runSubtask(run,subtask,controller,options);
   if(controller.signal.aborted)throw new Error('Tarea detenida.');
   run.review=null;
   run.status=subtask.status==='completed'?'completed':'error';
@@ -821,8 +955,9 @@ async function integrateNow(run,discard){
   if(run.review?.integration?.applied?.length)throw new Error('Los cambios de esta tarea ya se integraron.');
   const patches=run.subtasks.map(subtask=>subtask.patch).filter(Boolean);
   if(!patches.length)throw new Error('Esta tarea no dejó cambios pendientes de integrar.');
-  const applied=await applyPatches({projectPath:project.path,patches});
+  const applied=await applyPatches({projectPath:project.path,patches,excludes:patchExcludesOf(run)});
   run.review={...(run.review||{}),integration:applied};
+  void refreshChanges(project);
   if(applied.applied.length)await removeWorkspaces({projectPath:project.path,dataDir,runId:run.id});
   markFixable(run);flush();return applied;
 }
@@ -836,16 +971,26 @@ function assertFolderFree(project){
 
 function startRun(body){
   const conv=store.conversation(body.conversationId),project=store.project(conv.projectId);
-  const prompt=str(body.prompt,'Mensaje',50000);
-  const mode=['orquestar','directo','manual'].includes(body.mode)?body.mode:'orquestar';
+  const mode=['orquestar','directo','manual','opinion'].includes(body.mode)?body.mode:'orquestar';
   const provider=PROVIDERS.includes(body.orchestrator?.provider)?body.orchestrator.provider:'codex';
+  let prompt=mode==='opinion'?str(body.prompt||'','Mensaje',50000,true):str(body.prompt,'Mensaje',50000);
+  const display=typeof body.display==='string'&&body.display.trim()?str(body.display,'Mensaje',50000):null;
+  const attachments=(Array.isArray(body.attachments)?body.attachments:[]).map(ref=>store.data.uploads.find(upload=>upload.id===ref)).filter(Boolean).slice(0,8)
+    .map(upload=>({id:upload.id,name:upload.name,mime:upload.mime,path:upload.path}));
   // Resolve symlinks and case before locking the workspace across providers.
   project.path=folder(project.path);
   assertFolderFree(project);
-  const run={id:id(),conversationId:conv.id,prompt,mode,orchestrator:{provider,model:'',effort:null,sessionId:null},
-    readOnly:body.readOnly!==false,phase:'plan',status:'planning',stage:'Planificando',createdAt:now(),
+  const focus=mode==='opinion'?prompt:'';
+  if(mode==='opinion')prompt=`Segunda opinión de ${agentName(provider)} sobre los cambios sin confirmar${focus?`: ${focus}`:''}`;
+  const run={id:id(),conversationId:conv.id,prompt,focus,mode,orchestrator:{provider,model:'',effort:null,sessionId:null},
+    readOnly:mode==='opinion'||body.readOnly!==false,phase:'plan',status:'planning',stage:'Planificando',createdAt:now(),
     plan:{status:'pending',summary:'',warnings:[],context:''},isolation:null,snapshot:null,answer:null,usage:null,
-    subtasks:[],waves:[],review:null,events:[],reviewWanted:true,initRepo:false};
+    subtasks:[],waves:[],review:null,events:[],reviewWanted:true,initRepo:false,attachments};
+  if(mode==='orquestar'){
+    // El arquitecto reanuda su sesión en la conversación; cada ocho tareas empieza una nueva para que no crezca sin fin.
+    const key='architect:'+provider,previous=store.data.runs.filter(candidate=>candidate.conversationId===conv.id&&candidate.mode==='orquestar').length;
+    run.orchestrator.sessionId=previous%8===0?null:(conv.sessions?.[key]||null);
+  }
   let manualNote='';
   if(mode==='manual'){
     const parsed=parseManualPlan(body.plan,{connections,maxSubtasks:MAX_SUBTASKS,runReadOnly:run.readOnly,people:membersOf(project)});
@@ -862,7 +1007,9 @@ function startRun(body){
   else run.orchestrator.model=typeof body.orchestrator?.model==='string'?body.orchestrator.model.slice(0,200):'';
   if(conv.title==='Nueva conversación')conv.title=prompt.slice(0,70);
   conv.updatedAt=now();
-  message(conv.id,'user',prompt+manualNote,{runId:run.id,...(mode==='manual'?{kind:'manual'}:{})});store.data.runs.push(run);
+  message(conv.id,'user',(display||prompt)+manualNote,{runId:run.id,...(mode==='manual'?{kind:'manual'}:{}),
+    ...(attachments.length?{attachments:attachments.map(upload=>({id:upload.id,name:upload.name,mime:upload.mime}))}:{})});
+  store.data.runs.push(run);
   const controller=new AbortController();active.set(run.id,controller);flush();
   setImmediate(()=>execute(run,controller).catch(e=>console.error(e)));
   return run;
@@ -895,7 +1042,7 @@ function startReview(body){
   const run=getRun(body.runId);
   if(active.has(run.id))throw new Error('Espera a que la tarea termine para revisarla de nuevo.');
   if(run.phase!=='done')throw new Error('Esta tarea todavía no ha terminado.');
-  if(run.mode==='directo')throw new Error('El modo directo no tiene revisión: sigue conversando.');
+  if(run.mode==='directo'||run.mode==='opinion')throw new Error('El modo directo no tiene revisión: sigue conversando.');
   const conv=store.conversation(run.conversationId),project=store.project(conv.projectId);
   project.path=folder(project.path);
   assertFolderFree(project);
@@ -917,7 +1064,7 @@ async function reviewAgain(run,controller){
   finally{await settle(run);}
 }
 
-async function bodyJson(req){let bytes=0,chunks=[];for await(const chunk of req){bytes+=chunk.length;if(bytes>1024*1024)throw new Error('La solicitud es demasiado grande.');chunks.push(chunk);}return JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');}
+async function bodyJson(req,limit=1024*1024){let bytes=0,chunks=[];for await(const chunk of req){bytes+=chunk.length;if(bytes>limit)throw new Error('La solicitud es demasiado grande.');chunks.push(chunk);}return JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');}
 function json(res,status,data,extra={}){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store',...extra});res.end(JSON.stringify(data));}
 
 const server=http.createServer(async(req,res)=>{
@@ -945,7 +1092,14 @@ const server=http.createServer(async(req,res)=>{
         return;
       }
       if(route==='/api/export'&&req.method==='GET')return json(res,200,store.data,{'Content-Disposition':'attachment; filename="mixto-copia.json"'});
-      const b=await bodyJson(req);
+      if(route==='/api/diff'&&req.method==='GET')return json(res,200,diffOf(url.searchParams.get('runId'),url.searchParams.get('subtaskId')));
+      if(route==='/api/changes'&&req.method==='GET'){
+        const project=store.project(url.searchParams.get('projectId'));
+        const changes=await projectChanges(project.path);
+        changesCache.set(project.id,{git:changes.git,files:changes.files.length,at:now()});
+        return json(res,200,{git:changes.git,files:changes.files,untracked:changes.untracked,diff:changes.diff,truncated:!!changes.truncated,parsed:parseDiff(changes.diff)});
+      }
+      const b=await bodyJson(req,route==='/api/upload'?9*1024*1024:1024*1024);
       if(route==='/api/connections'&&req.method==='POST'){void refreshConnections();return json(res,202,{ok:true});}
       if(route==='/api/memory-sync'&&req.method==='POST'){
         if(active.size)return json(res,409,{error:'Espera a que terminen las tareas activas para sincronizar.'});
@@ -1085,7 +1239,78 @@ const server=http.createServer(async(req,res)=>{
       }
       if(route.startsWith('/api/approvals/')&&req.method==='POST'){
         const a=approvals.get(route.split('/').pop());if(!a)throw new Error('Esta solicitud ya no está pendiente.');
-        a.resolve({allow:b.allow===true,answers:b.answers&&typeof b.answers==='object'?b.answers:{}});return json(res,200,{ok:true});
+        // «Permitir siempre»: el prefijo del comando pasa a la lista del proyecto y deja de preguntar.
+        if(b.remember===true&&b.allow===true&&a.public.command){
+          const project=projectOf(getRun(a.public.runId));
+          project.allowedCommands=cleanCommandList([...(project.allowedCommands||[]),commandPrefix(a.public.command)]);
+        }
+        a.resolve({allow:b.allow===true,answers:b.answers&&typeof b.answers==='object'?b.answers:{}});flush();return json(res,200,{ok:true});
+      }
+      if(/^\/api\/projects\/[^/]+\/settings$/.test(route)&&req.method==='POST'){
+        const project=store.project(route.split('/')[3]);
+        if(b.allowedCommands!==undefined){if(!Array.isArray(b.allowedCommands))throw new Error('Comandos permitidos: envía una lista.');project.allowedCommands=cleanCommandList(b.allowedCommands);}
+        flush();return json(res,200,{ok:true,allowedCommands:project.allowedCommands||[]});
+      }
+      if(route==='/api/steer'&&req.method==='POST')return json(res,202,await steerRun(b));
+      if(route==='/api/revert'&&req.method==='POST'){
+        const run=getRun(b.runId),project=projectOf(run);
+        if(active.has(run.id))throw new Error('Espera a que la tarea termine.');
+        const subtask=run.subtasks.find(candidate=>candidate.id===b.subtaskId);
+        const change=subtask?.patch||subtask?.diff;
+        if(!change?.file)throw new Error('Esta parte no dejó cambios que deshacer.');
+        const files=(Array.isArray(b.files)?b.files:[]).filter(file=>typeof file==='string'&&file.trim()).slice(0,200);
+        const applied=run.review?.integration?.applied||[];
+        if(subtask.patch&&!applied.includes(subtask.patch.file)){
+          // Parche aún sin integrar: excluir (o volver a incluir) archivos antes de aplicarlo.
+          const all=parseDiff(fs.readFileSync(change.file,'utf8')).map(file=>file.path);
+          const current=new Set(subtask.patchExcludes||[]);
+          for(const file of files.length?files:all){if(b.toggle===true&&current.has(file))current.delete(file);else current.add(file);}
+          subtask.patchExcludes=[...current];
+          flush();return json(res,200,{ok:true,excluded:subtask.patchExcludes});
+        }
+        if(subtask.reverted)throw new Error('Este turno ya se deshizo.');
+        const result=await revertPatch({projectPath:project.path,patchFile:change.file,includes:files});
+        if(!result.ok)throw new Error('No se pudo revertir: '+result.error);
+        let toplevel=run.snapshot?.toplevel;
+        if(!toplevel){try{toplevel=inspect(project.path).toplevel||project.path;}catch{toplevel=project.path;}}
+        for(const created of change.created||[]){
+          if(files.length&&!files.includes(created))continue;
+          try{fs.rmSync(path.join(toplevel,created),{force:true});}catch{}
+        }
+        if(files.length)subtask.revertedFiles=[...new Set([...(subtask.revertedFiles||[]),...files])];
+        else subtask.reverted=true;
+        pushEvent(run,files.length?`Revertido en tu carpeta: ${files.join(', ')}`:`Turno «${subtask.title}» deshecho en tu carpeta.`);
+        await refreshChanges(project);
+        flush();return json(res,200,{ok:true,reverted:subtask.reverted===true,revertedFiles:subtask.revertedFiles||[]});
+      }
+      if(route==='/api/exec'&&req.method==='POST'){const project=store.project(b.projectId);return json(res,202,execView(startExec(project,str(b.command,'Comando',2000))));}
+      if(route==='/api/exec/stop'&&req.method==='POST'){stopExec(store.project(b.projectId));return json(res,200,{ok:true});}
+      if(route==='/api/changes/refresh'&&req.method==='POST'){const project=store.project(b.projectId);await refreshChanges(project);return json(res,200,changesCache.get(project.id)||{git:false,files:0});}
+      if(route==='/api/commit/propose'&&req.method==='POST')return json(res,200,await proposeCommit(store.project(b.projectId),b));
+      if(route==='/api/commit'&&req.method==='POST'){
+        const project=store.project(b.projectId);
+        const result=await commitFiles({projectPath:project.path,message:str(b.message,'Mensaje de commit',5000),files:b.files});
+        await refreshChanges(project);return json(res,200,result);
+      }
+      if(route==='/api/push'&&req.method==='POST'){
+        const result=await pushBranch(store.project(b.projectId).path);
+        if(!result.ok)throw new Error('No se pudo enviar al remoto: '+result.error);
+        return json(res,200,result);
+      }
+      if(route==='/api/upload'&&req.method==='POST'){
+        const name=str(b.name,'Nombre',200).replace(/[\\/:*?"<>|]+/g,'_');
+        const mime=str(b.mime||'application/octet-stream','Tipo',100).toLowerCase();
+        if(!/^(image\/(png|jpeg|gif|webp)|text\/[\w.+-]+|application\/(pdf|json|xml))$/.test(mime))throw new Error('Tipo de archivo no admitido: imágenes PNG, JPEG, GIF o WebP, texto, PDF o JSON.');
+        const data=Buffer.from(String(b.data||''),'base64');
+        if(!data.length||data.length>6*1024*1024)throw new Error('El archivo debe pesar entre 1 byte y 6 MB.');
+        const dir=path.join(dataDir,'uploads');fs.mkdirSync(dir,{recursive:true});
+        const record={id:id(),name,mime,size:data.length,createdAt:now()};
+        record.path=path.join(dir,`${record.id}-${name}`);
+        fs.writeFileSync(record.path,data);
+        store.data.uploads.push(record);
+        // Se conservan los últimos 200 adjuntos; los archivos de los anteriores se borran.
+        while(store.data.uploads.length>200){const old=store.data.uploads.shift();try{fs.rmSync(old.path,{force:true});}catch{}}
+        flush();return json(res,201,{id:record.id,name:record.name,mime:record.mime,size:record.size});
       }
       return json(res,404,{error:'Acción no encontrada.'});
     }

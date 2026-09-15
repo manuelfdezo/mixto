@@ -40,6 +40,11 @@ const PLAN_LECTURA=fence({resumen:'Una sola consulta',subtareas:[{titulo:'Consul
 const RESPUESTA='Aquí tienes:\n```json\n{"respuesta":"Es un proyecto de prueba con `base.txt`. Ejemplo:\\n```js\\nconsole.log(1)\\n```\\nNada más."}\n```';
 const SUPERVISION_DETENER=fence({accion:'detener',subtarea:1,motivo:'Las dos sub-tareas tocan compartido.txt'});
 
+// Las marcas de espera y de permiso solo cuentan en la petición actual, no en el historial que Mixto adjunta.
+function request(text){
+  const at=text.lastIndexOf('PETICIÓN DEL USUARIO:');
+  return at>=0?text.slice(at):text;
+}
 function scripted(text){
   // Una corrección se detecta antes que nada: su prompt contiene la revisión, que a su vez contiene VEREDICTO.
   if(text.includes('CORRECCIÓN SOLICITADA')){
@@ -64,7 +69,7 @@ function scripted(text){
     return 'Sin duplicados ni contradicciones.\n\nVEREDICTO: INTEGRAR';
   }
   if(text.includes('CONSULTA:'))return 'base.txt contiene la palabra base.';
-  const file=/ARCHIVO:([\w.-]+)/.exec(text);
+  const file=/ARCHIVO:([\w.-]+)/.exec(request(text));
   if(file){
     // Written up front, then a slow "thinking" pause: this leaves a real window where the file is
     // visible on disk before the sub-task reports back, which is what the live supervisor polls for.
@@ -90,22 +95,27 @@ createInterface({input:process.stdin}).on('line',line=>{
    if(m.method==='account/rateLimits/read')send({id:m.id,result:LIMITS});
    if(m.method==='thread/start'||m.method==='thread/resume')send({id:m.id,result:{thread:{id:m.params.threadId||'native-codex'}}});
    if(m.method==='turn/start'){
-     prompt=m.params.input[0].text;send({id:m.id,result:{turn:{id:'turn1'}}});
+     const input=m.params.input||[];
+     prompt=input.filter(i=>i.type==='text').map(i=>i.text).join('\n');
+     const images=input.filter(i=>i.type==='localImage').length;
+     send({id:m.id,result:{turn:{id:'turn1'}}});
      if(prompt==='ERROR')return send({method:'turn/completed',params:{turn:{status:'failed',error:{message:'Fallo controlado'}}}});
-     if(prompt==='WAIT')return;
-     if(prompt==='PERMISSION')return send({id:99,method:'item/commandExecution/requestApproval',params:{threadId:'native-codex',turnId:'turn1',command:'echo test',cwd:process.cwd()}});
-     codexDone(scripted(prompt)||undefined);
+     if(prompt==='WAIT'||request(prompt).includes('WAIT-FOREVER'))return;
+     if(prompt==='PERMISSION'||request(prompt).includes('PERMISSION-CHECK'))return send({id:99,method:'item/commandExecution/requestApproval',params:{threadId:'native-codex',turnId:'turn1',command:'echo test',cwd:process.cwd()}});
+     codexDone((scripted(prompt)||'Respuesta verificada: áéñ')+(images?` [imágenes: ${images}]`:''));
    }
    if(m.id===99&&m.result)codexDone(m.result.decision==='accept'?'Permitido':'Rechazado');
  }else{
    if(m.type==='control_request'&&m.request.subtype==='initialize')send({type:'control_response',response:{subtype:'success',request_id:m.request_id,response:{models:MODELS.claude,account:{subscriptionType:'prueba'}}}});
    if(m.type==='user'){
-     prompt=m.message.content;
+     const content=m.message.content;
+     prompt=typeof content==='string'?content:content.filter(c=>c.type==='text').map(c=>c.text).join('\n');
+     const images=Array.isArray(content)?content.filter(c=>c.type==='image').length:0;
      send({type:'system',subtype:'init',session_id:'native-claude'});
      if(prompt==='ERROR')return send({type:'result',is_error:true,errors:['Fallo controlado']});
-     if(prompt==='WAIT')return;
-     if(prompt==='PERMISSION')return send({type:'control_request',request_id:'permission1',request:{subtype:'can_use_tool',tool_name:'Bash',input:{command:'echo test'}}});
-     const text=scripted(prompt)||'Respuesta verificada: áéñ';
+     if(prompt==='WAIT'||request(prompt).includes('WAIT-FOREVER'))return;
+     if(prompt==='PERMISSION'||request(prompt).includes('PERMISSION-CHECK'))return send({type:'control_request',request_id:'permission1',request:{subtype:'can_use_tool',tool_name:'Bash',input:{command:'echo test'}}});
+     const text=(scripted(prompt)||'Respuesta verificada: áéñ')+(images?` [imágenes: ${images}]`:'');
      send({type:'stream_event',event:{delta:{type:'text_delta',text:'Respuesta '}}});
      send({type:'assistant',message:{content:[{type:'text',text}]}});
      send({type:'result',is_error:false,result:text,session_id:'native-claude',usage:CLAUDE_USAGE,total_cost_usd:0.0123});

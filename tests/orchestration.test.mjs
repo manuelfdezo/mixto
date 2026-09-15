@@ -678,3 +678,167 @@ test('cooperación por git: dos Mixto sobre clones del mismo repositorio compart
   assert.equal(git(B.work,'status','--porcelain').trim(),'');
   await assert.rejects(A.call('cooperation/sync',{projectId:(await A.call('projects',{name:'Suelto',directoryName:'suelto',description:''})).id}),/no está activada/);
 });
+
+test('un comando permitido en el proyecto se aprueba solo, en Claude y en Codex, y «permitir siempre» lo aprende',async t=>{
+  const {call,until,project}=await boot(t,{delay:50});
+  const conversation=await call('conversations',{projectId:project.id});
+  const direct=(provider,prompt)=>call('run',{conversationId:conversation.id,prompt,readOnly:false,mode:'directo',orchestrator:{provider,model:provider==='claude'?'claude-fake':'codex-fake',effort:null}});
+  await direct('claude','PERMISSION-CHECK');
+  let state=await until(s=>s.approvals.length===1);
+  assert.equal(state.approvals[0].command,'echo test');
+  await call('approvals/'+state.approvals[0].id,{allow:true,remember:true});
+  state=await until(s=>['completed','error'].includes(runOf(s).status));
+  assert.equal(runOf(state).subtasks[0].text,'Permitido');
+  assert.deepEqual(state.projects.find(p=>p.id===project.id).allowedCommands,['echo test']);
+  await direct('codex','PERMISSION-CHECK');
+  state=await until(s=>s.runs.length===2&&['completed','error'].includes(runOf(s).status));
+  assert.equal(runOf(state).subtasks[0].text,'Permitido','la segunda vez no pregunta, tampoco a Codex');
+  assert.equal(state.approvals.length,0);
+  assert.match(runOf(state).subtasks.flatMap(s=>s.events).map(e=>e.text).join('\n'),/Comando permitido en el proyecto: echo test/);
+  await call('projects/'+project.id+'/settings',{allowedCommands:['npm test','  echo   test ','npm test']});
+  assert.deepEqual((await call('state')).projects.find(p=>p.id===project.id).allowedCommands,['npm test','echo test']);
+});
+
+test('el visor de cambios muestra el diff del turno y permite deshacerlo, por archivo o entero',async t=>{
+  const {call,work,until,project}=await boot(t,{delay:50});
+  const conversation=await call('conversations',{projectId:project.id});
+  const direct=prompt=>call('run',{conversationId:conversation.id,prompt,readOnly:false,mode:'directo',orchestrator:{provider:'claude',model:'claude-fake',effort:null}});
+  await direct('ARCHIVO:nuevo.txt');
+  let state=await until(s=>['completed','error'].includes(runOf(s).status));
+  let run=runOf(state);
+  assert.ok(run.snapshot,'el modo directo con escritura toma una instantánea');
+  assert.deepEqual(run.subtasks[0].diff.created,['nuevo.txt']);
+  const diff=await call(`diff?runId=${run.id}&subtaskId=${run.subtasks[0].id}`);
+  assert.equal(diff.source,'diff');assert.equal(diff.applied,true);assert.equal(diff.pending,false);
+  assert.equal(diff.created[0].path,'nuevo.txt');assert.match(diff.created[0].text,/^\+escrito por la sub-tarea nuevo\.txt/);
+  assert.equal(diff.summary.files,1);
+  await call('revert',{runId:run.id,subtaskId:run.subtasks[0].id,files:[]});
+  assert.equal(fs.existsSync(path.join(work,'nuevo.txt')),false,'deshacer el turno elimina el archivo que creó');
+  state=await call('state');run=runOf(state);
+  assert.equal(run.subtasks[0].reverted,true);
+  assert.equal(state.changes[project.id].files,0,'el resumen de cambios sin confirmar se actualiza');
+  await assert.rejects(call('revert',{runId:run.id,subtaskId:run.subtasks[0].id,files:[]}),/ya se deshizo/);
+  await direct('ARCHIVO:base.txt');
+  state=await until(s=>s.runs.length===2&&['completed','error'].includes(runOf(s).status));run=runOf(state);
+  assert.equal(fs.readFileSync(path.join(work,'base.txt'),'utf8'),'escrito por la sub-tarea base.txt\n');
+  const diff2=await call(`diff?runId=${run.id}&subtaskId=${run.subtasks[0].id}`);
+  assert.deepEqual(diff2.files.map(f=>[f.path,f.status,f.additions,f.deletions]),[['base.txt','modified',1,1]]);
+  await call('revert',{runId:run.id,subtaskId:run.subtasks[0].id,files:['base.txt']});
+  assert.equal(fs.readFileSync(path.join(work,'base.txt'),'utf8'),'base\n','git apply -R devuelve el archivo a como estaba');
+  assert.deepEqual(runOf(await call('state')).subtasks[0].revertedFiles,['base.txt']);
+});
+
+test('en un parche pendiente se pueden excluir archivos antes de integrar',async t=>{
+  const {call,work,until,project}=await boot(t,{delay:50});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'Dos archivos',readOnly:false,mode:'manual',orchestrator:{provider:'codex',model:'codex-fake',effort:null},
+    plan:{review:false,subtasks:[{title:'Uno',provider:'claude',model:'claude-fake',instructions:'ARCHIVO:uno.txt'},{title:'Dos',provider:'codex',model:'codex-fake',instructions:'ARCHIVO:dos.txt'}]}});
+  const run=runOf(await until(s=>['completed','error'].includes(runOf(s).status)));
+  const diff=await call(`diff?runId=${run.id}&subtaskId=${run.subtasks[0].id}`);
+  assert.equal(diff.source,'patch');assert.equal(diff.pending,true);
+  assert.deepEqual(diff.files.map(f=>[f.path,f.status]),[['uno.txt','added']]);
+  await call('revert',{runId:run.id,subtaskId:run.subtasks[0].id,files:['uno.txt'],toggle:true});
+  assert.deepEqual(runOf(await call('state')).subtasks[0].patchExcludes,['uno.txt']);
+  await call('revert',{runId:run.id,subtaskId:run.subtasks[0].id,files:['uno.txt'],toggle:true});
+  assert.deepEqual(runOf(await call('state')).subtasks[0].patchExcludes,[],'volver a incluir');
+  await call('revert',{runId:run.id,subtaskId:run.subtasks[0].id,files:['uno.txt'],toggle:true});
+  const result=await call('integrate',{runId:run.id});
+  assert.equal(result.applied.length,2);
+  assert.equal(fs.existsSync(path.join(work,'uno.txt')),false,'el archivo excluido no se integra');
+  assert.equal(fs.existsSync(path.join(work,'dos.txt')),true);
+});
+
+test('el terminal del proyecto ejecuta comandos, enseña la salida y se puede detener',async t=>{
+  const {call,until,project}=await boot(t,{delay:50});
+  await call('exec',{projectId:project.id,command:'echo hola-mixto'});
+  let state=await until(s=>s.execs[project.id]?.status==='finished');
+  assert.match(state.execs[project.id].output,/hola-mixto/);
+  assert.equal(state.execs[project.id].code,0);
+  await call('exec',{projectId:project.id,command:`"${process.execPath}" -e "setTimeout(()=>{},60000)"`});
+  await until(s=>s.execs[project.id]?.status==='running');
+  await assert.rejects(call('exec',{projectId:project.id,command:'echo otra'}),/Ya hay un comando/);
+  await call('exec/stop',{projectId:project.id});
+  state=await until(s=>s.execs[project.id]?.status!=='running');
+  assert.equal(state.execs[project.id].status,'stopped');
+});
+
+test('confirmar cambios: propuesta de mensaje con un agente, commit de lo elegido y push al remoto',async t=>{
+  const {call,work,project,bare}=await boot(t,{delay:50,remote:true});
+  fs.writeFileSync(path.join(work,'base.txt'),'cambiado\n');fs.writeFileSync(path.join(work,'extra.txt'),'nuevo\n');
+  const changes=await call(`changes?projectId=${project.id}`);
+  assert.deepEqual(changes.files.map(f=>[f.path,f.status]).sort(),[['base.txt','modified'],['extra.txt','untracked']]);
+  assert.match(changes.diff,/-base\n\+cambiado/);
+  assert.equal(changes.parsed[0].path,'base.txt');
+  const proposal=await call('commit/propose',{projectId:project.id,provider:'claude',model:'claude-fake',effort:null});
+  assert.equal(proposal.message,'Respuesta verificada: áéñ');
+  const committed=await call('commit',{projectId:project.id,message:'feat: cambio de prueba',files:['base.txt']});
+  assert.match(committed.hash,/^[0-9a-f]{7,}$/);
+  assert.match(git(work,'log','-1','--format=%s'),/feat: cambio de prueba/);
+  assert.equal(git(work,'status','--porcelain').trim(),'?? extra.txt','solo se confirmó lo elegido');
+  const pushed=await call('push',{projectId:project.id});
+  assert.equal(pushed.ok,true);
+  assert.match(git(bare,'log','-1','--format=%s','main'),/feat: cambio de prueba/);
+  await assert.rejects(call('commit',{projectId:project.id,message:'x',files:[]}),/al menos un archivo/);
+  assert.equal((await call('state')).changes[project.id].files,1);
+});
+
+test('segunda opinión: el otro agente revisa los cambios sin confirmar en solo lectura',async t=>{
+  const {call,work,until,project}=await boot(t,{delay:50});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'',mode:'opinion',orchestrator:{provider:'codex',model:'codex-fake'}});
+  let state=await until(s=>['completed','error'].includes(runOf(s).status));
+  assert.equal(runOf(state).status,'error');assert.match(runOf(state).error,/No hay cambios sin confirmar/);
+  fs.writeFileSync(path.join(work,'base.txt'),'cambiado\n');
+  await call('run',{conversationId:conversation.id,prompt:'Mira el manejo de errores',mode:'opinion',orchestrator:{provider:'codex',model:'codex-fake'}});
+  state=await until(s=>s.runs.length===2&&['completed','error'].includes(runOf(s).status));
+  const run=runOf(state);
+  assert.equal(run.status,'completed',run.error);assert.equal(run.mode,'opinion');assert.equal(run.readOnly,true);
+  assert.match(run.prompt,/Segunda opinión de Codex/);assert.match(run.prompt,/Mira el manejo de errores/);
+  assert.deepEqual(state.messages.filter(m=>m.runId===run.id).map(m=>m.kind||m.role),['user','opinion']);
+  assert.equal(run.subtasks[0].fixable,false);
+  assert.equal(fs.readFileSync(path.join(work,'base.txt'),'utf8'),'cambiado\n','no toca nada');
+});
+
+test('redirigir un turno en directo lo detiene y continúa la misma sesión con la nueva indicación',async t=>{
+  const {call,until,project}=await boot(t,{delay:50});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'WAIT-FOREVER',readOnly:true,mode:'directo',orchestrator:{provider:'claude',model:'claude-fake'}});
+  let state=await until(s=>runOf(s).status==='running');
+  const first=runOf(state);
+  await call('steer',{runId:first.id,prompt:'Mejor explícame base.txt'});
+  state=await until(s=>s.runs.length===2&&['completed','error'].includes(runOf(s).status));
+  const stopped=state.runs.find(r=>r.id===first.id),next=runOf(state);
+  assert.equal(stopped.status,'cancelled');assert.equal(stopped.stage,'Redirigido');assert.equal(stopped.error,null);
+  assert.equal(next.status,'completed',next.error);assert.equal(next.mode,'directo');
+  assert.match(next.prompt,/^REDIRECCIÓN/);
+  assert.equal(state.messages.find(m=>m.runId===next.id&&m.role==='user').content,'Mejor explícame base.txt','el mensaje visible es el tuyo, sin el prefijo');
+  await assert.rejects(call('steer',{runId:next.id,prompt:'x'}),/ya ha terminado/);
+});
+
+test('adjuntos: una imagen pegada llega a los dos agentes y queda en la carpeta de datos',async t=>{
+  const {call,until,project,dir}=await boot(t,{delay:50});
+  const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==','base64');
+  const up=await call('upload',{name:'captura.png',mime:'image/png',data:png.toString('base64')});
+  assert.ok(fs.existsSync(path.join(dir,'datos','uploads',`${up.id}-captura.png`)));
+  await assert.rejects(call('upload',{name:'x.exe',mime:'application/x-msdownload',data:'AA=='}),/no admitido/);
+  const conversation=await call('conversations',{projectId:project.id});
+  for(const provider of ['claude','codex']){
+    await call('run',{conversationId:conversation.id,prompt:'Qué ves',readOnly:true,mode:'directo',attachments:[up.id],orchestrator:{provider,model:provider==='claude'?'claude-fake':'codex-fake'}});
+    const state=await until(s=>['completed','error'].includes(runOf(s).status)&&runOf(s).orchestrator.provider===provider);
+    const run=runOf(state);
+    assert.equal(run.status,'completed',run.error);
+    assert.match(run.subtasks[0].text,/\[imágenes: 1\]/,`${provider} recibió la imagen`);
+    assert.deepEqual(state.messages.find(m=>m.runId===run.id&&m.role==='user').attachments.map(a=>a.name),['captura.png']);
+  }
+});
+
+test('el arquitecto reanuda su sesión en la misma conversación',async t=>{
+  const {call,until,project}=await boot(t,{delay:50,scenario:'directa'});
+  const conversation=await call('conversations',{projectId:project.id});
+  const ask=async n=>{await call('run',{conversationId:conversation.id,prompt:'¿Qué es esto?',readOnly:true,orchestrator:{provider:'claude',model:'claude-fake'}});return runOf(await until(s=>s.runs.length===n&&['completed','error'].includes(runOf(s).status)&&runOf(s).phase==='done'));};
+  const first=await ask(1);
+  assert.doesNotMatch(first.events.map(e=>e.text).join('\n'),/reanuda su sesión/);
+  assert.equal((await call('state')).conversations.find(c=>c.id===conversation.id).sessions['architect:claude'],'native-claude');
+  const second=await ask(2);
+  assert.match(second.events.map(e=>e.text).join('\n'),/reanuda su sesión/);
+});

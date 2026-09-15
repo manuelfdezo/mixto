@@ -32,6 +32,9 @@ function limitsHtml(p,c){
 let state,projectId,conversationId,orchestrator='codex',busy=false,lastMessages='',lastAgents='',lastMemory='',lastRun='',toastTimer;
 let planChoices={},initRepo=false;
 let mode='orquestar',manualRows=[],manualOptions={review:true,initRepo:false},manualVersion=0,lastManual='';
+let attachments=[],notifyEnabled=false,terminalOpen=false,lastTerminal='',conversationQuery='';
+const lastRunStates=new Map();
+const statusLabel={added:'nuevo',modified:'modificado',deleted:'eliminado',renamed:'renombrado',untracked:'nuevo'};
 let preferences;try{preferences=JSON.parse(localStorage.getItem('mixto-preferences')||'{}');}catch{preferences={};}
 const selections=preferences.models||{},efforts=preferences.efforts||{};
 projectId=preferences.projectId;conversationId=preferences.conversationId;
@@ -39,12 +42,13 @@ if(['codex','claude'].includes(preferences.orchestrator))orchestrator=preference
 if(['orquestar','directo','manual'].includes(preferences.mode))mode=preferences.mode;
 if(Array.isArray(preferences.manualDraft))manualRows=preferences.manualDraft.filter(r=>r&&typeof r==='object');
 if(preferences.manualOptions&&typeof preferences.manualOptions==='object')manualOptions={...manualOptions,...preferences.manualOptions};
+notifyEnabled=preferences.notify===true;terminalOpen=preferences.terminalOpen===true;
 
 async function api(route,body,method=body===undefined?'GET':'POST'){
   const response=await fetch('/api/'+route,{method,headers:body===undefined?{}:{'Content-Type':'application/json','X-Mixto-Client':'1'},...(body!==undefined?{body:JSON.stringify(body)}:{})});
   const data=await response.json();if(!response.ok)throw new Error(data.error||'No se pudo completar la acción.');return data;
 }
-function remember(){try{localStorage.setItem('mixto-preferences',JSON.stringify({projectId,conversationId,orchestrator,mode,models:selections,efforts,manualDraft:manualRows,manualOptions}));}catch{}}
+function remember(){try{localStorage.setItem('mixto-preferences',JSON.stringify({projectId,conversationId,orchestrator,mode,models:selections,efforts,manualDraft:manualRows,manualOptions,notify:notifyEnabled,terminalOpen}));}catch{}}
 function toast(text){$('#toast').textContent=text;$('#toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').hidden=true,5500);}
 const project=()=>state?.projects.find(p=>p.id===projectId);
 const conversation=()=>state?.conversations.find(c=>c.id===conversationId);
@@ -80,19 +84,50 @@ function welcome(){return `<div class="welcome"><div class="welcome-symbol"><spa
 function approvalHtml(a){
   const questions=a.details?.questions||[];
   const questionMode=a.kind==='question'||a.kind==='claude-question';
-  return `<section class="approval" data-approval="${esc(a.id)}"><h3>${esc(a.title)}</h3>${a.label?`<div class="metadata">${esc(a.label)}</div>`:''}${questionMode?questions.map((q,i)=>`<label class="question-label"><span>${esc(q.question||q.header)}</span>${q.options?.length?`<small class="muted">${q.options.map(o=>esc(o.label)).join(' · ')}</small>`:''}<input data-answer="${i}" placeholder="Tu respuesta" autocomplete="off"></label>`).join(''):`<pre>${esc(JSON.stringify(a.details,null,2))}</pre>`}<div class="approval-actions"><button class="primary-button" data-approval-allow="${esc(a.id)}">${questionMode?'Enviar respuesta':'Permitir esta vez'}</button><button class="secondary-button" data-approval-deny="${esc(a.id)}">${questionMode?'Omitir':'Rechazar'}</button></div></section>`;
+  return `<section class="approval" data-approval="${esc(a.id)}"><h3>${esc(a.title)}</h3>${a.label?`<div class="metadata">${esc(a.label)}</div>`:''}${questionMode?questions.map((q,i)=>`<label class="question-label"><span>${esc(q.question||q.header)}</span>${q.options?.length?`<small class="muted">${q.options.map(o=>esc(o.label)).join(' · ')}</small>`:''}<input data-answer="${i}" placeholder="Tu respuesta" autocomplete="off"></label>`).join(''):a.command?`<pre class="command">${esc(a.command)}</pre>`:`<pre>${esc(JSON.stringify(a.details,null,2))}</pre>`}<div class="approval-actions"><button class="primary-button" data-approval-allow="${esc(a.id)}">${questionMode?'Enviar respuesta':'Permitir esta vez'}</button>${a.command?`<button class="secondary-button" data-approval-always="${esc(a.id)}" title="Guarda el prefijo del comando en la lista de comandos permitidos del proyecto">Permitir siempre en este proyecto</button>`:''}<button class="secondary-button" data-approval-deny="${esc(a.id)}">${questionMode?'Omitir':'Rechazar'}</button></div></section>`;
 }
 
 function renderMessages(){
   const messages=state.messages.filter(m=>m.conversationId===conversationId);
   const approvals=state.approvals.filter(a=>state.runs.find(r=>r.id===a.runId)?.conversationId===conversationId);
-  const runUsage=state.runs.filter(r=>r.conversationId===conversationId).map(r=>r.usage);
+  const runUsage=state.runs.filter(r=>r.conversationId===conversationId).map(r=>[r.usage,r.phase,r.subtasks.map(s=>[!!s.patch,!!s.diff,s.reverted,s.revertedFiles,s.patchExcludes])]);
   const signature=JSON.stringify([conversationId,messages,approvals,runUsage]);
   if(signature===lastMessages)return;lastMessages=signature;
   const area=$('#messages'),bottom=area.scrollHeight-area.scrollTop-area.clientHeight<130;
-  area.innerHTML=(messages.length?messages.map(m=>`<article class="message ${m.role}"><div class="message-header">${m.role==='assistant'?`<span class="agent-avatar ${m.provider}">${symbols[m.provider]}</span><strong>${names[m.provider]}</strong>${m.stage?`<span class="message-stage">${esc(m.stage)}</span>`:''}`:'<strong>Tú</strong>'}<time>${new Date(m.createdAt).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'})}</time>${usageBadges(m)}</div><div class="message-content">${m.content?markdown(m.content):m.status==='streaming'?'<span class="typing">Preparando la respuesta</span>':''}</div>${m.error?`<div class="message-error">${esc(m.error)}</div>`:''}${m.content?`<div class="message-actions"><button data-copy="${m.id}">Copiar</button>${m.role==='assistant'?`<button data-remember="${m.id}">◇ Guardar recuerdo</button>`:''}</div>`:''}</article>`).join(''):welcome())+approvals.map(approvalHtml).join('');
+  area.innerHTML=(messages.length?messages.map(m=>`<article class="message ${m.role}"><div class="message-header">${m.role==='assistant'?`<span class="agent-avatar ${m.provider}">${symbols[m.provider]}</span><strong>${names[m.provider]}</strong>${m.stage?`<span class="message-stage">${esc(m.stage)}</span>`:''}`:'<strong>Tú</strong>'}<time>${new Date(m.createdAt).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'})}</time>${usageBadges(m)}</div><div class="message-content">${m.content?markdown(m.content):m.status==='streaming'?'<span class="typing">Preparando la respuesta</span>':''}</div>${m.attachments?.length?`<div class="message-attachments">${m.attachments.map(a=>`<span class="chip">${a.mime?.startsWith('image/')?'🖼':'📄'} ${esc(a.name)}</span>`).join('')}</div>`:''}${m.error?`<div class="message-error">${esc(m.error)}</div>`:''}${m.content?`<div class="message-actions"><button data-copy="${m.id}">Copiar</button>${m.role==='assistant'?`<button data-remember="${m.id}">◇ Guardar recuerdo</button>`:''}${changeActions(m)}</div>`:''}</article>`).join(''):welcome())+approvals.map(approvalHtml).join('');
   if(!messages.length)area.scrollTop=0;
   else if(bottom||approvals.length||messages.length<2)area.scrollTop=area.scrollHeight;
+}
+// Un mensaje de trabajo con cambios en archivos ofrece verlos y, si están en tu carpeta, deshacerlos.
+function changeOf(m){const run=state.runs.find(r=>r.id===m.runId);const subtask=run?.subtasks.find(s=>s.id===m.subtaskId);return subtask&&(subtask.patch||subtask.diff)?{run,subtask}:null;}
+function changeActions(m){
+  const found=changeOf(m);if(!found)return '';
+  const {run,subtask}=found;
+  const undo=subtask.diff&&!subtask.reverted&&run.phase==='done';
+  return `<button data-diff="${esc(run.id)}/${esc(subtask.id)}">Ver cambios</button>${undo?`<button data-undo="${esc(run.id)}/${esc(subtask.id)}">Deshacer este turno</button>`:''}`;
+}
+const diffLines=text=>String(text||'').split('\n').map(l=>{const cls=l.startsWith('+')&&!l.startsWith('+++')?'add':l.startsWith('-')&&!l.startsWith('---')?'del':l.startsWith('@@')?'hunk':/^(diff |index |--- |\+\+\+ |new file|deleted file|rename |similarity |Binary)/.test(l)?'meta':'';return `<span class="${cls}">${esc(l)}</span>`;}).join('\n');
+async function diffModal(runId,subtaskId){
+  let d;try{d=await api(`diff?runId=${encodeURIComponent(runId)}&subtaskId=${encodeURIComponent(subtaskId)}`);}catch(error){toast(error.message);return;}
+  const run=state.runs.find(r=>r.id===runId),subtask=run?.subtasks.find(s=>s.id===subtaskId);
+  const fileHtml=f=>{
+    const excluded=d.excluded.includes(f.path),reverted=d.reverted||d.revertedFiles.includes(f.path);
+    const action=d.pending?`<button type="button" class="secondary-button" data-diff-toggle="${esc(f.path)}">${excluded?'Volver a incluir':'Excluir de la integración'}</button>`:(d.source==='diff'&&d.applied&&!reverted?`<button type="button" class="secondary-button" data-diff-revert="${esc(f.path)}">Revertir este archivo</button>`:'');
+    return `<details class="diff-file ${excluded?'excluded':''}" ${f.status==='deleted'?'':'open'}><summary><span class="diff-status ${f.status}">${statusLabel[f.status]||f.status}</span> ${esc(f.path)} <span class="muted">+${f.additions} −${f.deletions}</span>${excluded?' <span class="pill">excluido</span>':''}${reverted?' <span class="pill">revertido</span>':''}</summary>${f.binary?'<p class="muted">Archivo binario.</p>':`<pre class="diff">${diffLines(f.text)}</pre>`}${action?`<div class="approval-actions">${action}</div>`:''}</details>`;
+  };
+  const createdHtml=c=>`<details class="diff-file" open><summary><span class="diff-status added">nuevo</span> ${esc(c.path)}${!c.exists?' <span class="pill">ya no existe</span>':''}</summary>${c.binary?'<p class="muted">Archivo binario.</p>':`<pre class="diff">${diffLines(c.text)}</pre>`}${c.exists&&d.source==='diff'&&!d.reverted&&!d.revertedFiles.includes(c.path)?`<div class="approval-actions"><button type="button" class="secondary-button" data-diff-revert="${esc(c.path)}">Eliminar este archivo</button></div>`:''}</details>`;
+  const note=d.pending?'Estos cambios esperan a integrarse: puedes excluir archivos antes de aplicar.':d.source==='diff'?(d.reverted?'Este turno se deshizo entero.':'Estos cambios ya están en tu carpeta.'):d.applied?'Estos cambios ya se integraron en tu carpeta.':'Estos cambios se descartaron.';
+  openModal(`Cambios · ${subtask?.title||''}`,`<p class="modal-note">${d.summary.files} archivo(s), +${d.summary.additions} −${d.summary.deletions}. ${note}</p>${d.files.map(fileHtml).join('')}${d.created.map(createdHtml).join('')}${d.source==='diff'&&d.applied&&!d.reverted?`<div class="approval-actions"><button type="button" class="danger-button" id="diff-undo-all">Deshacer todo el turno</button></div>`:''}`,'diff');
+  $('#modal-content').onclick=async e=>{
+    const b=e.target.closest('button');if(!b)return;
+    try{
+      if(b.dataset.diffToggle!==undefined)await api('revert',{runId,subtaskId,files:[b.dataset.diffToggle],toggle:true});
+      else if(b.dataset.diffRevert!==undefined)await api('revert',{runId,subtaskId,files:[b.dataset.diffRevert]});
+      else if(b.id==='diff-undo-all')await api('revert',{runId,subtaskId,files:[]});
+      else return;
+      lastMessages='';lastRun='';await load();diffModal(runId,subtaskId);toast('Hecho.');
+    }catch(error){toast(error.message);}
+  };
 }
 const catalogOf=provider=>state.connections[provider]?.models||[];
 const effortLevels=(provider,model)=>catalogOf(provider).find(m=>m.id===model)?.efforts||[];
@@ -300,11 +335,72 @@ function render(){
   $('#team-count').textContent=peopleOf(project()).length;
   refreshTeamModal();
   $('#project-name').textContent=project()?.name||'';$('#conversation-title').textContent=conversation()?.title||'Nueva conversación';
-  $('#conversations').innerHTML=state.conversations.filter(c=>c.projectId===projectId).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)).map(c=>`<button class="conversation-link ${c.id===conversationId?'active':''}" data-conversation="${c.id}"><span>◷</span><span>${esc(c.title)}</span></button>`).join('');
+  const q=conversationQuery.trim().toLowerCase();
+  const matches=c=>!q||c.title.toLowerCase().includes(q)||state.messages.some(m=>m.conversationId===c.id&&String(m.content||'').toLowerCase().includes(q));
+  $('#conversations').innerHTML=state.conversations.filter(c=>c.projectId===projectId&&matches(c)).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)).map(c=>`<button class="conversation-link ${c.id===conversationId?'active':''}" data-conversation="${c.id}"><span>◷</span><span>${esc(c.title)}</span></button>`).join('')||(q?'<p class="muted" style="padding:8px 12px;font-size:13px">Nada coincide.</p>':'');
   renderAgents();renderMemory();renderMessages();renderRun();renderManual();
   const run=activeRun();
-  $('#send').hidden=!!run;$('#cancel-run').hidden=!run;$('#send').disabled=busy;
+  const steerable=!!run&&run.mode==='directo'&&run.status==='running';
+  $('#send').hidden=!!run&&!steerable;$('#cancel-run').hidden=!run;$('#send').disabled=busy;
+  const other=orchestrator==='codex'?'claude':'codex';
+  $('#opinion-button').textContent=`Segunda opinión de ${names[other]}`;
+  const pending=state.changes?.[projectId];
+  $('#commit-button').hidden=!(pending?.git&&pending.files>0);
+  if(pending?.files)$('#commit-button').textContent=`Confirmar cambios (${pending.files})`;
+  $('#notify-toggle').classList.toggle('on',notifyEnabled);$('#terminal-toggle').classList.toggle('on',terminalOpen);
+  renderTerminal();checkNotifications();
   updateOrchestrator();remember();
+}
+// Terminal del proyecto: la salida se actualiza en sitio para no perder el foco del cuadro de comando.
+function renderTerminal(){
+  const panel=$('#terminal-panel');panel.hidden=!terminalOpen||!projectId;if(panel.hidden)return;
+  const exec=state.execs?.[projectId]||null,running=exec?.status==='running';
+  const tail=exec?esc(exec.output||'')+(running?'\n…':`\n[terminado${exec.code!==null&&exec.code!==undefined?` con código ${exec.code}`:''}${exec.status==='stopped'?', detenido':''}]`):'Sin comandos ejecutados todavía.';
+  if(panel.dataset.project===projectId&&panel.dataset.exec===(exec?.id||'')&&$('#terminal-output')){
+    $('#terminal-output').textContent='';$('#terminal-output').innerHTML=tail;$('#terminal-output').scrollTop=$('#terminal-output').scrollHeight;
+    $('#terminal-run').disabled=running;$('#terminal-stop').disabled=!running;$('#terminal-send').disabled=!exec?.output;return;
+  }
+  panel.dataset.project=projectId;panel.dataset.exec=exec?.id||'';
+  const quick=(project()?.allowedCommands||[]).slice(0,8).map(c=>`<button type="button" class="chip" data-quick="${esc(c)}">${esc(c)}</button>`).join('');
+  const current=$('#terminal-command')?.value||'';
+  panel.innerHTML=`<div class="terminal-head"><strong>Terminal del proyecto</strong><span class="muted">${esc(project()?.path||'')}</span></div><form id="terminal-form" class="terminal-form"><input id="terminal-command" placeholder="Comando a ejecutar en la carpeta del proyecto" autocomplete="off" value="${esc(current)}"><button id="terminal-run" class="primary-button" ${running?'disabled':''}>Ejecutar</button><button type="button" class="secondary-button" id="terminal-stop" ${running?'':'disabled'}>Detener</button><button type="button" class="secondary-button" id="terminal-send" ${exec?.output?'':'disabled'}>Pasar al mensaje</button></form>${quick?`<div class="chips">${quick}</div>`:''}<pre id="terminal-output" class="terminal-output">${tail}</pre>`;
+  $('#terminal-output').scrollTop=$('#terminal-output').scrollHeight;
+  $('#terminal-form').onsubmit=async e=>{e.preventDefault();const command=$('#terminal-command').value.trim();if(!command)return;try{await api('exec',{projectId,command});$('#terminal-command').value='';await load();}catch(error){toast(error.message);}};
+  $('#terminal-stop').onclick=async()=>{try{await api('exec/stop',{projectId});await load();}catch(error){toast(error.message);}};
+  $('#terminal-send').onclick=()=>{const e=state.execs?.[projectId];if(!e)return;const box=$('#prompt');box.value=(box.value?box.value+'\n\n':'')+`Salida de \`${e.command}\`:\n\`\`\`\n${e.output.slice(-6000)}\n\`\`\``;box.focus();box.dispatchEvent(new Event('input'));};
+  panel.querySelectorAll('[data-quick]').forEach(b=>{b.onclick=()=>{$('#terminal-command').value=b.dataset.quick;$('#terminal-form').requestSubmit();};});
+}
+// Avisos del sistema cuando algo cambia de estado y no estás mirando; el título lleva la cuenta de lo que espera.
+function checkNotifications(){
+  for(const run of state.runs){
+    const previous=lastRunStates.get(run.id);
+    if(previous!==undefined&&previous!==run.status&&document.hidden&&notifyEnabled&&['completed','error','cancelled','awaiting-plan','waiting'].includes(run.status)){
+      const title={'awaiting-plan':'Plan listo para aprobar',waiting:'Un agente necesita tu respuesta',completed:'Tarea terminada',error:'Tarea con errores',cancelled:'Tarea detenida'}[run.status];
+      try{new Notification(`Mixto · ${title}`,{body:run.prompt.slice(0,120)});}catch{}
+    }
+    lastRunStates.set(run.id,run.status);
+  }
+  // Una tarea en espera lo está por sus peticiones pendientes: se cuentan las peticiones, no la tarea otra vez.
+  const waiting=state.runs.filter(r=>r.status==='awaiting-plan').length+state.approvals.length;
+  document.title=(waiting?`(${waiting}) `:'')+'Mixto · Tu equipo, un espacio';
+}
+async function commitModal(){
+  if(!projectId)return;
+  openModal('Confirmar cambios','<p class="modal-note">Leyendo los cambios…</p>','commit');
+  let changes;try{changes=await api(`changes?projectId=${encodeURIComponent(projectId)}`);}catch(error){toast(error.message);closeModal();return;}
+  if(!changes.git){$('#modal-content').innerHTML='<p class="modal-note">La carpeta no es un repositorio git.</p>';return;}
+  if(!changes.files.length){$('#modal-content').innerHTML='<p class="modal-note">No hay cambios sin confirmar.</p>';return;}
+  const draw=message=>{
+    $('#modal-content').innerHTML=`<form id="commit-form"><label class="form-field"><span>Mensaje del commit</span><textarea name="message" rows="4" required placeholder="Qué cambia y por qué">${esc(message||'')}</textarea><small>${message?`Propuesto por ${names[orchestrator]} a partir del diff; edítalo si quieres. Mixto solo confirma cuando pulsas.`:'Escribe el mensaje o pide una propuesta. Mixto solo confirma cuando pulsas.'}</small></label><div class="commit-files">${changes.files.map(f=>`<label class="check-field"><input type="checkbox" name="files" value="${esc(f.path)}" checked> <span class="diff-status ${f.status}">${statusLabel[f.status]||f.status}</span> ${esc(f.path)}</label>`).join('')}</div>${changes.parsed?.length?`<details><summary class="muted">Ver diff</summary>${changes.parsed.map(f=>`<details class="diff-file"><summary>${esc(f.path)} <span class="muted">+${f.additions} −${f.deletions}</span></summary><pre class="diff">${diffLines(f.text)}</pre></details>`).join('')}</details>`:''}<div class="form-footer"><button type="button" class="secondary-button" id="commit-propose">${message?'Otra propuesta':`Proponer mensaje con ${names[orchestrator]}`}</button><button class="primary-button" value="commit">Confirmar</button><button class="primary-button" value="push">Confirmar y enviar</button></div></form>`;
+    $('#commit-propose').onclick=async()=>{const b=$('#commit-propose');b.disabled=true;b.textContent='Pensando…';try{const r=await api('commit/propose',{projectId,provider:orchestrator,model:selections[orchestrator],effort:efforts[orchestrator]||null});draw(r.message);}catch(error){toast(error.message);b.disabled=false;b.textContent='Proponer mensaje';}};
+    $('#commit-form').onsubmit=async e=>{
+      e.preventDefault();const form=e.target,files=[...form.querySelectorAll('input[name=files]:checked')].map(i=>i.value),message=form.elements.message.value.trim();
+      const push=e.submitter?.value==='push';
+      try{const r=await api('commit',{projectId,message,files});toast(`Commit ${r.hash} creado.`);if(push){await api('push',{projectId});toast('Commit creado y enviado al remoto.');}closeModal();await load();}
+      catch(error){toast(error.message);await load();}
+    };
+  };
+  draw('');
 }
 function updateOrchestrator(){
   const auto=state?.settings?.autoApproveSingle||state?.settings?.autoApproveReadOnly;
@@ -317,13 +413,50 @@ function updateOrchestrator(){
   $('#orchestrator-symbol').textContent=symbols[orchestrator];
   const select=$('#orchestrator');if(select.value!==orchestrator)select.value=orchestrator;
   const modeSelect=$('#mode');if(modeSelect.value!==mode)modeSelect.value=mode;
-  $('#prompt').placeholder=mode==='manual'?'Objetivo de la tarea: qué hay que conseguir en conjunto':mode==='directo'?`Habla con ${names[orchestrator]}`:'¿Qué vamos a hacer?';
+  const running=activeRun();
+  $('#prompt').placeholder=running?.mode==='directo'&&running.status==='running'?`Redirigir a ${names[running.orchestrator.provider]}: escribe y envía; se detiene y sigue con lo nuevo`:mode==='manual'?'Objetivo de la tarea: qué hay que conseguir en conjunto':mode==='directo'?`Habla con ${names[orchestrator]}`:'¿Qué vamos a hacer?';
 }
 async function load(){
   try{state=await api('state');$('#connection-error').hidden=true;render();}catch(e){$('#connection-error').hidden=false;}
 }
 $('#reload').onclick=()=>location.reload();
-$('#project-select').onchange=e=>{projectId=e.target.value;conversationId=null;lastMessages='';render();};
+$('#project-select').onchange=e=>{projectId=e.target.value;conversationId=null;lastMessages='';render();void api('changes/refresh',{projectId}).catch(()=>{});};
+$('#conversation-search').oninput=e=>{conversationQuery=e.target.value;render();};
+$('#terminal-toggle').onclick=()=>{terminalOpen=!terminalOpen;lastTerminal='';remember();render();if(terminalOpen)$('#terminal-command')?.focus();};
+$('#notify-toggle').onclick=async()=>{
+  if(!('Notification' in window)){toast('Este navegador no admite notificaciones.');return;}
+  if(!notifyEnabled){const permission=await Notification.requestPermission();if(permission!=='granted'){toast('El navegador no ha dado permiso para avisar.');return;}}
+  notifyEnabled=!notifyEnabled;remember();render();toast(notifyEnabled?'Te avisaré cuando una tarea termine o necesite algo y no estés mirando.':'Avisos desactivados.');
+};
+$('#commit-button').onclick=commitModal;
+$('#opinion-button').onclick=async()=>{
+  if(busy||activeRun())return;
+  const other=orchestrator==='codex'?'claude':'codex';
+  if(!projectId){toast('Crea o añade un proyecto antes de empezar.');return;}
+  if(!selections[other]){toast(`Conecta ${names[other]} desde Agentes antes de pedirle una opinión.`);return;}
+  busy=true;
+  try{
+    if(!conversationId){const c=await api('conversations',{projectId});conversationId=c.id;}
+    await api('run',{conversationId,prompt:$('#prompt').value.trim(),mode:'opinion',orchestrator:{provider:other,model:selections[other],effort:efforts[other]||null}});
+    $('#prompt').value='';lastMessages='';await load();
+  }catch(error){toast(error.message);}finally{busy=false;}
+};
+// Adjuntos: pegar, arrastrar o elegir; suben al servidor local y viajan con el siguiente mensaje.
+async function addFiles(files){
+  for(const file of files){
+    if(file.size>6*1024*1024){toast(`${file.name} pesa más de 6 MB.`);continue;}
+    const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]||'');reader.onerror=reject;reader.readAsDataURL(file);});
+    try{const up=await api('upload',{name:file.name||'imagen.png',mime:file.type||'application/octet-stream',data});attachments.push(up);renderAttachments();}
+    catch(error){toast(error.message);}
+  }
+}
+function renderAttachments(){const box=$('#attachments');box.hidden=!attachments.length;box.innerHTML=attachments.map(a=>`<span class="chip">${a.mime.startsWith('image/')?'🖼':'📄'} ${esc(a.name)} <button type="button" data-detach="${esc(a.id)}" aria-label="Quitar adjunto">×</button></span>`).join('');}
+$('#attachments').onclick=e=>{const b=e.target.closest('[data-detach]');if(b){attachments=attachments.filter(a=>a.id!==b.dataset.detach);renderAttachments();}};
+$('#attach-button').onclick=()=>$('#attach-input').click();
+$('#attach-input').onchange=e=>{addFiles([...e.target.files]);e.target.value='';};
+$('#prompt').addEventListener('paste',e=>{const files=[...(e.clipboardData?.files||[])];if(files.length){e.preventDefault();addFiles(files);}});
+$('#composer').addEventListener('dragover',e=>{e.preventDefault();});
+$('#composer').addEventListener('drop',e=>{e.preventDefault();addFiles([...(e.dataTransfer?.files||[])]);});
 $('#conversations').onclick=e=>{const b=e.target.closest('[data-conversation]');if(b){conversationId=b.dataset.conversation;lastMessages='';render();}};
 $('#new-conversation').onclick=()=>{conversationId=null;lastMessages='';render();$('#prompt').focus();};
 $('#orchestrator').onchange=e=>{orchestrator=e.target.value;lastAgents='';renderAgents();updateOrchestrator();lastManual='';renderManual();remember();};
@@ -372,10 +505,16 @@ $('#run-status').onclick=async e=>{
   }
 };
 $('#composer').onsubmit=async e=>{
-  e.preventDefault();if(busy||activeRun())return;
+  e.preventDefault();if(busy)return;
   const input=$('#prompt'),prompt=input.value.trim();if(!prompt)return;
+  const running=activeRun();
+  if(running){
+    // Un turno en directo se puede redirigir: se detiene y sigue en la misma sesión con lo nuevo.
+    if(running.mode==='directo'&&running.status==='running'){busy=true;try{await api('steer',{runId:running.id,prompt,attachments:attachments.map(a=>a.id)});attachments=[];renderAttachments();input.value='';input.style.height='';lastMessages='';await load();}catch(error){toast(error.message);}finally{busy=false;}}
+    return;
+  }
   if(!projectId){toast('Crea o añade un proyecto antes de empezar.');return;}
-  const body={prompt,readOnly:$('#read-only').checked,mode,orchestrator:{provider:orchestrator,model:selections[orchestrator],effort:efforts[orchestrator]||null}};
+  const body={prompt,readOnly:$('#read-only').checked,mode,attachments:attachments.map(a=>a.id),orchestrator:{provider:orchestrator,model:selections[orchestrator],effort:efforts[orchestrator]||null}};
   if(mode==='manual'){
     const rows=manualRows.map(r=>({title:(r.title||'').trim(),provider:r.provider,personId:r.personId||null,model:r.model,effort:r.effort||null,instructions:(r.instructions||'').trim(),scope:r.scope||'',readOnly:!!r.readOnly}));
     if(!rows.length||rows.some(r=>!r.title||!r.instructions)){toast('Cada sub-tarea necesita título e instrucciones.');return;}
@@ -389,6 +528,7 @@ $('#composer').onsubmit=async e=>{
     body.conversationId=conversationId;
     await api('run',body);
     if(mode==='manual'){seedManualRows();lastManual='';}
+    attachments=[];renderAttachments();
     input.value='';input.style.height='';lastMessages='';remember();await load();$('#messages').scrollTop=$('#messages').scrollHeight;
   }catch(error){toast(error.message);await load();}finally{busy=false;$('#send').disabled=false;}
 };
@@ -399,6 +539,10 @@ $('#messages').onclick=async e=>{
   const suggestion=e.target.closest('[data-suggestion]');if(suggestion){$('#prompt').value=suggestion.dataset.suggestion;$('#prompt').focus();return;}
   const copy=e.target.closest('[data-copy]');if(copy){try{await navigator.clipboard.writeText(state.messages.find(m=>m.id===copy.dataset.copy).content);toast('Respuesta copiada.');}catch{toast('No se pudo copiar. Selecciona el texto y cópialo.');}return;}
   const save=e.target.closest('[data-remember]');if(save){const m=state.messages.find(m=>m.id===save.dataset.remember);memoryForm({title:'Nota de '+names[m.provider],content:m.content.slice(0,12000)});return;}
+  const diff=e.target.closest('[data-diff]');if(diff){const [runId,subtaskId]=diff.dataset.diff.split('/');diffModal(runId,subtaskId);return;}
+  const undo=e.target.closest('[data-undo]');if(undo){const [runId,subtaskId]=undo.dataset.undo.split('/');try{await api('revert',{runId,subtaskId,files:[]});lastMessages='';lastRun='';await load();toast('Turno deshecho en tu carpeta.');}catch(error){toast(error.message);}return;}
+  const always=e.target.closest('[data-approval-always]');
+  if(always){try{await api('approvals/'+always.dataset.approvalAlways,{allow:true,remember:true});await load();toast('Comando permitido en este proyecto a partir de ahora.');}catch(error){toast(error.message);}return;}
   const approve=e.target.closest('[data-approval-allow]'),deny=e.target.closest('[data-approval-deny]');
   if(approve||deny){
     const key=approve?.dataset.approvalAllow||deny.dataset.approvalDeny;
@@ -557,7 +701,7 @@ function teamModal(){
 }
 $('#open-team').onclick=teamModal;
 function connectionsModal(){
-  openModal('Agentes',`<p class="modal-note">Mixto usa las sesiones de las herramientas instaladas. Aquí solo configuras lo necesario para orquestar.</p>${['codex','claude'].map(p=>{const c=state.connections[p],levels=effortLevels(p,selections[p]);return `<section class="connection-card"><h3><span class="agent-avatar ${p}">${symbols[p]}</span> ${names[p]}</h3><p>${c.loading?'Consultando conexión…':c.connected?'Conectado · '+esc(c.plan||c.authType):'Sin conexión'}</p>${limitsHtml(p,c)}${c.error?`<div class="message-error">${esc(c.error)}</div>`:''}${!c.connected?`<p>Inicia sesión con <code>${p==='codex'?'codex login':'claude auth login'}</code> y pulsa Actualizar.</p>`:''}${c.models.length?`<label class="form-field compact-field"><span>Modelo predeterminado</span><select data-agent-model="${p}">${modelOptions(p,selections[p])}</select><small>Cuando ${names[p]} orquesta, este modelo planifica y revisa: uno rápido abarata cada tarea. Los modelos potentes se eligen por sub-tarea en el plan.</small></label>${levels.length?`<label class="form-field compact-field"><span>Razonamiento</span><select data-agent-effort="${p}">${effortOptions(p,selections[p],efforts[p])}</select></label>`:''}`:''}</section>`;}).join('')}<form id="agent-settings"><label class="form-field"><span>Persona del arquitecto</span><select name="orchestratorPersona"><option value="">Sin persona</option>${state.personas.map(p=>`<option value="${esc(p.id)}" ${p.id===state.settings.orchestratorPersona?'selected':''}>${esc(p.name)}</option>`).join('')}</select><small>Añade unos 7.000 tokens de texto genérico a cada plan. Déjala en «Sin persona» salvo que la necesites.</small></label><label class="check-field"><input type="checkbox" name="autoApproveSingle" ${state.settings.autoApproveSingle?'checked':''}> Empezar sin pedir aprobación cuando el plan tiene una sola sub-tarea</label><label class="check-field"><input type="checkbox" name="autoApproveReadOnly" ${state.settings.autoApproveReadOnly?'checked':''}> Empezar sin pedir aprobación cuando todas las sub-tareas son de solo lectura</label><label class="form-field"><span>Tope de tokens por tarea (0 = sin tope)</span><input type="number" name="tokenBudget" min="0" step="1000" value="${Number(state.settings.tokenBudget)||0}"><small>Se comprueba al cerrar cada turno, así que puede excederse por un turno. Al superarlo la tarea se detiene y te lo dice; una corrección la reanuda.</small></label>${['codex','claude'].map(p=>`<label class="form-field"><span>Preferencias para ${names[p]}</span><textarea name="${p}Instructions" rows="3" maxlength="8000" placeholder="Cómo quieres que trabaje este agente…">${esc(state.settings[p+'Instructions'])}</textarea></label>`).join('')}<div class="form-footer"><button type="button" class="secondary-button" id="refresh-connections">Actualizar</button><button class="primary-button">Guardar</button></div></form>`,'connections');
+  openModal('Agentes',`<p class="modal-note">Mixto usa las sesiones de las herramientas instaladas. Aquí solo configuras lo necesario para orquestar.</p>${['codex','claude'].map(p=>{const c=state.connections[p],levels=effortLevels(p,selections[p]);return `<section class="connection-card"><h3><span class="agent-avatar ${p}">${symbols[p]}</span> ${names[p]}</h3><p>${c.loading?'Consultando conexión…':c.connected?'Conectado · '+esc(c.plan||c.authType):'Sin conexión'}</p>${limitsHtml(p,c)}${c.error?`<div class="message-error">${esc(c.error)}</div>`:''}${!c.connected?`<p>Inicia sesión con <code>${p==='codex'?'codex login':'claude auth login'}</code> y pulsa Actualizar.</p>`:''}${c.models.length?`<label class="form-field compact-field"><span>Modelo predeterminado</span><select data-agent-model="${p}">${modelOptions(p,selections[p])}</select><small>Cuando ${names[p]} orquesta, este modelo planifica y revisa: uno rápido abarata cada tarea. Los modelos potentes se eligen por sub-tarea en el plan.</small></label>${levels.length?`<label class="form-field compact-field"><span>Razonamiento</span><select data-agent-effort="${p}">${effortOptions(p,selections[p],efforts[p])}</select></label>`:''}`:''}</section>`;}).join('')}<form id="agent-settings"><label class="form-field"><span>Persona del arquitecto</span><select name="orchestratorPersona"><option value="">Sin persona</option>${state.personas.map(p=>`<option value="${esc(p.id)}" ${p.id===state.settings.orchestratorPersona?'selected':''}>${esc(p.name)}</option>`).join('')}</select><small>Añade unos 7.000 tokens de texto genérico a cada plan. Déjala en «Sin persona» salvo que la necesites.</small></label><label class="check-field"><input type="checkbox" name="autoApproveSingle" ${state.settings.autoApproveSingle?'checked':''}> Empezar sin pedir aprobación cuando el plan tiene una sola sub-tarea</label><label class="check-field"><input type="checkbox" name="autoApproveReadOnly" ${state.settings.autoApproveReadOnly?'checked':''}> Empezar sin pedir aprobación cuando todas las sub-tareas son de solo lectura</label><label class="form-field"><span>Comandos permitidos en ${esc(project()?.name||'este proyecto')} (uno por línea; «npm test» permite «npm test» y «npm test -- x»)</span><textarea name="allowedCommands" rows="3" placeholder="npm test&#10;npm run check&#10;git status">${esc((project()?.allowedCommands||[]).join('\n'))}</textarea><small>Los agentes ejecutan estos comandos sin preguntar, también el revisor. El botón «Permitir siempre» de cada petición los añade aquí.</small></label><label class="form-field"><span>Tope de tokens por tarea (0 = sin tope)</span><input type="number" name="tokenBudget" min="0" step="1000" value="${Number(state.settings.tokenBudget)||0}"><small>Se comprueba al cerrar cada turno, así que puede excederse por un turno. Al superarlo la tarea se detiene y te lo dice; una corrección la reanuda.</small></label>${['codex','claude'].map(p=>`<label class="form-field"><span>Preferencias para ${names[p]}</span><textarea name="${p}Instructions" rows="3" maxlength="8000" placeholder="Cómo quieres que trabaje este agente…">${esc(state.settings[p+'Instructions'])}</textarea></label>`).join('')}<div class="form-footer"><button type="button" class="secondary-button" id="refresh-connections">Actualizar</button><button class="primary-button">Guardar</button></div></form>`,'connections');
   $('#modal-content').onchange=e=>{
     const model=e.target.dataset.agentModel,effort=e.target.dataset.agentEffort;
     if(model){selections[model]=e.target.value;efforts[model]=defaultEffort(model,e.target.value)||'';lastAgents='';renderAgents();connectionsModal();}
@@ -566,7 +710,7 @@ function connectionsModal(){
   $('#agent-settings').onsubmit=async e=>{e.preventDefault();const form=new FormData(e.target);
     // Una casilla sin marcar no viaja en FormData: los booleanos se envían explícitamente.
     const body={orchestratorPersona:form.get('orchestratorPersona')||'',codexInstructions:form.get('codexInstructions')||'',claudeInstructions:form.get('claudeInstructions')||'',autoApproveSingle:form.has('autoApproveSingle'),autoApproveReadOnly:form.has('autoApproveReadOnly'),tokenBudget:Number(form.get('tokenBudget'))||0};
-    try{await api('settings',body);await load();toast('Preferencias guardadas.');}catch(error){toast(error.message);}};
+    try{await api('settings',body);if(projectId)await api('projects/'+projectId+'/settings',{allowedCommands:String(form.get('allowedCommands')||'').split('\n')});await load();toast('Preferencias guardadas.');}catch(error){toast(error.message);}};
   $('#refresh-connections').onclick=async()=>{
     const button=$('#refresh-connections');button.disabled=true;button.textContent='Consultando…';
     try{await api('connections',{});await load();let attempts=0;while(Object.values(state.connections).some(c=>c.loading)&&attempts++<50){await new Promise(r=>setTimeout(r,1000));await load();}if($('#modal').open&&$('#modal').dataset.type==='connections')connectionsModal();}catch(error){toast(error.message);button.disabled=false;}
@@ -587,6 +731,6 @@ function connectEvents(){
   events.addEventListener('state',e=>{try{state=JSON.parse(e.data);$('#connection-error').hidden=true;render();}catch{}});
   events.onerror=()=>{setTimeout(()=>{if(events?.readyState!==1)load();},1500);};
 }
-load();connectEvents();
+load().then(()=>{if(projectId)void api('changes/refresh',{projectId}).catch(()=>{});});connectEvents();
 setInterval(()=>{if(!document.hidden&&(!events||events.readyState!==1))load();},5000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)load();});
