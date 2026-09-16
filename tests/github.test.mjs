@@ -47,3 +47,25 @@ test('el usuario y los repositorios se leen de la API con paginación y errores 
   await assert.rejects(fetchViewer(sources,'malo',{fetchImpl:async()=>({ok:false,status:401})}),/no acepta el token/);
   await assert.rejects(fetchViewer(sources,'tok',{fetchImpl:async()=>({ok:false,status:500})}),/500/);
 });
+
+test('las pull requests, las comprobaciones y la creación de una PR se leen de la API',async()=>{
+  const {fetchPulls,fetchChecks,createPull,fetchRepoMeta}=await import('../lib/github.mjs');
+  const sources=githubSources({MIXTO_GITHUB_API:'http://api.test'});
+  const calls=[];
+  const fetchImpl=async(url,options)=>{
+    calls.push([options.method||'GET',url.replace('http://api.test',''),options.body]);
+    if(url.includes('/pulls?'))return {ok:true,status:200,json:async()=>[{number:7,title:'Añade el visor',user:{login:'ana'},draft:false,head:{ref:'visor'},base:{ref:'main'},updated_at:'2026-09-16T10:00:00Z',html_url:'https://github.com/a/b/pull/7'}]};
+    if(url.includes('/check-runs'))return {ok:true,status:200,json:async()=>({check_runs:[{name:'tests',status:'completed',conclusion:'success'},{name:'lint',status:'completed',conclusion:'failure'},{name:'build',status:'in_progress'}]})};
+    if(url.endsWith('/repos/a/b'))return {ok:true,status:200,json:async()=>({default_branch:'main',private:true,permissions:{push:true}})};
+    return {ok:true,status:201,json:async()=>({number:9,html_url:'https://github.com/a/b/pull/9',title:'Desde Mixto'})};
+  };
+  const pulls=await fetchPulls(sources,'tok','a/b',{fetchImpl});
+  assert.deepEqual(pulls,[{number:7,title:'Añade el visor',author:'ana',draft:false,head:'visor',base:'main',updatedAt:'2026-09-16T10:00:00Z',htmlUrl:'https://github.com/a/b/pull/7'}]);
+  assert.deepEqual(await fetchChecks(sources,'tok','a/b','abc',{fetchImpl}),{state:'failure',total:3,failed:['lint'],pending:1});
+  assert.deepEqual(await fetchRepoMeta(sources,'tok','a/b',{fetchImpl}),{defaultBranch:'main',private:true,pushable:true,htmlUrl:'https://github.com/a/b'});
+  const created=await createPull(sources,'tok','a/b',{title:'Desde Mixto',head:'rama',base:'main'},{fetchImpl});
+  assert.deepEqual(created,{number:9,htmlUrl:'https://github.com/a/b/pull/9',title:'Desde Mixto'});
+  assert.deepEqual(calls.at(-1),['POST','/repos/a/b/pulls',JSON.stringify({title:'Desde Mixto',body:'',head:'rama',base:'main'})]);
+  // Un fallo de red al leer las comprobaciones no rompe la vista.
+  assert.deepEqual(await fetchChecks(sources,'tok','a/b','abc',{fetchImpl:async()=>{throw new Error('red');}}),{state:'unknown',total:0,failed:[],pending:0});
+});

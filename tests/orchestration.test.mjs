@@ -1045,3 +1045,70 @@ test('Auto: Mixto elige agente, modelo y nivel en directo y en el reparto a mano
   await call('settings',{claudeSoftLimit:-5});
   assert.equal((await call('state')).settings.claudeSoftLimit,0,'un tope negativo se descarta');
 });
+
+test('el proyecto sigue al repositorio real: ve lo que empuja otra persona, se pone al día antes de trabajar y cambia de rama',async t=>{
+  const {call,until,project,work,bare,dir}=await boot(t,{delay:50,remote:true});
+  // Otra persona trabaja sobre el mismo repositorio y publica su commit.
+  const otro=path.join(dir,'otra-persona');
+  execFileSync('git',['clone','--quiet',bare,otro],{env:GIT_ENV});
+  git(otro,'config','user.name','Otra Persona');git(otro,'config','user.email','otra@example.invalid');
+  fs.writeFileSync(path.join(otro,'de-otro.txt'),'trabajo de otra persona\n');
+  git(otro,'add','.');git(otro,'commit','-q','-m','lo que hizo otra persona');git(otro,'push','-q','origin','main');
+  // Sin traer nada, el proyecto todavía no lo sabe; al comprobar el remoto, sí.
+  let repo=await call(`repo?projectId=${project.id}`);
+  assert.equal(repo.git,true);assert.equal(repo.branch,'main');assert.equal(repo.behind,0);assert.equal(repo.dirty,0);
+  assert.equal(repo.head.subject,'inicial');
+  repo=await call(`repo?projectId=${project.id}&fetch=1`);
+  assert.equal(repo.behind,1,'el commit del remoto se ve sin haberlo traído');
+  assert.deepEqual(repo.incoming.map(c=>[c.subject,c.author]),[['lo que hizo otra persona','Otra Persona']]);
+  assert.ok(repo.fetchedAt,'queda constancia de cuándo se comprobó');
+  assert.equal((await call('state')).repos[project.id].behind,1,'el estado en vivo llega a la interfaz');
+  // Una tarea se pone al día con el repositorio real antes de empezar.
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'CONSULTA: qué hay aquí',readOnly:true,mode:'directo',orchestrator:{provider:'claude',model:'claude-fake'}});
+  let state=await until(s=>['completed','error'].includes(runOf(s).status));
+  assert.equal(runOf(state).status,'completed',runOf(state).error);
+  assert.match(runOf(state).events.map(e=>e.text).join('\n'),/Puesto al día con origin\/main: 1 commit\(s\) nuevos \(lo que hizo otra persona\)/);
+  assert.equal(fs.readFileSync(path.join(work,'de-otro.txt'),'utf8'),'trabajo de otra persona\n','el trabajo de la otra persona ya está en la carpeta');
+  assert.equal((await call(`repo?projectId=${project.id}`)).behind,0);
+  // Con cambios sin confirmar no se trae nada a ciegas: se avisa y se sigue.
+  fs.writeFileSync(path.join(otro,'segundo.txt'),'otro más\n');
+  git(otro,'add','.');git(otro,'commit','-q','-m','segundo de otra persona');git(otro,'push','-q','origin','main');
+  fs.writeFileSync(path.join(work,'mio-sin-confirmar.txt'),'a medias\n');
+  await call('run',{conversationId:conversation.id,prompt:'CONSULTA: otra vez',readOnly:true,mode:'directo',orchestrator:{provider:'claude',model:'claude-fake'}});
+  state=await until(s=>s.runs.length===2&&['completed','error'].includes(runOf(s).status));
+  assert.match(runOf(state).events.map(e=>e.text).join('\n'),/hay cambios sin confirmar: no se traen solos/);
+  assert.equal(fs.existsSync(path.join(work,'segundo.txt')),false);
+  // Ramas: se listan, no se cambian con el árbol sucio, y una rama nueva sí se crea.
+  const branches=await call(`repo/branches?projectId=${project.id}`);
+  assert.equal(branches.current,'main');assert.deepEqual(branches.local,['main']);
+  // Un archivo seguido y modificado sí impide cambiar de rama; uno sin seguir, no (git lo lleva consigo).
+  fs.writeFileSync(path.join(work,'base.txt'),'base cambiada\n');
+  await assert.rejects(call('repo/switch',{projectId:project.id,branch:'otra',create:true}),/cambios sin confirmar/);
+  git(work,'checkout','--','base.txt');
+  fs.rmSync(path.join(work,'mio-sin-confirmar.txt'));
+  repo=await call('repo/switch',{projectId:project.id,branch:'arreglo-login',create:true});
+  assert.equal(repo.branch,'arreglo-login');
+  assert.equal(repo.upstream,null,'una rama nueva todavía no tiene remoto');
+  // Un commit propio queda pendiente de enviar y el push lo sube al repositorio real.
+  fs.writeFileSync(path.join(work,'arreglo.txt'),'arreglado\n');
+  await call('commit',{projectId:project.id,message:'arreglo del login',files:['arreglo.txt']});
+  repo=await call(`repo?projectId=${project.id}`);
+  assert.equal(repo.ahead,0,'sin rama remota no hay nada que comparar');
+  repo=await call('repo/push',{projectId:project.id});
+  assert.equal(repo.upstream,'origin/arreglo-login');assert.equal(repo.ahead,0);
+  assert.match(execFileSync('git',['-C',bare,'log','arreglo-login','-1','--pretty=%s'],{encoding:'utf8',env:GIT_ENV}),/arreglo del login/);
+  // El ajuste permite desactivar la puesta al día automática.
+  await call('settings',{autoPull:false});
+  assert.equal((await call('state')).settings.autoPull,false);
+});
+
+test('una carpeta sin git no rompe la vista del repositorio',async t=>{
+  const {call,dir}=await boot(t,{delay:50,noProject:true});
+  const plain=path.join(dir,'projects','sin-git');fs.mkdirSync(plain,{recursive:true});
+  const project=await call('projects',{name:'Sin git',directoryName:'sin-git'});
+  const repo=await call(`repo?projectId=${project.id}&fetch=1`);
+  assert.equal(repo.git,false);
+  assert.match(repo.reason,/no es un repositorio git/);
+  await assert.rejects(call('repo/pull',{projectId:project.id}),/remoto|repositorio/);
+});

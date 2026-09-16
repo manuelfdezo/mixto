@@ -17,6 +17,8 @@ import {openLedger,syncLedger,publishLedger,writeLedger,gitIdentity,STATUSES as 
 import {updateSources,checkUpdate,downloadUpdate,applyUpdate,compareVersions} from './lib/update.mjs';
 import {githubSources,applyAuth,clearAuth,parseRepoInput,fetchViewer,fetchRepos,cloneRepo,pullProject,hasRemote} from './lib/github.mjs';
 import {chooseAgent,routingSummary,claudeUsage} from './lib/routing.mjs';
+import {fetchPulls,fetchChecks,fetchRepoMeta,createPull} from './lib/github.mjs';
+import {repoState,fetchRemote,listBranches,switchBranch,pullFastForward,pushBranchUpstream,repoNote} from './lib/repo.mjs';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
 const VERSION=(()=>{try{return JSON.parse(fs.readFileSync(path.join(root,'package.json'),'utf8')).version||'0.0.0';}catch{return '0.0.0';}})();
@@ -416,7 +418,7 @@ function snapshot(conversationId=null,{all=conversationId===null}={}){
   const runs=all?data.runs:data.runs.map(run=>run.conversationId===conversationId?run:briefRun(run));
   return {...data,messages,runs,focus:all?undefined:conversationId,memories:sharedMemories(store.data),memorySync:memoryBridge.status,connections,personas:listPersonas(),
     approvals:[...approvals.values()].map(a=>a.public),execs:Object.fromEntries([...execs].map(([projectId,record])=>[projectId,execView(record)])),
-    changes:Object.fromEntries(changesCache),update,github:githubView(),quota:{claude:claudeUsage(store.data.messages)},app:{version:VERSION,workspace:root,
+    changes:Object.fromEntries(changesCache),repos:Object.fromEntries(repos),update,github:githubView(),quota:{claude:claudeUsage(store.data.messages)},app:{version:VERSION,workspace:root,
       projectsRoot:{path:managed.root,available:managed.available}}};
 }
 // GitHub: con un token guardado, git (el de Mixto, el de los agentes y el del terminal) lleva la autorización por entorno.
@@ -441,6 +443,58 @@ async function cloneFromGithub(body){
   project.github={fullName,htmlUrl:`${githubFrom.web}/${fullName}`};
   flush();void refreshChanges(project);
   return project;
+}
+// El repositorio en vivo de cada proyecto: estado de git (rama, adelanto, retraso, sin confirmar) y, si la
+// cuenta de GitHub está conectada, las pull requests abiertas y el estado de las comprobaciones. Se refresca
+// al abrir un proyecto, al terminar cada tarea y en segundo plano, para trabajar sobre el repositorio real.
+const repos=new Map();
+const repoBusy=new Set();
+const projectIsActive=project=>[...active.keys()].some(runId=>{try{return sameFolder(projectOf(getRun(runId)).path,project.path);}catch{return false;}});
+async function refreshRepo(project,{fetch:doFetch=false,remote:doRemote=true,force=false}={}){
+  if(!project||repoBusy.has(project.id))return repos.get(project.id)||null;
+  repoBusy.add(project.id);
+  try{
+    const previous=repos.get(project.id)||{};
+    let fetchedAt=previous.fetchedAt||null,fetchError=null;
+    if(doFetch&&(force||!projectIsActive(project))){
+      const result=await fetchRemote(project.path);
+      if(result.ok)fetchedAt=now();else fetchError=result.error;
+    }
+    const state=await repoState(project.path);
+    let pulls=previous.pulls||[],checks=previous.checks||null,pullsAt=previous.pullsAt||null;
+    const token=store.data.github?.token;
+    if(doRemote&&token&&state.fullName&&(!pullsAt||Date.now()-Date.parse(pullsAt)>120000)){
+      try{
+        pulls=await fetchPulls(githubFrom,token,state.fullName);
+        checks=state.head?await fetchChecks(githubFrom,token,state.fullName,state.head.hash):null;
+        pullsAt=now();
+      }catch(error){pulls=[];checks=null;pullsAt=now();fetchError=fetchError||error.message;}
+    }
+    if(!token||!state.fullName){pulls=[];checks=null;}
+    const view={...state,pulls,checks,pullsAt,fetchedAt,fetchError,at:now()};
+    repos.set(project.id,view);
+    notify();
+    return view;
+  }catch(error){
+    const view={git:false,reason:error.message,at:now()};
+    repos.set(project.id,view);return view;
+  }finally{repoBusy.delete(project.id);}
+}
+const repoView=projectId=>repos.get(projectId)||null;
+const repoPrompt=project=>{const view=repoView(project.id);return view?repoNote(view,{pulls:view.pulls||[]}):'';};
+// Antes de trabajar, el proyecto se pone al día con el repositorio real: solo cuando está limpio y solo
+// avance directo, para no mezclar nada a ciegas. Se puede desactivar en Ajustes.
+async function syncBeforeRun(run){
+  const project=projectOf(run);
+  if(store.data.settings.autoPull===false)return;
+  const state=await refreshRepo(project,{fetch:true,remote:false,force:true});
+  if(!state?.git||state.empty||!state.upstream||!state.behind)return;
+  if(state.dirty){pushEvent(run,`El repositorio tiene ${state.behind} commit(s) nuevos en ${state.upstream}, pero hay cambios sin confirmar: no se traen solos.`);return;}
+  const pulled=await pullFastForward(project.path);
+  if(pulled.ok){
+    pushEvent(run,`Puesto al día con ${state.upstream}: ${state.behind} commit(s) nuevos (${state.incoming.map(c=>c.subject).slice(0,2).join('; ')}).`);
+    await refreshRepo(project,{remote:false});
+  }else pushEvent(run,'No se pudieron traer los commits nuevos del remoto: '+pulled.error);
 }
 // Actualización desde la app: la versión publicada en GitHub, comprobada al arrancar y cada seis horas.
 const updateFrom=updateSources();
@@ -606,6 +660,7 @@ async function planPhase(run,controller){
   if(resumed)pushEvent(run,'El arquitecto reanuda su sesión de esta conversación.');
   let prompt=buildPlanPrompt({request:run.prompt,connections,memory,history:resumed?'':history,
     instructions,maxSubtasks:MAX_SUBTASKS,maxParallel:maxParallel(),readOnly:run.readOnly,people,balance:store.data.settings.balance||'auto',
+    repo:repoPrompt(projectOf(run)),
     routing:routingSummary({connections,messages:store.data.messages,settings:store.data.settings})});
   let parsed=null,sessionId,lastError;
   for(let attempt=0;attempt<2&&!parsed;attempt++){
@@ -722,10 +777,10 @@ async function runSubtask(run,subtask,controller,options=null){
     if(kind==='direct'){
       const prior=store.data.messages.filter(m=>m.conversationId===conv.id&&m.runId!==run.id&&m.status!=='error').slice(-12);
       const history=prior.map(m=>`${m.provider||m.role}: ${m.content}`).join('\n\n').slice(-24000);
-      prompt=buildDirectPrompt({request:run.prompt,memory,instructions,history,readOnly:subtask.readOnly,resumed:!!sessionId});
+      prompt=buildDirectPrompt({request:run.prompt,memory,instructions,history,readOnly:subtask.readOnly,resumed:!!sessionId,repo:repoPrompt(project)});
     } else {
       const teamNote=run.subtasks.filter(other=>other.human).map(other=>`- ${other.personName}: ${other.title}`).join('\n');
-      prompt=buildWorkPrompt({request:run.prompt,subtask,memory,instructions,context:run.plan.context,direct,teamNote});
+      prompt=buildWorkPrompt({request:run.prompt,subtask,memory,instructions,context:run.plan.context,direct,teamNote,repo:repoPrompt(project)});
     }
   }
   const providerOptions=sid=>({
@@ -968,11 +1023,12 @@ async function settle(run){
   flush();
   void syncMemory();
   void refreshLimits();
-  try{void refreshChanges(projectOf(run));}catch{}
+  try{const project=projectOf(run);void refreshChanges(project);void refreshRepo(project,{fetch:true});}catch{}
 }
 
 async function execute(run,controller){
   try{
+    if(run.mode!=='opinion')await syncBeforeRun(run).catch(error=>pushEvent(run,'No se pudo comprobar el repositorio: '+error.message));
     if(run.mode==='directo'||run.mode==='opinion'){await directPhase(run,controller);return;}
     let decision;
     if(run.mode==='manual'){decision={approve:true,initRepo:run.initRepo===true,subtasks:[]};run.status='running';run.stage='Preparando';flush();}
@@ -1248,6 +1304,7 @@ const server=http.createServer(async(req,res)=>{
         if(b.modelNotes!==undefined)store.data.settings.modelNotes=str(b.modelNotes,'Notas sobre modelos',4000,true);
         if(b.claudeSoftLimit!==undefined){const limit=Number(b.claudeSoftLimit);store.data.settings.claudeSoftLimit=Number.isFinite(limit)&&limit>0?Math.round(limit):0;}
         if(b.reviewPolicy!==undefined)store.data.settings.reviewPolicy=['multi','always','never'].includes(b.reviewPolicy)?b.reviewPolicy:'multi';
+        if(b.autoPull!==undefined)store.data.settings.autoPull=b.autoPull!==false;
         if(b.tokenBudget!==undefined){
           const budget=Number(b.tokenBudget);
           if(!Number.isFinite(budget)||budget<0)throw new Error('Tope de tokens: escribe un número de tokens, o 0 para no limitar.');
@@ -1267,6 +1324,52 @@ const server=http.createServer(async(req,res)=>{
       if(route==='/api/github/disconnect'&&req.method==='POST'){store.data.github=null;clearAuth();repoCache={at:0,repos:[]};flush();return json(res,200,githubView());}
       if(route==='/api/github/repos'&&req.method==='GET')return json(res,200,{repos:await githubRepos(url.searchParams.get('refresh')==='1')});
       if(route==='/api/github/clone'&&req.method==='POST')return json(res,201,await cloneFromGithub(b));
+      if(route==='/api/repo'&&req.method==='GET'){
+        const project=store.project(url.searchParams.get('projectId'));
+        return json(res,200,await refreshRepo(project,{fetch:url.searchParams.get('fetch')==='1'})||{git:false});
+      }
+      if(route==='/api/repo/branches'&&req.method==='GET')return json(res,200,await listBranches(store.project(url.searchParams.get('projectId')).path));
+      if(route==='/api/repo/switch'&&req.method==='POST'){
+        const project=store.project(b.projectId);
+        if(projectIsActive(project))throw new Error('Espera a que terminen las tareas de este proyecto para cambiar de rama.');
+        const result=await switchBranch(project.path,b.branch,{create:b.create===true,from:typeof b.from==='string'?b.from:''});
+        if(!result.ok)throw new Error(result.error);
+        await refreshChanges(project);
+        return json(res,200,await refreshRepo(project,{fetch:true}));
+      }
+      if(route==='/api/repo/pull'&&req.method==='POST'){
+        const project=store.project(b.projectId);
+        if(projectIsActive(project))throw new Error('Espera a que terminen las tareas de este proyecto.');
+        const fetched=await fetchRemote(project.path);
+        if(!fetched.ok)throw new Error('No se pudo contactar con el remoto: '+fetched.error);
+        const pulled=await pullFastForward(project.path);
+        if(!pulled.ok)throw new Error('No se pudieron traer los cambios: '+pulled.error);
+        await refreshChanges(project);
+        return json(res,200,await refreshRepo(project,{fetch:false}));
+      }
+      if(route==='/api/repo/push'&&req.method==='POST'){
+        const project=store.project(b.projectId);
+        const pushed=await pushBranchUpstream(project.path);
+        if(!pushed.ok)throw new Error('No se pudo enviar al remoto: '+pushed.error);
+        return json(res,200,await refreshRepo(project,{fetch:true}));
+      }
+      if(route==='/api/repo/pr'&&req.method==='POST'){
+        const project=store.project(b.projectId);
+        const token=store.data.github?.token;
+        if(!token)throw new Error('Conecta GitHub para abrir una pull request.');
+        const state=await repoState(project.path);
+        if(!state.git||!state.fullName)throw new Error('Este proyecto no apunta a un repositorio de GitHub.');
+        if(state.ahead||!state.upstream){
+          const pushed=await pushBranchUpstream(project.path);
+          if(!pushed.ok)throw new Error('No se pudo enviar la rama antes de abrir la pull request: '+pushed.error);
+        }
+        const meta=await fetchRepoMeta(githubFrom,token,state.fullName);
+        const base=str(b.base||meta.defaultBranch,'Rama base',200);
+        if(base===state.branch)throw new Error(`Estás en «${base}»: crea una rama antes de abrir una pull request.`);
+        const pull=await createPull(githubFrom,token,state.fullName,{title:str(b.title,'Título',200),body:str(b.body||'','Descripción',60000,true),head:state.branch,base});
+        await refreshRepo(project,{fetch:true});
+        return json(res,201,pull);
+      }
       if(route==='/api/pull'&&req.method==='POST'){
         const project=store.project(b.projectId);
         if([...active.keys()].some(runId=>{try{return sameFolder(projectOf(getRun(runId)).path,project.path);}catch{return false;}}))throw new Error('Espera a que terminen las tareas de este proyecto.');
@@ -1474,7 +1577,18 @@ const coopTimer=setInterval(()=>{
   }
 },60000);
 coopTimer.unref();
+// Cada dos minutos, un proyecto distinto se pone al día con su remoto: así el estado que ves (y el que
+// reciben los agentes) es el del repositorio real, no el del día que lo clonaste.
+let repoTurn=0;
+const repoTimer=setInterval(()=>{
+  const list=store.data.projects;
+  if(!list.length)return;
+  const project=list[repoTurn++%list.length];
+  if(!projectIsActive(project))void refreshRepo(project,{fetch:true}).catch(()=>{});
+},120000);
+repoTimer.unref();
 server.listen(port,'127.0.0.1',()=>{console.log(`Mixto · ${origin}`);void refreshConnections();void syncMemory();
+  for(const project of store.data.projects)void refreshRepo(project,{fetch:false}).catch(()=>{});
   for(const project of store.data.projects)if(coopEnabled(project))void coopSync(project,{fetch:true}).catch(()=>{});
   if(updateFrom.enabled){setTimeout(()=>void checkUpdates(),4000).unref();setInterval(()=>void checkUpdates(),6*60*60*1000).unref();}});
 let stopping=false;

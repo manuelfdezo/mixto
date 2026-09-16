@@ -10,7 +10,7 @@ App local para Windows que reúne **Claude Code y Codex** con proyectos, convers
 
 Si Windows muestra «Windows protegió tu PC» al abrir el archivo por primera vez, pulsa **Más información → Ejecutar de todas formas**: es la marca que llevan los archivos descargados de internet. No hace falta instalar nada a mano; si ya tienes Node.js 22 o posterior, Git, Codex o Claude Code, se usan tal cual.
 
-Para actualizar no hace falta descargar nada a mano: en **Agentes y ajustes → Aplicación** verás la versión instalada y, cuando haya una nueva, el botón **Actualizar**. Mixto comprueba la versión publicada en GitHub al arrancar y cada seis horas, y avisa con una marca en el botón de ajustes. Actualizar descarga el zip de la rama principal, sustituye los archivos de Mixto, guarda una copia de los anteriores en `.runtime/backup` y reinicia el servidor. Tus datos viven en `data` y `.runtime`, que nunca se tocan. Ahí mismo está **Descargar Mixto (zip)** para instalarlo en otro ordenador. Si clonaste el repositorio, `git pull` sigue funcionando igual.
+Para actualizar no hace falta descargar nada a mano: en **Ajustes → Aplicación** verás la versión instalada y, cuando haya una nueva, el botón **Actualizar**. Mixto comprueba la versión publicada en GitHub al arrancar y cada seis horas, y avisa con una marca en el botón de ajustes. Actualizar descarga el zip de la rama principal, sustituye los archivos de Mixto, guarda una copia de los anteriores en `.runtime/backup` y reinicia el servidor. Tus datos viven en `data` y `.runtime`, que nunca se tocan. Ahí mismo está **Descargar Mixto (zip)** para instalarlo en otro ordenador. Si clonaste el repositorio, `git pull` sigue funcionando igual.
 
 Si tu instalación es anterior a este botón, o algo impide actualizar desde la app, haz doble clic en **Actualizar-Mixto.cmd**: descarga la última versión, sustituye los archivos y abre Mixto. Abrir Mixto con archivos más nuevos que el servidor que sigue abierto también lo reinicia solo.
 
@@ -57,9 +57,24 @@ Lo que hace falta para que Mixto sea el sitio donde trabajas, no solo donde lanz
 - **Avisos y búsqueda.** El botón de la campana pide permiso al navegador para avisarte cuando una tarea termina, falla o necesita algo y no estás mirando; el título de la pestaña lleva la cuenta de lo que espera. La búsqueda de la barra lateral filtra las conversaciones por título y contenido.
 - **El arquitecto recuerda.** Dentro de una conversación, el agente principal reanuda su propia sesión nativa en cada tarea nueva: no vuelve a explorar la carpeta ni se le repite el historial. Cada ocho tareas la sesión se renueva para que no crezca sin límite, y si la herramienta ha olvidado la sesión se empieza otra sin que la tarea falle.
 
+### El repositorio, en vivo
+
+Un proyecto de Mixto no es una copia congelada del día que lo clonaste: **sigue al repositorio de verdad**. Bajo la cabecera hay una barra con lo que pasa ahora mismo:
+
+- **La rama** en la que estás. Púlsala para cambiar de rama o crear una nueva; Mixto no te deja si tienes archivos seguidos sin confirmar.
+- **↓ n nuevos · traer** cuando alguien ha empujado commits que tú no tienes. Al pasar el ratón ves quién y qué; al pulsar, se traen con avance directo.
+- **↑ n sin enviar** con tus commits pendientes, y el botón para subirlos.
+- **● n sin confirmar** con lo que tienes a medias en la carpeta.
+- **El estado de las comprobaciones (CI)** del último commit y **las pull requests abiertas**, leídos de GitHub con tu token.
+- **Abrir PR** cuando estás en una rama propia: Mixto envía la rama si hace falta y crea la pull request.
+
+Mixto comprueba el remoto al abrir el proyecto, cada minuto mientras lo tienes delante, al terminar cada tarea y en segundo plano para el resto de proyectos. **Antes de cada tarea**, si el remoto tiene commits nuevos y tu carpeta está limpia, se pone al día solo (solo avance directo) y lo dice en la conversación; si hay cambios sin confirmar, avisa y no toca nada. Se desactiva en **Ajustes → Este proyecto**.
+
+Los agentes siguen trabajando sobre archivos locales, que es la única forma de que puedan leerlos y editarlos, pero reciben ese estado escrito antes de empezar: en qué rama están, qué commits acaban de llegar, qué hay sin confirmar y qué pull requests hay abiertas. Así trabajan sobre el código real del repositorio, no sobre una foto vieja.
+
 ### GitHub
 
-Con el botón **GitHub** de la barra lateral (también en **Agentes y ajustes → GitHub**) pegas un token de acceso personal y Mixto queda conectado a tu cuenta. Crea el token en [github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new), elige los repositorios a los que quieras acceder y dale permiso de *Contents: Read and write* (o usa un token clásico con el ámbito `repo`). Se guarda solo en tu ordenador, en la carpeta `data`, y nunca llega al navegador; **Desconectar** lo borra.
+Con el botón **GitHub** de la barra lateral (también en **Ajustes → Aplicación → GitHub**) pegas un token de acceso personal y Mixto queda conectado a tu cuenta. Crea el token en [github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new), elige los repositorios a los que quieras acceder y dale permiso de *Contents: Read and write* (o usa un token clásico con el ámbito `repo`). Se guarda solo en tu ordenador, en la carpeta `data`, y nunca llega al navegador; **Desconectar** lo borra.
 
 Con la cuenta conectada, ese mismo botón y el **+** de proyectos muestran tus repositorios: buscas, pulsas **Clonar** y el repositorio se clona en tu carpeta de proyectos, ya listo para trabajar; también puedes pegar la URL de cualquier repositorio de GitHub. Junto a **Confirmar cambios** aparece **Traer cambios**, que hace `git pull --ff-only`, y **Confirmar y enviar** empuja con tu cuenta. La autorización se la da Mixto a git por variables de entorno, con el mismo mecanismo que usa GitHub Actions, así que también la heredan los agentes y el terminal del proyecto: pueden traer y enviar cambios sin que git pida credenciales. Los remotos por SSH siguen usando tus claves de siempre.
 
@@ -141,6 +156,10 @@ La sincronización ocurre al arrancar, al terminar tareas y cada 15 segundos cua
 El puente usa las interfaces públicas MCP e importación/exportación, nunca escribe directamente SQLite. La exportación nativa lee la base completa en un archivo temporal del usuario que se elimina al terminar; únicamente los proyectos asociados pasan a la caché local. No publica un servidor Engram adicional ni activa sincronización en la nube. Un cierre forzado del proceso puede dejar un archivo `mixto-transfer-*` en la carpeta temporal del usuario; elimínalo solo cuando Mixto esté cerrado.
 
 Si aparece un conflicto, compara la nota local con su versión en Engram y haz que título y contenido coincidan antes de reintentar. Para separar carpetas que Engram identifica con el mismo nombre, configura nombres distintos en Engram antes de la primera sincronización; no cambies una identidad ya migrada sin planificar su traslado.
+
+## Ajustes
+
+El botón **Agentes y ajustes** de la barra lateral abre cuatro pestañas: **Agentes** (modelo, razonamiento y preferencias de Claude Code y Codex), **Reparto y consumo** (quién hace cada trabajo, notas sobre modelos, topes de tokens, política de revisión), **Este proyecto** (comandos permitidos y puesta al día automática con el repositorio) y **Aplicación** (versión, actualizaciones y la cuenta de GitHub).
 
 ## Conexiones
 

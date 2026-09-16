@@ -117,3 +117,28 @@ button:focus-visible,a:focus-visible,.hint-button:focus-visible{outline:2px soli
   .composer-hint .hint-actions{order:2}
 }
 .run-status .approval-actions.static{position:static;box-shadow:none;border-top:0;padding:4px 0 10px;margin-top:4px}
+
+/* Barra del repositorio en vivo, bajo la cabecera. */
+.repo-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:7px clamp(22px,4vw,64px);border-bottom:1px solid #26272d;background:#17181c;font-size:12px}
+.repo-branch{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:#d2c6ff;background:#272233;border:1px solid #423a55;border-radius:6px;padding:3px 9px;cursor:pointer}
+.repo-branch:hover{background:#322a42}
+.repo-item{font-size:12px;color:#b7b8c1;border:1px solid #33343b;border-radius:6px;padding:3px 8px;background:#1f2025;white-space:nowrap}
+button.repo-item{cursor:pointer}
+button.repo-item:hover{background:#2a2b31;color:#fff}
+.repo-item.muted{border-color:transparent;background:none;color:#7f8391;padding-left:0;padding-right:0}
+.repo-item.behind{border-color:#4a5a86;color:#b8c8ef;background:#1c2233}
+.repo-item.ahead{border-color:#4d6b4f;color:#a9e3b0;background:#1a2620}
+.repo-item.dirty{border-color:#6b5a3a;color:#e6cfa7;background:#26221a}
+.repo-item.success{border-color:#3f6146;color:#a9e3b0}
+.repo-item.failure{border-color:#7a4340;color:#efb7b1;background:#2a1b1a}
+.repo-item.pending{border-color:#5a5468;color:#c5b5e7}
+.repo-spacer{flex:1}
+.repo-row a.secondary-button{text-decoration:none}
+@media(max-width:620px){.repo-bar{padding:6px 16px;gap:6px}.repo-item.muted{display:none}}
+/* Pestañas de los ajustes: cada cosa en su sitio en vez de una lista interminable. */
+.tabs{display:flex;gap:4px;flex-wrap:wrap;border-bottom:1px solid #2c2d32;margin:0 0 18px;padding-bottom:2px}
+.tabs .tab{font-size:13px;color:#a1a3b0;padding:7px 12px;border-radius:7px 7px 0 0;border:1px solid transparent;border-bottom:0;background:none;cursor:pointer}
+.tabs .tab:hover{color:#ededef;background:#1f2025}
+.tabs .tab.active{color:#d2c6ff;background:#231f2b;border-color:#3a3350}
+.tab-panel>.modal-note:first-child{margin-top:0}
+.check-field small{display:block;color:#8f919b;font-size:12px;margin-top:3px}

@@ -38,7 +38,7 @@ function limitsHtml(p,c){
 let state,projectId,conversationId,orchestrator='auto',busy=false,lastMessages='',lastAgents='',lastMemory='',lastRun='',toastTimer;
 let planChoices={},initRepo=false;
 let mode='directo',manualRows=[],manualOptions={review:true,initRepo:false},manualVersion=0,lastManual='';
-let updateNoticed=false,runCardCollapsed=false,quotaWarned=false,searchHits=null,searchTimer=null,newBelow=false,following=true,lastApprovalsHtml='';const messageNodes=new Map();
+let updateNoticed=false,settingsTab='agentes',repoTimer=null,lastRepoBar='',runCardCollapsed=false,quotaWarned=false,searchHits=null,searchTimer=null,newBelow=false,following=true,lastApprovalsHtml='';const messageNodes=new Map();
 let attachments=[],notifyEnabled=false,terminalOpen=false,lastTerminal='',conversationQuery='';
 const lastRunStates=new Map();
 const statusLabel={added:'nuevo',modified:'modificado',deleted:'eliminado',renamed:'renombrado',untracked:'nuevo'};
@@ -459,11 +459,85 @@ function render(){
   $('#update-count').hidden=!state.update?.available;
   $('#github-state').hidden=!state.github?.connected;
   if(state.update?.available&&!updateNoticed){updateNoticed=true;toast(`Hay una versión nueva de Mixto (${state.update.latest}). Actualiza desde Agentes y ajustes.`);}
-  renderTerminal();checkNotifications();
+  renderRepoBar();renderTerminal();checkNotifications();
   if(following&&conversationId)scrollMessagesToBottom();
   updateOrchestrator();remember();
 }
 // Terminal del proyecto: la salida se actualiza en sitio para no perder el foco del cuadro de comando.
+// El repositorio en vivo: rama, commits que faltan o sobran, trabajo sin confirmar, pull requests y CI.
+const agoText=iso=>{
+  if(!iso)return 'nunca';
+  const seconds=Math.max(0,Math.round((Date.now()-Date.parse(iso))/1000));
+  if(seconds<60)return 'hace segundos';
+  const minutes=Math.round(seconds/60);
+  return minutes<60?`hace ${minutes} min`:`hace ${Math.round(minutes/60)} h`;
+};
+const checkLabel={success:'✓ CI en verde',failure:'✕ CI en rojo',pending:'◌ CI en marcha',none:'',unknown:''};
+function renderRepoBar(){
+  const bar=$('#repo-bar'),repo=state.repos?.[projectId];
+  if(!projectId||!repo||!repo.git){bar.hidden=true;lastRepoBar='';return;}
+  const key=JSON.stringify([projectId,repo]);if(key===lastRepoBar)return;lastRepoBar=key;
+  bar.hidden=false;
+  if(repo.empty){bar.innerHTML=`<span class="repo-item muted">Repositorio sin commits todavía</span>`;return;}
+  const pulls=repo.pulls||[];
+  const checks=repo.checks&&checkLabel[repo.checks.state]?`<span class="repo-item ${repo.checks.state}" title="${repo.checks.failed?.length?'Falla: '+esc(repo.checks.failed.join(', ')):repo.checks.total+' comprobaciones'}">${checkLabel[repo.checks.state]}</span>`:'';
+  bar.innerHTML=`<button type="button" class="repo-branch" id="repo-branch" title="Cambiar de rama o crear una nueva">⎇ ${esc(repo.branch)}</button>`
+    +(repo.fullName?`<span class="repo-item muted" title="Repositorio de GitHub que sigue este proyecto">${esc(repo.fullName)}</span>`:'<span class="repo-item muted">sin remoto</span>')
+    +(repo.behind?`<button type="button" class="repo-item behind" id="repo-pull" title="${esc(repo.incoming.map(c=>c.short+' '+c.subject+' · '+c.author).join('\n'))}">↓ ${repo.behind} nuevo${repo.behind===1?'':'s'} · traer</button>`:'')
+    +(repo.ahead?`<button type="button" class="repo-item ahead" id="repo-push" title="Enviar tus commits al remoto">↑ ${repo.ahead} sin enviar</button>`:'')
+    +(repo.dirty?`<span class="repo-item dirty" title="Archivos con cambios sin confirmar">● ${repo.dirty} sin confirmar</span>`:'')
+    +checks
+    +(pulls.length?`<button type="button" class="repo-item" id="repo-pulls">${pulls.length} PR abierta${pulls.length===1?'':'s'}</button>`:'')
+    +(repo.fullName&&!repo.ahead&&!repo.behind&&repo.branch!=='main'&&repo.branch!=='master'?`<button type="button" class="repo-item" id="repo-pr">Abrir PR</button>`:'')
+    +`<span class="repo-spacer"></span><button type="button" class="repo-item muted" id="repo-refresh" title="${repo.fetchError?esc(repo.fetchError):'Comprobar el repositorio ahora'}">${repo.fetchError?'⚠ ':'⟳ '}${agoText(repo.fetchedAt)}</button>`;
+  $('#repo-branch').onclick=branchModal;
+  if($('#repo-pull'))$('#repo-pull').onclick=()=>repoAction('repo/pull','Proyecto al día con el remoto.');
+  if($('#repo-push'))$('#repo-push').onclick=()=>repoAction('repo/push','Commits enviados al remoto.');
+  if($('#repo-pr'))$('#repo-pr').onclick=pullRequestModal;
+  if($('#repo-pulls'))$('#repo-pulls').onclick=pullsModal;
+  $('#repo-refresh').onclick=()=>refreshRepoNow(true);
+}
+async function repoAction(route,okText){
+  try{const repo=await api(route,{projectId});state.repos={...state.repos,[projectId]:repo};lastRepoBar='';toast(okText);await load();}
+  catch(error){toast(error.message);}
+}
+async function refreshRepoNow(force=false){
+  if(!projectId)return;
+  try{const repo=await api(`repo?projectId=${encodeURIComponent(projectId)}${force?'&fetch=1':''}`);state.repos={...state.repos,[projectId]:repo};lastRepoBar='';renderRepoBar();}catch{}
+}
+async function branchModal(){
+  openModal('Ramas','<p class="modal-note">Leyendo las ramas…</p>','branches');
+  let data;try{data=await api(`repo/branches?projectId=${encodeURIComponent(projectId)}`);}catch(error){toast(error.message);closeModal();return;}
+  const row=(name,remote)=>`<div class="repo-row"><div><strong>${esc(name)}</strong>${name===data.current?' <span class="pill">aquí</span>':''}${remote?' <span class="muted">solo en el remoto</span>':''}</div>${name===data.current?'':`<button type="button" class="secondary-button" data-branch="${esc(name)}">Cambiar</button>`}</div>`;
+  $('#modal-content').innerHTML=`<p class="modal-note">Cambiar de rama mueve los archivos del proyecto; hace falta tener el trabajo confirmado.</p>
+    <div class="repo-list">${data.local.map(name=>row(name,false)).join('')}${data.remote.map(name=>row(name,true)).join('')}</div>
+    <form id="branch-form" class="terminal-form"><input name="name" placeholder="Nombre de una rama nueva, por ejemplo arreglo-login" autocomplete="off" required><button class="primary-button">Crear y cambiar</button></form>`;
+  $('#modal-content').onclick=async e=>{
+    const button=e.target.closest('[data-branch]');if(!button)return;
+    button.disabled=true;
+    try{const repo=await api('repo/switch',{projectId,branch:button.dataset.branch});state.repos={...state.repos,[projectId]:repo};lastRepoBar='';closeModal();await load();toast(`Ahora estás en ${button.dataset.branch}.`);}
+    catch(error){toast(error.message);button.disabled=false;}
+  };
+  $('#branch-form').onsubmit=async e=>{
+    e.preventDefault();const name=e.target.elements.name.value.trim();if(!name)return;
+    try{const repo=await api('repo/switch',{projectId,branch:name,create:true});state.repos={...state.repos,[projectId]:repo};lastRepoBar='';closeModal();await load();toast(`Rama ${name} creada.`);}
+    catch(error){toast(error.message);}
+  };
+}
+function pullsModal(){
+  const pulls=state.repos?.[projectId]?.pulls||[];
+  openModal('Pull requests abiertas',`<div class="repo-list">${pulls.map(pull=>`<div class="repo-row"><div><strong>#${pull.number} ${esc(pull.title)}</strong>${pull.draft?' <span class="pill">borrador</span>':''}<div class="muted">${esc(pull.author)} · ${esc(pull.head)} → ${esc(pull.base)} · ${agoText(pull.updatedAt)}</div></div><a class="secondary-button" href="${esc(pull.htmlUrl)}" target="_blank" rel="noopener">Ver en GitHub</a></div>`).join('')||'<p class="muted">Ninguna.</p>'}</div>`,'pulls');
+}
+function pullRequestModal(){
+  const repo=state.repos?.[projectId];if(!repo)return;
+  openModal('Abrir pull request',`<form id="pr-form"><p class="modal-note">Desde <strong>${esc(repo.branch)}</strong> hacia la rama principal de ${esc(repo.fullName||'')}. Mixto enviará la rama si hace falta.</p><label class="form-field"><span>Título</span><input name="title" required maxlength="200" value="${esc(repo.head?.subject||'')}"></label><label class="form-field"><span>Descripción (opcional)</span><textarea name="body" rows="4" maxlength="60000"></textarea></label><div class="form-footer"><button class="primary-button">Abrir pull request</button></div></form>`,'pr');
+  $('#pr-form').onsubmit=async e=>{
+    e.preventDefault();const button=e.target.querySelector('button');button.disabled=true;button.textContent='Abriendo…';
+    const values=Object.fromEntries(new FormData(e.target));
+    try{const pull=await api('repo/pr',{projectId,title:values.title,body:values.body});closeModal();toast(`Pull request #${pull.number} abierta.`);window.open(pull.htmlUrl,'_blank','noopener');await refreshRepoNow(true);}
+    catch(error){toast(error.message);button.disabled=false;button.textContent='Abrir pull request';}
+  };
+}
 function renderTerminal(){
   const panel=$('#terminal-panel');panel.hidden=!terminalOpen||!projectId;if(panel.hidden)return;
   const exec=state.execs?.[projectId]||null,running=exec?.status==='running';
@@ -537,7 +611,7 @@ async function load(){
 }
 function focusConversation(id){conversationId=id||null;lastMessages='';lastRun='';newBelow=false;connectEvents();}
 $('#reload').onclick=()=>location.reload();
-$('#project-select').onchange=e=>{projectId=e.target.value;focusConversation(null);lastMessages='';render();void api('changes/refresh',{projectId}).catch(()=>{});};
+$('#project-select').onchange=e=>{projectId=e.target.value;focusConversation(null);lastMessages='';lastRepoBar='';render();void api('changes/refresh',{projectId}).catch(()=>{});void refreshRepoNow(true);};
 $('#conversation-search').oninput=e=>{
   conversationQuery=e.target.value;searchHits=null;render();
   clearTimeout(searchTimer);const q=conversationQuery.trim();if(!q)return;
@@ -923,16 +997,48 @@ function bindAppSection(){
   };
 }
 function connectionsModal(){
-  openModal('Agentes y ajustes',`<p class="modal-note">Mixto usa las sesiones de las herramientas instaladas. Aquí solo configuras lo necesario para orquestar.</p>${['codex','claude'].map(p=>{const c=state.connections[p],levels=effortLevels(p,selections[p]);return `<section class="connection-card"><h3><span class="agent-avatar ${p}">${symbols[p]}</span> ${names[p]}</h3><p>${c.loading?'Consultando conexión…':c.connected?'Conectado · '+esc(c.plan||c.authType):'Sin conexión'}</p>${limitsHtml(p,c)}${c.error?`<div class="message-error">${esc(c.error)}</div>`:''}${!c.connected?`<p>Inicia sesión con <code>${p==='codex'?'codex login':'claude auth login'}</code> y pulsa Actualizar.</p>`:''}${c.models.length?`<label class="form-field compact-field"><span>Modelo predeterminado</span><select data-agent-model="${p}">${modelOptions(p,selections[p])}</select><small>Cuando ${names[p]} orquesta, este modelo planifica y revisa: uno rápido abarata cada tarea. Los modelos potentes se eligen por sub-tarea en el plan.</small></label>${levels.length?`<label class="form-field compact-field"><span>Razonamiento</span><select data-agent-effort="${p}">${effortOptions(p,selections[p],efforts[p])}</select></label>`:''}`:''}</section>`;}).join('')}${githubSectionHtml()}${appSectionHtml()}<form id="agent-settings"><label class="form-field"><span>Persona del arquitecto</span><select name="orchestratorPersona"><option value="">Sin persona</option>${state.personas.map(p=>`<option value="${esc(p.id)}" ${p.id===state.settings.orchestratorPersona?'selected':''}>${esc(p.name)}</option>`).join('')}</select><small>Añade unos 7.000 tokens de texto genérico a cada plan. Déjala en «Sin persona» salvo que la necesites.</small></label><label class="check-field"><input type="checkbox" name="autoApproveSingle" ${state.settings.autoApproveSingle?'checked':''}> Empezar sin pedir aprobación cuando el plan tiene una sola sub-tarea</label><label class="check-field"><input type="checkbox" name="autoApproveReadOnly" ${state.settings.autoApproveReadOnly?'checked':''}> Empezar sin pedir aprobación cuando todas las sub-tareas son de solo lectura</label><label class="form-field"><span>Comandos permitidos en ${esc(project()?.name||'este proyecto')} (uno por línea; «npm test» permite «npm test» y «npm test -- x»)</span><textarea name="allowedCommands" rows="3" placeholder="npm test&#10;npm run check&#10;git status">${esc((project()?.allowedCommands||[]).join('\n'))}</textarea><small>Los agentes ejecutan estos comandos sin preguntar, también el revisor. El botón «Permitir siempre» de cada petición los añade aquí.</small></label><label class="form-field"><span>Reparto del trabajo entre agentes</span><select name="balance"><option value="auto" ${state.settings.balance==='auto'||!state.settings.balance?'selected':''}>Equilibrado: decide el arquitecto</option><option value="claude" ${state.settings.balance==='claude'?'selected':''}>Prefiere Claude Code; Codex solo si aporta algo</option><option value="codex" ${state.settings.balance==='codex'?'selected':''}>Prefiere Codex; Claude Code solo si aporta algo</option></select><small>El plan sigue esta preferencia y, además, evita Codex cuando su cuota pasa del 70 %. La segunda opinión siempre usa el otro agente.</small></label><label class="form-field"><span>Revisión al terminar una tarea orquestada</span><select name="reviewPolicy"><option value="multi" ${state.settings.reviewPolicy==='multi'||!state.settings.reviewPolicy?'selected':''}>Solo con dos o más partes (menos turnos)</option><option value="always" ${state.settings.reviewPolicy==='always'?'selected':''}>Siempre</option><option value="never" ${state.settings.reviewPolicy==='never'?'selected':''}>Nunca: los cambios esperan a que los apliques tú</option></select><small>La revisión es un turno más del agente principal. Con una sola parte, «Ver cambios» y la segunda opinión suelen bastar.</small></label><label class="form-field"><span>Para qué es mejor cada modelo (el arquitecto y Auto lo tienen en cuenta)</span><textarea name="modelNotes" rows="4" maxlength="4000" placeholder="${esc(DEFAULT_MODEL_NOTES)}">${esc(state.settings.modelNotes||'')}</textarea><small>Vacío usa las notas de ejemplo que ves de fondo. Escribe aquí lo que hayas aprendido de cada modelo con tus proyectos.</small></label><label class="form-field"><span>Tope orientativo de Claude Code por 5 h (tokens; 0 = sin tope)</span><input type="number" name="claudeSoftLimit" min="0" step="10000" value="${Number(state.settings.claudeSoftLimit)||0}"><small>Claude Code no publica su cuota. Si fijas un tope, Mixto calcula un porcentaje con lo consumido en las últimas 5 h y Auto y el plan evitan Claude cuando se acerca. Consumido ahora: ${fmtTokens(state.quota?.claude?.tokens5h||0)} tokens en 5 h, ${fmtTokens(state.quota?.claude?.tokens7d||0)} en 7 días.</small></label><label class="form-field"><span>Tope de tokens por tarea (0 = sin tope)</span><input type="number" name="tokenBudget" min="0" step="1000" value="${Number(state.settings.tokenBudget)||0}"><small>Se comprueba al cerrar cada turno, así que puede excederse por un turno. Al superarlo la tarea se detiene y te lo dice; una corrección la reanuda.</small></label>${['codex','claude'].map(p=>`<label class="form-field"><span>Preferencias para ${names[p]}</span><textarea name="${p}Instructions" rows="3" maxlength="8000" placeholder="Cómo quieres que trabaje este agente…">${esc(state.settings[p+'Instructions'])}</textarea></label>`).join('')}<div class="form-footer"><button type="button" class="secondary-button" id="refresh-connections">Actualizar</button><button class="primary-button">Guardar</button></div></form>`,'connections');
+  const tabs=[['agentes','Agentes'],['reparto','Reparto y consumo'],['proyecto','Este proyecto'],['app','Aplicación']];
+  openModal('Ajustes',`<div class="tabs" id="settings-tabs">${tabs.map(([id,label])=>`<button type="button" class="tab ${settingsTab===id?'active':''}" data-tab="${id}">${label}</button>`).join('')}</div>
+  <div id="settings-extra" class="tab-panel" data-panel="app" ${settingsTab==='app'?'':'hidden'}>${githubSectionHtml()}${appSectionHtml()}</div>
+  <form id="agent-settings" ${settingsTab==='app'?'hidden':''}>
+    <div class="tab-panel" data-panel="agentes" ${settingsTab==='agentes'?'':'hidden'}>
+      <p class="modal-note">Mixto usa las sesiones de Claude Code y Codex ya instaladas; aquí solo eliges su modelo y cómo quieres que trabajen.</p>
+      ${['codex','claude'].map(p=>{const c=state.connections[p],levels=effortLevels(p,selections[p]);return `<section class="connection-card"><h3><span class="agent-avatar ${p}">${symbols[p]}</span> ${names[p]}</h3><p>${c.loading?'Consultando conexión…':c.connected?'Conectado · '+esc(c.plan||c.authType):'Sin conexión'}</p>${limitsHtml(p,c)}${c.error?`<div class="message-error">${esc(c.error)}</div>`:''}${!c.connected?`<p>Inicia sesión con <code>${p==='codex'?'codex login':'claude auth login'}</code> y pulsa Actualizar.</p>`:''}${c.models.length?`<label class="form-field compact-field"><span>Modelo predeterminado</span><select data-agent-model="${p}">${modelOptions(p,selections[p])}</select><small>Cuando ${names[p]} orquesta, este modelo planifica y revisa.</small></label>${levels.length?`<label class="form-field compact-field"><span>Razonamiento</span><select data-agent-effort="${p}">${effortOptions(p,selections[p],efforts[p])}</select></label>`:''}`:''}<label class="form-field compact-field"><span>Preferencias para ${names[p]}</span><textarea name="${p}Instructions" rows="3" maxlength="8000" placeholder="Cómo quieres que trabaje este agente…">${esc(state.settings[p+'Instructions'])}</textarea></label></section>`;}).join('')}
+    </div>
+    <div class="tab-panel" data-panel="reparto" ${settingsTab==='reparto'?'':'hidden'}>
+      <p class="modal-note">Quién hace cada trabajo y cuánto puede gastar.</p>
+      <label class="form-field"><span>Reparto del trabajo entre agentes</span><select name="balance"><option value="auto" ${state.settings.balance==='auto'||!state.settings.balance?'selected':''}>Equilibrado: decide Mixto</option><option value="claude" ${state.settings.balance==='claude'?'selected':''}>Prefiere Claude Code</option><option value="codex" ${state.settings.balance==='codex'?'selected':''}>Prefiere Codex</option></select><small>Auto y el plan siguen esta preferencia mientras a ese agente le quede cuota.</small></label>
+      <label class="form-field"><span>Para qué es mejor cada modelo</span><textarea name="modelNotes" rows="4" maxlength="4000" placeholder="${esc(DEFAULT_MODEL_NOTES)}">${esc(state.settings.modelNotes||'')}</textarea><small>Vacío usa las notas de ejemplo del fondo. Auto y el arquitecto las tienen en cuenta.</small></label>
+      <label class="form-field"><span>Tope orientativo de Claude Code por 5 h (tokens; 0 = sin tope)</span><input type="number" name="claudeSoftLimit" min="0" step="10000" value="${Number(state.settings.claudeSoftLimit)||0}"><small>Claude Code no publica su cuota. Consumido ahora: ${fmtTokens(state.quota?.claude?.tokens5h||0)} en 5 h, ${fmtTokens(state.quota?.claude?.tokens7d||0)} en 7 días.</small></label>
+      <label class="form-field"><span>Tope de tokens por tarea (0 = sin tope)</span><input type="number" name="tokenBudget" min="0" step="1000" value="${Number(state.settings.tokenBudget)||0}"><small>Al superarlo la tarea se detiene y te lo dice; una corrección la reanuda.</small></label>
+      <label class="form-field"><span>Revisión al terminar una tarea orquestada</span><select name="reviewPolicy"><option value="multi" ${state.settings.reviewPolicy==='multi'||!state.settings.reviewPolicy?'selected':''}>Solo con dos o más partes (menos turnos)</option><option value="always" ${state.settings.reviewPolicy==='always'?'selected':''}>Siempre</option><option value="never" ${state.settings.reviewPolicy==='never'?'selected':''}>Nunca</option></select></label>
+      <label class="check-field"><input type="checkbox" name="autoApproveSingle" ${state.settings.autoApproveSingle?'checked':''}> Empezar sin pedir aprobación cuando el plan tiene una sola parte</label>
+      <label class="check-field"><input type="checkbox" name="autoApproveReadOnly" ${state.settings.autoApproveReadOnly?'checked':''}> Empezar sin pedir aprobación cuando todas las partes son de solo lectura</label>
+      <label class="form-field"><span>Persona del arquitecto</span><select name="orchestratorPersona"><option value="">Sin persona</option>${state.personas.map(p=>`<option value="${esc(p.id)}" ${p.id===state.settings.orchestratorPersona?'selected':''}>${esc(p.name)}</option>`).join('')}</select><small>Añade unos 7.000 tokens a cada plan; déjala sin persona salvo que la necesites.</small></label>
+    </div>
+    <div class="tab-panel" data-panel="proyecto" ${settingsTab==='proyecto'?'':'hidden'}>
+      <p class="modal-note">Ajustes de <strong>${esc(project()?.name||'este proyecto')}</strong>.</p>
+      <label class="form-field"><span>Comandos permitidos (uno por línea; «npm test» permite «npm test -- x»)</span><textarea name="allowedCommands" rows="4" placeholder="npm test&#10;npm run check&#10;git status">${esc((project()?.allowedCommands||[]).join('\n'))}</textarea><small>Los agentes y el revisor los ejecutan sin preguntar. «Permitir siempre» los añade aquí.</small></label>
+      <label class="check-field"><input type="checkbox" name="autoPull" ${state.settings.autoPull!==false?'checked':''}> Ponerse al día con el repositorio antes de cada tarea<small>Si el remoto tiene commits nuevos y tu carpeta está limpia, Mixto los trae (solo avance directo) para que los agentes trabajen sobre el código real.</small></label>
+    </div>
+    <div class="form-footer"><button type="button" class="secondary-button" id="refresh-connections">Actualizar conexiones</button><button class="primary-button">Guardar</button></div>
+  </form>`,'connections');
   $('#modal-content').onchange=e=>{
     const model=e.target.dataset.agentModel,effort=e.target.dataset.agentEffort;
     if(model){selections[model]=e.target.value;efforts[model]=defaultEffort(model,e.target.value)||'';lastAgents='';renderAgents();connectionsModal();}
     if(effort){efforts[effort]=e.target.value;remember();}
   };
+  $('#settings-tabs').onclick=e=>{
+    const button=e.target.closest('[data-tab]');if(!button)return;
+    settingsTab=button.dataset.tab;
+    for(const tab of document.querySelectorAll('#settings-tabs .tab'))tab.classList.toggle('active',tab.dataset.tab===settingsTab);
+    for(const panel of document.querySelectorAll('#modal-content .tab-panel'))panel.hidden=panel.dataset.panel!==settingsTab;
+    $('#agent-settings').hidden=settingsTab==='app';
+  };
   bindAppSection();bindGithubSection();
   $('#agent-settings').onsubmit=async e=>{e.preventDefault();const form=new FormData(e.target);
     // Una casilla sin marcar no viaja en FormData: los booleanos se envían explícitamente.
-    const body={orchestratorPersona:form.get('orchestratorPersona')||'',codexInstructions:form.get('codexInstructions')||'',claudeInstructions:form.get('claudeInstructions')||'',autoApproveSingle:form.has('autoApproveSingle'),autoApproveReadOnly:form.has('autoApproveReadOnly'),tokenBudget:Number(form.get('tokenBudget'))||0};
+    const body={autoPull:form.get('autoPull')==='on',orchestratorPersona:form.get('orchestratorPersona')||'',codexInstructions:form.get('codexInstructions')||'',claudeInstructions:form.get('claudeInstructions')||'',autoApproveSingle:form.has('autoApproveSingle'),autoApproveReadOnly:form.has('autoApproveReadOnly'),tokenBudget:Number(form.get('tokenBudget'))||0};
     try{await api('settings',body);if(projectId)await api('projects/'+projectId+'/settings',{allowedCommands:String(form.get('allowedCommands')||'').split('\n')});await load();toast('Preferencias guardadas.');}catch(error){toast(error.message);}};
   $('#refresh-connections').onclick=async()=>{
     const button=$('#refresh-connections');button.disabled=true;button.textContent='Consultando…';
@@ -955,6 +1061,9 @@ function connectEvents(){
   events.addEventListener('state',e=>{try{state=JSON.parse(e.data);$('#connection-error').hidden=true;render();}catch{}});
   events.onerror=()=>{setTimeout(()=>{if(events?.readyState!==1)load();},1500);};
 }
-load().then(()=>{if(projectId)void api('changes/refresh',{projectId}).catch(()=>{});});connectEvents();
+load().then(()=>{if(projectId){void api('changes/refresh',{projectId}).catch(()=>{});void refreshRepoNow(true);}});connectEvents();
+// El repositorio del proyecto abierto se comprueba cada minuto: los commits de otros aparecen solos.
+repoTimer=setInterval(()=>{if(!document.hidden)void refreshRepoNow(true);},60000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)void refreshRepoNow(true);});
 setInterval(()=>{if(!document.hidden&&(!events||events.readyState!==1))load();},5000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)load();});
