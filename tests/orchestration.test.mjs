@@ -16,7 +16,7 @@ const git=(cwd,...args)=>execFileSync('git',['-C',cwd,...args],{windowsHide:true
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
 const GIT_ENV={...process.env,GIT_TERMINAL_PROMPT:'0'};
-async function boot(t,{delay=600,scenario,remote=false,cloneOf=null,identity={name:'Mixto Test',email:'test@example.invalid'},appRoot=root,env={},noProject=false}={}) {
+async function boot(t,{delay=600,scenario,remote=false,cloneOf=null,identity={name:'Mixto Test',email:'test@example.invalid'},appRoot=root,env={},noProject=false,reviewPolicy='always'}={}) {
   const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'mixto-orq-')));
   const projectsRoot=env.MIXTO_PROJECTS_ROOT||path.join(dir,'projects');if(!env.MIXTO_PROJECTS_ROOT)fs.mkdirSync(projectsRoot);
   const work=path.join(projectsRoot,'proyecto');
@@ -78,6 +78,8 @@ async function boot(t,{delay=600,scenario,remote=false,cloneOf=null,identity={na
   assert.ok(state.connections.claude.connected,'el agente falso no se reportó conectado: '+log);
   // Nunca usar el proyecto por defecto: apunta a la carpeta de Mixto, no a esta copia de prueba.
   const project=noProject?null:await call('projects',{name:'Proyecto de prueba',path:work,description:''});
+  // Las pruebas históricas cuentan con revisión en cada tarea; la política por defecto de la app se prueba aparte.
+  if(reviewPolicy)await call('settings',{reviewPolicy});
   return {call,refreshCookie,work,dir,project,origin,cookie,bare,log:()=>log,
     until:async predicate=>{
       for(let attempt=0;attempt<200;attempt++) {
@@ -961,4 +963,51 @@ test('la carpeta de proyectos se crea sola al arrancar, y crear o clonar un proy
   assert.deepEqual(state.app.projectsRoot,{path:fresh,available:true});
   const created=await call('projects',{name:'Nuevo',directoryName:'nuevo'});
   assert.equal(path.dirname(created.path),fresh);
+});
+
+test('política de revisión por defecto: una sola parte no paga revisión; dos partes sí; «nunca» deja los cambios a la espera',async t=>{
+  const {call,until,work}=await boot(t,{delay:50,scenario:'unica',reviewPolicy:'multi'});
+  const conversation=await call('conversations',{projectId:(await call('state')).projects[0].id});
+  const orchestrate=(prompt,provider='claude')=>call('run',{conversationId:conversation.id,prompt,readOnly:false,orchestrator:{provider,model:provider==='claude'?'claude-fake':'codex-fake',effort:'medium'}});
+  await orchestrate('Una sola parte');
+  let state=await until(s=>runOf(s).status==='awaiting-plan');
+  assert.equal(runOf(state).subtasks.length,1);
+  await call('plan',{runId:runOf(state).id,approve:true,subtasks:[]});
+  state=await until(s=>['completed','error'].includes(runOf(s).status));
+  assert.equal(runOf(state).status,'completed');
+  assert.equal(runOf(state).review,null,'sin revisión con una sola parte');
+  assert.equal(runOf(state).usage.turns,2,'plan y trabajo: dos turnos, no tres');
+  assert.match(runOf(state).events.map(e=>e.text).join('\n'),/Una sola parte: sin revisión automática/);
+  assert.equal(fs.existsSync(path.join(work,'solo.txt')),true,'el trabajo está en la carpeta');
+  await call('settings',{reviewPolicy:'never'});
+  assert.equal((await call('state')).settings.reviewPolicy,'never');
+  await call('settings',{reviewPolicy:'rara'});
+  assert.equal((await call('state')).settings.reviewPolicy,'multi','un valor desconocido vuelve al predeterminado');
+  await call('settings',{balance:'claude'});
+  assert.equal((await call('state')).settings.balance,'claude');
+});
+
+test('en consulta, Claude Code puede ejecutar un comando si tú lo permites; Codex no escala',async t=>{
+  const {call,until,project}=await boot(t,{delay:50});
+  const conversation=await call('conversations',{projectId:project.id});
+  await call('run',{conversationId:conversation.id,prompt:'PERMISSION-CHECK',readOnly:true,mode:'directo',orchestrator:{provider:'claude',model:'claude-fake'}});
+  let state=await until(s=>s.approvals.length===1);
+  assert.equal(state.approvals[0].command,'echo test');
+  await call('approvals/'+state.approvals[0].id,{allow:false});
+  state=await until(s=>['completed','error'].includes(runOf(s).status));
+  assert.equal(runOf(state).subtasks[0].text,'Rechazado');
+  await call('run',{conversationId:conversation.id,prompt:'PERMISSION-CHECK',readOnly:true,mode:'directo',orchestrator:{provider:'codex',model:'codex-fake'}});
+  state=await until(s=>s.runs.length===2&&['completed','error'].includes(runOf(s).status));
+  assert.equal(state.approvals.length,0,'Codex en consulta no pregunta');
+  assert.equal(runOf(state).subtasks[0].text,'Rechazado');
+});
+
+test('la preferencia de reparto y la cuota de Codex llegan al plan',async()=>{
+  const {buildPlanPrompt,balanceNote}=await import('../lib/orchestrator.mjs');
+  const connections={claude:{connected:true,models:[{id:'claude-fake'}]},codex:{connected:true,models:[{id:'codex-fake'}],limits:{windows:[{usedPercent:81,minutes:300},{usedPercent:20,minutes:10080}]}}};
+  const prompt=buildPlanPrompt({request:'x',connections,balance:'claude'});
+  assert.match(prompt,/prefiere que el trabajo lo haga Claude Code/);
+  assert.match(prompt,/CUOTA DE CODEX USADA: 81 % de 5 h, 20 % de 7 días\. Está cerca del límite/);
+  assert.equal(balanceNote('auto',{codex:{limits:null}}),'');
+  assert.doesNotMatch(buildPlanPrompt({request:'x',connections:{claude:{connected:true,models:[]}},balance:'auto'}),/PREFERENCIA DE REPARTO/);
 });

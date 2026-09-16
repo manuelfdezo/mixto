@@ -5,7 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {randomBytes} from 'node:crypto';
 import {spawn,execFile} from 'node:child_process';
 import {Store,id,now,memoryContext,sessionKey,rememberSession} from './lib/store.mjs';
-import {discover,runProvider,readLimits} from './lib/providers.mjs';
+import {discover,runProvider,readLimits,closeAllSessions} from './lib/providers.mjs';
 import {EngramBridge,sharedMemories,cleanupOrphanTransfers} from './lib/engram.mjs';
 import {buildPlanPrompt,parsePlan,parseManualPlan,assignWaves,buildReviewPrompt,readVerdict,PlanError,buildSupervisionPrompt,parseDecision,buildWorkPrompt,buildFixPrompt,buildDirectPrompt,buildSelfPrompt,buildOpinionPrompt,buildCommitPrompt,steerPrefix,HUMAN,HUMAN_STATUSES,humanStatusLabel,findPerson} from './lib/orchestrator.mjs';
 import {inspect,initRepository,createWorkspaces,createReviewWorkspace,capturePatch,checkPatches,applyPatches,removeWorkspaces,cleanupOrphanWorkspaces,snapshotProject,diffSince,parseDiff,revertPatch,projectChanges,commitFiles,pushBranch} from './lib/isolation.mjs';
@@ -604,7 +604,7 @@ async function planPhase(run,controller){
   const resumed=!!run.orchestrator.sessionId;
   if(resumed)pushEvent(run,'El arquitecto reanuda su sesión de esta conversación.');
   let prompt=buildPlanPrompt({request:run.prompt,connections,memory,history:resumed?'':history,
-    instructions,maxSubtasks:MAX_SUBTASKS,maxParallel:maxParallel(),readOnly:run.readOnly,people});
+    instructions,maxSubtasks:MAX_SUBTASKS,maxParallel:maxParallel(),readOnly:run.readOnly,people,balance:store.data.settings.balance||'auto'});
   let parsed=null,sessionId,lastError;
   for(let attempt=0;attempt<2&&!parsed;attempt++){
     const result=await orchestratorRun(run,{prompt,sessionId,controller,attachments:attempt===0?run.attachments:undefined,onText:text=>{current.content=text;touch();}});
@@ -730,6 +730,7 @@ async function runSubtask(run,subtask,controller,options=null){
     cwd:subtask.cwd,model:subtask.model,effort:subtask.effort,prompt,readOnly:subtask.readOnly,
     sessionId:sid,signal:controller.signal,onSession:next=>{subtask.sessionId=next;touch();},
     allowedTools:claudeAllowedTools(project.allowedCommands),allowCommand:allowCommandIn(project),attachments:kind==='direct'?run.attachments:undefined,
+    extraTools:subtask.readOnly?['Bash']:undefined,
     onText:text=>{current.content=text;touch();},
     onEvent:text=>{subtask.events.push({time:now(),text:String(text).slice(0,1500)});subtask.events=subtask.events.slice(-40);touch();},
     approve:request=>ask(run,subtask,request,controller.signal)
@@ -919,8 +920,12 @@ async function conclude(run,controller){
   if(controller.signal.aborted)throw new Error('Tarea detenida.');
   const agents=run.subtasks.filter(subtask=>!subtask.human);
   // Una tarea solo de personas no tiene nada que revisar todavía: se revisa cuando ellas terminen.
+  const policy=store.data.settings.reviewPolicy||'multi';
+  // En reparto a mano manda la casilla del usuario; en el resto, la política de revisión de los ajustes.
+  const skip=run.mode==='manual'?run.reviewWanted===false:(!run.reviewRequested&&(policy==='never'||(policy==='multi'&&agents.length<2)));
   if(!agents.length&&!run.reviewRequested)run.review=null;
-  else if(run.reviewWanted===false)await skipReview(run);else await reviewPhase(run,controller);
+  else if(skip){await skipReview(run);if(agents.length===1&&policy==='multi')pushEvent(run,'Una sola parte: sin revisión automática (ajustable en Agentes y ajustes). Usa «Ver cambios» o pide una segunda opinión.');}
+  else await reviewPhase(run,controller);
   const failed=agents.some(subtask=>subtask.status==='error');
   run.status=failed?'error':'completed';run.stage='Completado';run.error=null;
   if(failed)run.error='Alguna sub-tarea no pudo terminar. Revisa el informe antes de dar el trabajo por hecho.';
@@ -1225,6 +1230,8 @@ const server=http.createServer(async(req,res)=>{
           store.data.settings.orchestratorPersona=listPersonas().some(item=>item.id===persona)?persona:'';
         }
         for(const key of ['autoApproveSingle','autoApproveReadOnly'])if(b[key]!==undefined)store.data.settings[key]=b[key]===true;
+        if(b.balance!==undefined)store.data.settings.balance=['auto','claude','codex'].includes(b.balance)?b.balance:'auto';
+        if(b.reviewPolicy!==undefined)store.data.settings.reviewPolicy=['multi','always','never'].includes(b.reviewPolicy)?b.reviewPolicy:'multi';
         if(b.tokenBudget!==undefined){
           const budget=Number(b.tokenBudget);
           if(!Number.isFinite(budget)||budget<0)throw new Error('Tope de tokens: escribe un número de tokens, o 0 para no limitar.');
@@ -1459,6 +1466,7 @@ let stopping=false;
 function restart(){
   if(stopping)return;stopping=true;
   for(const c of active.values())c.abort();
+  closeAllSessions();
   flush();
   const logs=path.join(root,'.runtime');fs.mkdirSync(logs,{recursive:true});
   const out=fs.openSync(path.join(logs,'server.log'),'a'),err=fs.openSync(path.join(logs,'server-error.log'),'a');
@@ -1467,5 +1475,5 @@ function restart(){
   fs.closeSync(out);fs.closeSync(err);
   setTimeout(()=>{for(const client of clients.keys()){try{client.end();}catch{}}server.close();process.exit(0);},300);
 }
-function stop(){if(stopping)return;stopping=true;for(const c of active.values())c.abort();setTimeout(()=>{flush();for(const client of clients.keys()){try{client.end();}catch{}}server.close();process.exit(0);},750);}
+function stop(){if(stopping)return;stopping=true;for(const c of active.values())c.abort();closeAllSessions();setTimeout(()=>{flush();for(const client of clients.keys()){try{client.end();}catch{}}server.close();process.exit(0);},750);}
 process.on('SIGINT',stop);process.on('SIGTERM',stop);

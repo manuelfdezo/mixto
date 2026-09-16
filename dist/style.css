@@ -82,3 +82,12 @@ a.secondary-button{text-decoration:none;display:inline-flex;align-items:center}
   .dock{position:sticky;bottom:0;background:#141518;z-index:3;padding-top:4px;box-shadow:0 -10px 24px #141518}
   .scroll-down{position:fixed;bottom:150px}
 }
+
+/* La tarjeta de la tarea nunca tapa la conversación: altura máxima con desplazamiento propio, y se puede plegar. */
+.run-status{position:relative;max-height:min(34vh,340px);overflow:auto;padding-right:36px}
+.run-status.collapsed{max-height:none;overflow:visible}
+.run-status .approval-actions{position:sticky;bottom:0;background:#141518;padding:8px 0 2px;margin-top:8px}
+.card-toggle{position:absolute;top:6px;right:8px;width:24px;height:24px;border-radius:6px;border:1px solid #42384f;background:#1c1a22;color:#c5b5e7;font-size:13px;line-height:1;cursor:pointer}
+.card-toggle:hover{background:#2a2734}
+.quota-hint.warn{color:#f0b7a8;font-weight:600}
+@media(max-height:700px) and (min-width:621px){.run-status{max-height:26vh}}

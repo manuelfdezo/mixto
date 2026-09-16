@@ -1,4 +1,5 @@
 import test from 'node:test';
+import {closeAllSessions,liveSessions} from '../lib/providers.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -60,10 +61,26 @@ for(const provider of ['codex','claude']){
     const result=await runProvider(provider,opts('PERMISSION',{readOnly:false,approve:async()=>{asked++;return {allow:true};}}));
     assert.equal(asked,1);assert.equal(result.text,'Permitido');
   });
-  test(`${provider}: consulta no permite escaladas de escritura`,async()=>{
+  test(`${provider}: en consulta, Codex no escala y Claude pregunta antes de ejecutar un comando`,async()=>{
     let asked=0;
     const result=await runProvider(provider,opts('PERMISSION',{approve:async()=>{asked++;return {allow:true};}}));
-    assert.equal(asked,0);assert.equal(result.text,'Rechazado');
+    // Codex corre en su sandbox de solo lectura: una escalada se rechaza sin preguntar. Claude Code no tiene
+    // sandbox, así que un comando se le pregunta al usuario; sin herramientas de escritura no hay más escaladas.
+    if(provider==='codex'){assert.equal(asked,0);assert.equal(result.text,'Rechazado');}
+    else{assert.equal(asked,1);assert.equal(result.text,'Permitido');}
+  });
+  test(`${provider}: la sesión viva se reutiliza entre turnos y se cierra al apagar`,async()=>{
+    closeAllSessions();
+    const first=await runProvider(provider,opts('OK'));
+    assert.equal(first.sessionId,'native-'+provider);
+    assert.equal(liveSessions(),1,'el proceso queda vivo tras el turno');
+    const second=await runProvider(provider,opts('OK',{sessionId:first.sessionId}));
+    assert.equal(second.text,'Respuesta verificada: áéñ');
+    assert.equal(liveSessions(),1,'el segundo turno reutiliza el mismo proceso');
+    await runProvider(provider,opts('OK',{cwd:process.cwd()+'/tests',sessionId:first.sessionId}));
+    assert.equal(liveSessions(),2,'otra carpeta es otro proceso');
+    closeAllSessions();
+    assert.equal(liveSessions(),0);
   });
   test(`${provider}: detener una tarea libera la espera`,async()=>{
     const controller=new AbortController();const running=runProvider(provider,opts('WAIT',{signal:controller.signal}));
