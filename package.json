@@ -1,5 +1,5 @@
 {
-  "name": "mixto", "version": "1.6.1", "private": true, "type": "module",
+  "name": "mixto", "version": "1.6.2", "private": true, "type": "module",
   "description": "Claude Code y Codex con memoria compartida, en tu ordenador",
   "engines": { "node": ">=24" },
   "scripts": { "start": "node server.mjs", "test": "node --test --test-concurrency=1 tests/*.test.mjs", "check": "node --check server.mjs && node --check lib/providers.mjs && node --check lib/store.mjs && node --check lib/engram.mjs && node --check lib/orchestrator.mjs && node --check lib/isolation.mjs && node --check lib/projects.mjs && node --check lib/personas.mjs && node --check lib/supervisor.mjs && node --check lib/team.mjs && node --check lib/commands.mjs && node --check lib/zip.mjs && node --check lib/update.mjs && node --check lib/github.mjs && node --check dist/app.js" }

@@ -503,8 +503,8 @@ async function commitModal(){
   if(!changes.git){$('#modal-content').innerHTML='<p class="modal-note">La carpeta no es un repositorio git.</p>';return;}
   if(!changes.files.length){$('#modal-content').innerHTML='<p class="modal-note">No hay cambios sin confirmar.</p>';return;}
   const draw=message=>{
-    $('#modal-content').innerHTML=`<form id="commit-form"><label class="form-field"><span>Mensaje del commit</span><textarea name="message" rows="4" required placeholder="Qué cambia y por qué">${esc(message||'')}</textarea><small>${message?`Propuesto por ${names[orchestrator]} a partir del diff; edítalo si quieres. Mixto solo confirma cuando pulsas.`:'Escribe el mensaje o pide una propuesta. Mixto solo confirma cuando pulsas.'}</small></label><div class="commit-files">${changes.files.map(f=>`<label class="check-field"><input type="checkbox" name="files" value="${esc(f.path)}" checked> <span class="diff-status ${f.status}">${statusLabel[f.status]||f.status}</span> ${esc(f.path)}</label>`).join('')}</div>${changes.parsed?.length?`<details><summary class="muted">Ver diff</summary>${changes.parsed.map(f=>`<details class="diff-file"><summary>${esc(f.path)} <span class="muted">+${f.additions} −${f.deletions}</span></summary><pre class="diff">${diffLines(f.text)}</pre></details>`).join('')}</details>`:''}<div class="form-footer"><button type="button" class="secondary-button" id="commit-propose">${message?'Otra propuesta':`Proponer mensaje con ${names[orchestrator]}`}</button><button class="primary-button" value="commit">Confirmar</button><button class="primary-button" value="push">Confirmar y enviar</button></div></form>`;
-    $('#commit-propose').onclick=async()=>{const b=$('#commit-propose');b.disabled=true;b.textContent='Pensando…';try{const r=await api('commit/propose',{projectId,provider:orchestrator,model:selections[orchestrator],effort:efforts[orchestrator]||null});draw(r.message);}catch(error){toast(error.message);b.disabled=false;b.textContent='Proponer mensaje';}};
+    $('#modal-content').innerHTML=`<form id="commit-form"><label class="form-field"><span>Mensaje del commit</span><textarea name="message" rows="4" required placeholder="Qué cambia y por qué">${esc(message||'')}</textarea><small>${message?`Propuesto por ${names[concreteAgent()]} a partir del diff; edítalo si quieres. Mixto solo confirma cuando pulsas.`:'Escribe el mensaje o pide una propuesta. Mixto solo confirma cuando pulsas.'}</small></label><div class="commit-files">${changes.files.map(f=>`<label class="check-field"><input type="checkbox" name="files" value="${esc(f.path)}" checked> <span class="diff-status ${f.status}">${statusLabel[f.status]||f.status}</span> ${esc(f.path)}</label>`).join('')}</div>${changes.parsed?.length?`<details><summary class="muted">Ver diff</summary>${changes.parsed.map(f=>`<details class="diff-file"><summary>${esc(f.path)} <span class="muted">+${f.additions} −${f.deletions}</span></summary><pre class="diff">${diffLines(f.text)}</pre></details>`).join('')}</details>`:''}<div class="form-footer"><button type="button" class="secondary-button" id="commit-propose">${message?'Otra propuesta':`Proponer mensaje con ${names[concreteAgent()]}`}</button><button class="primary-button" value="commit">Confirmar</button><button class="primary-button" value="push">Confirmar y enviar</button></div></form>`;
+    $('#commit-propose').onclick=async()=>{const b=$('#commit-propose');b.disabled=true;b.textContent='Pensando…';try{const agent=concreteAgent();const r=await api('commit/propose',{projectId,provider:agent,model:selections[agent],effort:efforts[agent]||null});draw(r.message);}catch(error){toast(error.message);b.disabled=false;b.textContent='Proponer mensaje';}};
     $('#commit-form').onsubmit=async e=>{
       e.preventDefault();const form=e.target,files=[...form.querySelectorAll('input[name=files]:checked')].map(i=>i.value),message=form.elements.message.value.trim();
       const push=e.submitter?.value==='push';
@@ -551,6 +551,11 @@ $('#notify-toggle').onclick=async()=>{
 };
 $('#commit-button').onclick=commitModal;
 $('#pull-button').onclick=async()=>{const b=$('#pull-button');b.disabled=true;try{const r=await api('pull',{projectId});toast(r.output||'Proyecto al día con el remoto.');await load();}catch(error){toast(error.message);}finally{b.disabled=false;}};
+// Un agente concreto para acciones puntuales cuando el principal es Auto: el conectado, Claude Code si hay los dos.
+function concreteAgent(){
+  if(orchestrator==='claude'||orchestrator==='codex')return orchestrator;
+  return state?.connections?.claude?.connected&&selections.claude?'claude':'codex';
+}
 function otherAgent(){
   if(orchestrator==='codex')return 'claude';
   if(orchestrator==='claude')return 'codex';
@@ -648,7 +653,9 @@ $('#composer').onsubmit=async e=>{
     if(!rows.length||rows.some(r=>!r.title||!r.instructions)){toast('Cada sub-tarea necesita título e instrucciones.');return;}
     body.plan={subtasks:rows,review:manualOptions.review!==false,initRepo:!!manualOptions.initRepo};
   }
-  if((mode!=='manual'||manualOptions.review!==false)&&!selections[orchestrator]){toast(`Conecta ${names[orchestrator]} desde Agentes antes de empezar.`);return;}
+  // Con Auto basta con que haya algún agente conectado; con un agente concreto, ese agente.
+  const principalReady=orchestrator==='auto'?['claude','codex'].some(p=>state.connections[p]?.connected&&selections[p]):!!selections[orchestrator];
+  if((mode!=='manual'||manualOptions.review!==false)&&!principalReady){toast(orchestrator==='auto'?'Conecta Claude Code o Codex desde Agentes y ajustes antes de empezar.':`Conecta ${names[orchestrator]} desde Agentes y ajustes antes de empezar.`);return;}
   busy=true;$('#send').disabled=true;
   try{
     if(!conversationId){const c=await api('conversations',{projectId});focusConversation(c.id);}
