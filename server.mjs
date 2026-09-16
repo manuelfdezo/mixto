@@ -60,17 +60,20 @@ const connections=Object.fromEntries(['codex','claude'].map(provider=>[provider,
 let refreshing=null,dirty=false;
 // Los cambios se empujan a la interfaz por SSE en vez de sondearlos: `touch()` marca datos pendientes de
 // guardar y de enviar, y `notify()` agrupa los envíos para no inundar mientras un agente escribe.
-const clients=new Set();let pushTimer=null;
+const clients=new Map();let pushTimer=null;
 function broadcast(){
   if(!clients.size)return;
-  let payload;
-  try{payload=`event: state\ndata: ${JSON.stringify(snapshot())}\n\n`;}catch{return;}
-  for(const client of clients){try{client.write(payload);}catch{clients.delete(client);}}
+  const payloads=new Map();
+  for(const [client,conversationId] of clients){
+    let payload=payloads.get(conversationId);
+    if(!payload){try{payload=`event: state\ndata: ${JSON.stringify(snapshot(conversationId))}\n\n`;}catch{return;}payloads.set(conversationId,payload);}
+    try{client.write(payload);}catch{clients.delete(client);}
+  }
 }
 function notify(){if(pushTimer||!clients.size)return;pushTimer=setTimeout(()=>{pushTimer=null;broadcast();},300);}
 const touch=()=>{dirty=true;notify();};
 const flush=()=>{store.save();dirty=false;notify();};
-const keepalive=setInterval(()=>{for(const client of clients){try{client.write(': ping\n\n');}catch{clients.delete(client);}}},20000);
+const keepalive=setInterval(()=>{for(const client of clients.keys()){try{client.write(': ping\n\n');}catch{clients.delete(client);}}},20000);
 keepalive.unref();
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 // Terminal de proyecto (un comando a la vez por carpeta) y resumen de cambios sin confirmar por proyecto.
@@ -392,11 +395,25 @@ async function updateHumanPart(project,{run,subtask,assignment},{status,due,note
   }
   touch();
 }
-function snapshot(){
-  const managed=syncDiscoveredProjects(store.data,managedProjectsRoot);
-  if(managed.added.length)flush();
+// La carpeta de proyectos se relee como mucho cada dos segundos, no en cada actualización.
+let discoveredCache={at:0,result:null};
+function discovered(){
+  if(!discoveredCache.result||Date.now()-discoveredCache.at>2000){
+    discoveredCache={at:Date.now(),result:syncDiscoveredProjects(store.data,managedProjectsRoot)};
+    if(discoveredCache.result.added.length)flush();
+  }
+  return discoveredCache.result;
+}
+// Una tarea de otra conversación viaja resumida: sin eventos ni textos largos, que solo se ven en la suya.
+const briefRun=run=>({id:run.id,conversationId:run.conversationId,status:run.status,stage:run.stage,mode:run.mode,prompt:String(run.prompt||'').slice(0,200),createdAt:run.createdAt,finishedAt:run.finishedAt,usage:run.usage,phase:run.phase,events:[],plan:null,review:null,
+  subtasks:(run.subtasks||[]).map(subtask=>({id:subtask.id,index:subtask.index,title:subtask.title,status:subtask.status,stage:subtask.stage,provider:subtask.provider,model:subtask.model,human:subtask.human,personId:subtask.personId,personName:subtask.personName,result:subtask.result,due:subtask.due,role:subtask.role,instructions:subtask.human?subtask.instructions:'',scope:subtask.scope,justification:subtask.human?subtask.justification:'',events:[],text:''}))});
+// Sin conversación (`null`) el estado lleva todos los mensajes y tareas completas; con una, solo los suyos.
+function snapshot(conversationId=null,{all=conversationId===null}={}){
+  const managed=discovered();
   const {engram,github,...data}=store.data;
-  return {...data,memories:sharedMemories(store.data),memorySync:memoryBridge.status,connections,personas:listPersonas(),
+  const messages=all?data.messages:data.messages.filter(m=>m.conversationId===conversationId);
+  const runs=all?data.runs:data.runs.map(run=>run.conversationId===conversationId?run:briefRun(run));
+  return {...data,messages,runs,focus:all?undefined:conversationId,memories:sharedMemories(store.data),memorySync:memoryBridge.status,connections,personas:listPersonas(),
     approvals:[...approvals.values()].map(a=>a.public),execs:Object.fromEntries([...execs].map(([projectId,record])=>[projectId,execView(record)])),
     changes:Object.fromEntries(changesCache),update,github:githubView(),app:{version:VERSION,workspace:root,
       projectsRoot:{path:managed.root,available:managed.available}}};
@@ -489,7 +506,7 @@ function ask(run,subtask,request,signal,label){
     const requestId=id();
     const abort=()=>{approvals.delete(requestId);reject(new Error('Tarea detenida.'));};
     signal.addEventListener('abort',abort,{once:true});
-    approvals.set(requestId,{public:{id:requestId,runId:run.id,subtaskId:subtask.id,provider:subtask.provider,
+    approvals.set(requestId,{public:{id:requestId,runId:run.id,conversationId:run.conversationId,subtaskId:subtask.id,provider:subtask.provider,
       label:label||`#${subtask.index+1} ${subtask.title} · ${subtask.model}`,...request},
       resolve:answer=>{signal.removeEventListener('abort',abort);approvals.delete(requestId);subtask.status='running';if(run.phase==='review')run.status='reviewing';rollup(run);touch();resolve(answer);}});
     subtask.status='waiting';if(run.phase==='review')run.status='waiting';rollup(run);flush();
@@ -957,8 +974,9 @@ async function execute(run,controller){
       if(!decision){run.status='cancelled';run.stage='Plan descartado';return;}
       if(decision.direct){run.status='completed';run.stage='Respondido';recordRunMemory(run);return;}
     }
+    run.stage='Preparando';flush();
     await prepare(run,decision);
-    run.phase='work';rollup(run);flush();
+    run.phase='work';rollup(run);run.stage='Trabajando';flush();
     await runWaves(run,controller);
     await conclude(run,controller);
   }catch(error){failRun(run,controller,error);}
@@ -1143,12 +1161,22 @@ const server=http.createServer(async(req,res)=>{
       const cookie=req.headers.cookie||'';
       if(!cookie.split(';').some(c=>c.trim()===`mixto_session=${secret}`))return json(res,401,{error:'Recarga Mixto para conectar con la sesión local.'});
       if(req.method!=='GET'&&req.headers['x-mixto-client']!=='1')return json(res,403,{error:'Solicitud no autorizada.'});
-      if(route==='/api/state'&&req.method==='GET')return json(res,200,snapshot());
+      if(route==='/api/state'&&req.method==='GET'){
+        const focus=url.searchParams.get('conversation');
+        return json(res,200,focus===null?snapshot():snapshot(focus||null,{all:false}));
+      }
+      if(route==='/api/search'&&req.method==='GET'){
+        const q=String(url.searchParams.get('q')||'').trim().toLowerCase(),projectId=url.searchParams.get('projectId');
+        if(!q)return json(res,200,{ids:[]});
+        const ids=store.data.conversations.filter(c=>(!projectId||c.projectId===projectId)&&(String(c.title||'').toLowerCase().includes(q)||store.data.messages.some(m=>m.conversationId===c.id&&String(m.content||'').toLowerCase().includes(q)))).map(c=>c.id);
+        return json(res,200,{ids});
+      }
       if(route==='/api/events'&&req.method==='GET'){
+        const focus=url.searchParams.get('conversation')||null;
         res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-store','Connection':'keep-alive','X-Accel-Buffering':'no'});
         res.write('retry: 2000\n\n');
-        res.write(`event: state\ndata: ${JSON.stringify(snapshot())}\n\n`);
-        clients.add(res);
+        res.write(`event: state\ndata: ${JSON.stringify(snapshot(focus,{all:false}))}\n\n`);
+        clients.set(res,focus);
         req.on('close',()=>clients.delete(res));
         return;
       }
@@ -1437,7 +1465,7 @@ function restart(){
   const child=spawn(process.execPath,[path.join(root,'server.mjs')],{cwd:root,windowsHide:true,detached:true,stdio:['ignore',out,err],env:{...process.env,MIXTO_RESTART:'1'}});
   child.on('error',e=>console.error('No se pudo reiniciar Mixto: '+e.message));child.unref();
   fs.closeSync(out);fs.closeSync(err);
-  setTimeout(()=>{for(const client of clients){try{client.end();}catch{}}server.close();process.exit(0);},300);
+  setTimeout(()=>{for(const client of clients.keys()){try{client.end();}catch{}}server.close();process.exit(0);},300);
 }
-function stop(){if(stopping)return;stopping=true;for(const c of active.values())c.abort();setTimeout(()=>{flush();for(const client of clients){try{client.end();}catch{}}server.close();process.exit(0);},750);}
+function stop(){if(stopping)return;stopping=true;for(const c of active.values())c.abort();setTimeout(()=>{flush();for(const client of clients.keys()){try{client.end();}catch{}}server.close();process.exit(0);},750);}
 process.on('SIGINT',stop);process.on('SIGTERM',stop);

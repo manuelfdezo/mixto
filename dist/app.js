@@ -31,8 +31,8 @@ function limitsHtml(p,c){
 }
 let state,projectId,conversationId,orchestrator='codex',busy=false,lastMessages='',lastAgents='',lastMemory='',lastRun='',toastTimer;
 let planChoices={},initRepo=false;
-let mode='orquestar',manualRows=[],manualOptions={review:true,initRepo:false},manualVersion=0,lastManual='';
-let updateNoticed=false;
+let mode='directo',manualRows=[],manualOptions={review:true,initRepo:false},manualVersion=0,lastManual='';
+let updateNoticed=false,searchHits=null,searchTimer=null,newBelow=false,following=true,lastApprovalsHtml='';const messageNodes=new Map();
 let attachments=[],notifyEnabled=false,terminalOpen=false,lastTerminal='',conversationQuery='';
 const lastRunStates=new Map();
 const statusLabel={added:'nuevo',modified:'modificado',deleted:'eliminado',renamed:'renombrado',untracked:'nuevo'};
@@ -80,7 +80,7 @@ function markdown(text){
   }).join('');
 }
 
-function welcome(){return `<div class="welcome"><div class="welcome-symbol"><span>✺</span><span>✳</span></div><div class="eyebrow">UN EQUIPO QUE SE ARMA SOLO.</div><h1>Haz espacio a<br><em>lo que quieres crear.</em></h1><p>Elige quién orquesta. Ese agente estudia la tarea, decide cuántos agentes hacen falta y qué hace cada uno; tú apruebas el plan antes de que empiecen.</p><div class="suggestions"><button class="suggestion" data-suggestion="Explora este proyecto y explícame cómo está organizado y cuál sería el siguiente paso."><span>⌁</span> Entender mi proyecto<small>Una visión clara para empezar</small></button><button class="suggestion" data-suggestion="Analiza este proyecto y propón tres mejoras concretas, reparte el trabajo entre los agentes que haga falta."><span>⇄</span> Repartir el trabajo<small>Varios frentes a la vez</small></button></div></div>`;}
+function welcome(){return `<div class="welcome"><div class="welcome-symbol"><span>✺</span><span>✳</span></div><div class="eyebrow">CLAUDE CODE Y CODEX, EN TU ORDENADOR.</div><h1>¿Qué vamos a<br><em>hacer hoy?</em></h1><p>Escribe abajo como harías en la terminal. En <strong>Directo</strong> hablas con un agente y ves cada cambio; en <strong>Orquesta</strong> uno de ellos propone un plan y reparte el trabajo entre los dos.</p><div class="suggestions"><button class="suggestion" data-mode="directo" data-readonly="1" data-suggestion="Explícame cómo está organizado este proyecto y por dónde empezar."><span>⌁</span> Entender el proyecto<small>Directo, solo consulta</small></button><button class="suggestion" data-mode="directo" data-readonly="0" data-suggestion="Haz este cambio: "><span>✎</span> Hacer un cambio<small>Directo, con escritura</small></button><button class="suggestion" data-mode="orquestar" data-readonly="0" data-suggestion="Analiza este proyecto y propón un plan con las mejoras más valiosas, repartiendo el trabajo entre los agentes."><span>⇄</span> Tarea grande con plan<small>Orquesta: plan, dos agentes y revisión</small></button></div></div>`;}
 
 function approvalHtml(a){
   const questions=a.details?.questions||[];
@@ -88,17 +88,89 @@ function approvalHtml(a){
   return `<section class="approval" data-approval="${esc(a.id)}"><h3>${esc(a.title)}</h3>${a.label?`<div class="metadata">${esc(a.label)}</div>`:''}${questionMode?questions.map((q,i)=>`<label class="question-label"><span>${esc(q.question||q.header)}</span>${q.options?.length?`<small class="muted">${q.options.map(o=>esc(o.label)).join(' · ')}</small>`:''}<input data-answer="${i}" placeholder="Tu respuesta" autocomplete="off"></label>`).join(''):a.command?`<pre class="command">${esc(a.command)}</pre>`:`<pre>${esc(JSON.stringify(a.details,null,2))}</pre>`}<div class="approval-actions"><button class="primary-button" data-approval-allow="${esc(a.id)}">${questionMode?'Enviar respuesta':'Permitir esta vez'}</button>${a.command?`<button class="secondary-button" data-approval-always="${esc(a.id)}" title="Guarda el prefijo del comando en la lista de comandos permitidos del proyecto">Permitir siempre en este proyecto</button>`:''}<button class="secondary-button" data-approval-deny="${esc(a.id)}">${questionMode?'Omitir':'Rechazar'}</button></div></section>`;
 }
 
-function renderMessages(){
-  const messages=state.messages.filter(m=>m.conversationId===conversationId);
-  const approvals=state.approvals.filter(a=>state.runs.find(r=>r.id===a.runId)?.conversationId===conversationId);
-  const runUsage=state.runs.filter(r=>r.conversationId===conversationId).map(r=>[r.usage,r.phase,r.subtasks.map(s=>[!!s.patch,!!s.diff,s.reverted,s.revertedFiles,s.patchExcludes])]);
-  const signature=JSON.stringify([conversationId,messages,approvals,runUsage]);
-  if(signature===lastMessages)return;lastMessages=signature;
-  const area=$('#messages'),bottom=area.scrollHeight-area.scrollTop-area.clientHeight<130;
-  area.innerHTML=(messages.length?messages.map(m=>`<article class="message ${m.role}"><div class="message-header">${m.role==='assistant'?`<span class="agent-avatar ${m.provider}">${symbols[m.provider]}</span><strong>${names[m.provider]}</strong>${m.stage?`<span class="message-stage">${esc(m.stage)}</span>`:''}`:'<strong>Tú</strong>'}<time>${new Date(m.createdAt).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'})}</time>${usageBadges(m)}</div><div class="message-content">${m.content?markdown(m.content):m.status==='streaming'?'<span class="typing">Preparando la respuesta</span>':''}</div>${m.attachments?.length?`<div class="message-attachments">${m.attachments.map(a=>`<span class="chip">${a.mime?.startsWith('image/')?'🖼':'📄'} ${esc(a.name)}</span>`).join('')}</div>`:''}${m.error?`<div class="message-error">${esc(m.error)}</div>`:''}${m.content?`<div class="message-actions"><button data-copy="${m.id}">Copiar</button>${m.role==='assistant'?`<button data-remember="${m.id}">◇ Guardar recuerdo</button>`:''}${changeActions(m)}</div>`:''}</article>`).join(''):welcome())+approvals.map(approvalHtml).join('');
-  if(!messages.length)area.scrollTop=0;
-  else if(bottom||approvals.length||messages.length<2)area.scrollTop=area.scrollHeight;
+// Un plan llega como JSON: se enseña como resumen, contexto y lista de partes, nunca como texto crudo.
+function parseJsonLoose(text){
+  const s=String(text||'').trim();const candidates=[];
+  const fence=/```(?:json)?\s*([\s\S]*?)```/.exec(s);if(fence)candidates.push(fence[1]);
+  candidates.push(s);
+  const first=s.indexOf('{'),last=s.lastIndexOf('}');if(first>=0&&last>first)candidates.push(s.slice(first,last+1));
+  for(const c of candidates){try{const v=JSON.parse(c);if(v&&typeof v==='object')return v;}catch{}}
+  return null;
 }
+function planMessageHtml(m){
+  const plan=parseJsonLoose(m.content);
+  if(!plan)return null;
+  if(typeof plan.respuesta==='string'&&!Array.isArray(plan.subtareas))return markdown(plan.respuesta);
+  const subs=Array.isArray(plan.subtareas)?plan.subtareas:[];
+  if(!subs.length&&!plan.resumen)return null;
+  const who=s=>s.proveedor==='persona'?`👤 ${esc(s.persona||'persona del equipo')}`:`${symbols[s.proveedor]||''} ${names[s.proveedor]||esc(s.proveedor||'')}${s.modelo?' · '+esc(s.modelo):''}`;
+  return `<div class="plan-message">${plan.resumen?`<p class="plan-summary">${inline(String(plan.resumen))}</p>`:''}${subs.length?`<ol class="plan-list">${subs.map(s=>`<li><div class="plan-item-head"><strong>${esc(s.titulo||'')}</strong><span class="muted">${who(s)}${s.soloLectura?' · solo lectura':''}</span></div>${s.rol?`<div class="plan-role">${esc(s.rol)}</div>`:''}${s.instrucciones?`<div class="plan-item-body">${markdown(String(s.instrucciones))}</div>`:''}${s.justificacion?`<div class="plan-why">${esc(s.justificacion)}</div>`:''}</li>`).join('')}</ol>`:''}${plan.contexto?`<details class="plan-context"><summary>Lo que descubrió del proyecto</summary><div>${markdown(String(plan.contexto))}</div></details>`:''}${Array.isArray(plan.avisos)&&plan.avisos.length?`<div class="metadata">⚠ ${plan.avisos.map(a=>esc(String(a))).join(' · ')}</div>`:''}</div>`;
+}
+function reviewHtml(content){
+  const verdict=/VEREDICTO:\s*(NO INTEGRAR|INTEGRAR)/i.exec(content||'');
+  if(!verdict)return markdown(content);
+  const ok=verdict[1].toUpperCase()==='INTEGRAR';
+  return `<div class="verdict ${ok?'ok':'no'}">${ok?'✓ Revisión: se puede integrar':'✕ Revisión: no integrar todavía'}</div>`+markdown(String(content).replace(verdict[0],'').trim());
+}
+// Mientras un agente trabaja, debajo de su mensaje se ve lo último que está haciendo.
+function activityOf(m){
+  if(m.status!=='streaming')return '';
+  const run=state.runs.find(r=>r.id===m.runId);const sub=run?.subtasks?.find(s=>s.id===m.subtaskId);
+  const event=(sub?.events?.length?sub.events:run?.events||[]).at(-1);
+  return event?event.text:'';
+}
+function messageBodyHtml(m){
+  if(!m.content)return m.status==='streaming'?'<span class="typing">Preparando la respuesta</span>':'';
+  if(m.kind==='plan'){const plan=planMessageHtml(m);if(plan)return plan;}
+  if(m.kind==='review')return reviewHtml(m.content);
+  return markdown(m.content);
+}
+function messageInnerHtml(m){
+  const activity=activityOf(m);
+  return `<div class="message-header">${m.role==='assistant'?`<span class="agent-avatar ${m.provider}">${symbols[m.provider]}</span><strong>${names[m.provider]}</strong>${m.stage?`<span class="message-stage">${esc(m.stage)}</span>`:''}`:'<strong>Tú</strong>'}<time>${new Date(m.createdAt).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'})}</time>${usageBadges(m)}</div><div class="message-content">${messageBodyHtml(m)}</div>${activity?`<div class="message-activity">${esc(activity)}</div>`:''}${m.attachments?.length?`<div class="message-attachments">${m.attachments.map(a=>`<span class="chip">${a.mime?.startsWith('image/')?'🖼':'📄'} ${esc(a.name)}</span>`).join('')}</div>`:''}${m.error?`<div class="message-error">${esc(m.error)}</div>`:''}${m.content?`<div class="message-actions"><button data-copy="${m.id}">Copiar</button>${m.role==='assistant'?`<button data-remember="${m.id}">◇ Guardar recuerdo</button>`:''}${changeActions(m)}</div>`:''}`;
+}
+function messageSignature(m){
+  const run=state.runs.find(r=>r.id===m.runId);const sub=run?.subtasks?.find(s=>s.id===m.subtaskId);
+  return JSON.stringify([m.content,m.status,m.stage,m.error,m.usage,m.attachments,m.kind,run?.usage,run?.phase,run?.review?.integration?.applied,sub&&[!!sub.patch,!!sub.diff,sub.reverted,sub.revertedFiles,sub.patchExcludes],activityOf(m)]);
+}
+// La vista sigue a lo último mientras no te alejes tú; si subes a leer, aparece el botón para volver.
+function scrollMessagesToBottom(){const area=$('#messages');area.scrollTo({top:area.scrollHeight,behavior:'instant'});following=true;newBelow=false;$('#scroll-down').hidden=true;}
+const atBottom=area=>area.scrollHeight-area.scrollTop-area.clientHeight<48;
+// Solo se vuelve a pintar el mensaje que cambia; el resto de la conversación se queda como está.
+function renderMessages(){
+  const area=$('#messages'),key=conversationId||'';
+  const fresh=area.dataset.conversation!==key;
+  if(fresh){area.innerHTML='';messageNodes.clear();lastApprovalsHtml='';area.dataset.conversation=key;newBelow=false;following=true;$('#scroll-down').hidden=true;}
+  // Un estado de otra conversación (cambio de pestaña en curso) no se pinta: llega el suyo enseguida.
+  if(state.focus!==undefined&&(state.focus||'')!==key)return;
+  const messages=state.messages.filter(m=>m.conversationId===conversationId);
+  const approvals=state.approvals.filter(a=>a.conversationId===conversationId);
+  if(!messages.length){
+    if(!area.querySelector('.welcome')){area.innerHTML=welcome();messageNodes.clear();lastApprovalsHtml='';}
+    return;
+  }
+  let list=area.querySelector('.message-list');
+  if(!list){area.innerHTML='<div class="message-list"></div><div class="approvals"></div>';list=area.querySelector('.message-list');messageNodes.clear();lastApprovalsHtml='';}
+  let added=false,changed=false;const seen=new Set();
+  messages.forEach((m,i)=>{
+    seen.add(m.id);
+    const sig=messageSignature(m);
+    let node=messageNodes.get(m.id);
+    if(!node){node={el:document.createElement('article'),sig:null};node.el.dataset.id=m.id;messageNodes.set(m.id,node);added=true;}
+    if(list.children[i]!==node.el)list.insertBefore(node.el,list.children[i]||null);
+    if(node.sig!==sig){node.el.className=`message ${m.role}`;node.el.innerHTML=messageInnerHtml(m);node.sig=sig;changed=true;}
+  });
+  for(const [id,node] of messageNodes)if(!seen.has(id)){node.el.remove();messageNodes.delete(id);}
+  const approvalsHtml=approvals.map(approvalHtml).join('');
+  const box=area.querySelector('.approvals');
+  if(approvalsHtml!==lastApprovalsHtml){box.innerHTML=approvalsHtml;lastApprovalsHtml=approvalsHtml;if(approvalsHtml)added=true;}
+  if(fresh||following||(added&&messages.at(-1)?.role==='user'))scrollMessagesToBottom();
+  else if(added||changed){newBelow=true;$('#scroll-down').hidden=false;}
+}
+$('#scroll-down').onclick=scrollMessagesToBottom;
+$('#messages').addEventListener('scroll',()=>{const area=$('#messages');following=atBottom(area);if(following){newBelow=false;$('#scroll-down').hidden=true;}});
+// Si el cuadro de escritura o la tarjeta de estado cambian de tamaño, la conversación no pierde el final.
+if(typeof ResizeObserver!=='undefined'){new ResizeObserver(()=>{if(following)scrollMessagesToBottom();}).observe($('#messages'));}
 // Un mensaje de trabajo con cambios en archivos ofrece verlos y, si están en tu carpeta, deshacerlos.
 function changeOf(m){const run=state.runs.find(r=>r.id===m.runId);const subtask=run?.subtasks.find(s=>s.id===m.subtaskId);return subtask&&(subtask.patch||subtask.diff)?{run,subtask}:null;}
 function changeActions(m){
@@ -329,7 +401,7 @@ $('#manual-panel').onclick=e=>{
 };
 function render(){
   if(!state.projects.some(p=>p.id===projectId))projectId=state.projects[0]?.id;
-  if(!state.conversations.some(c=>c.id===conversationId&&c.projectId===projectId))conversationId=null;
+  if(conversationId&&!state.conversations.some(c=>c.id===conversationId&&c.projectId===projectId))focusConversation(null);
   const select=$('#project-select');if(document.activeElement!==select)select.innerHTML=state.projects.map(p=>`<option value="${p.id}" ${p.id===projectId?'selected':''}>${esc(p.name)}</option>`).join('');
   $('#project-folder').textContent=project()?.path||'';$('#project-folder').title=project()?.path||'';
   const quota=quotaText('codex');$('#quota-hint').textContent=quota?`Codex: ${quota}`:'';
@@ -337,7 +409,7 @@ function render(){
   refreshTeamModal();
   $('#project-name').textContent=project()?.name||'';$('#conversation-title').textContent=conversation()?.title||'Nueva conversación';
   const q=conversationQuery.trim().toLowerCase();
-  const matches=c=>!q||c.title.toLowerCase().includes(q)||state.messages.some(m=>m.conversationId===c.id&&String(m.content||'').toLowerCase().includes(q));
+  const matches=c=>!q||(searchHits?searchHits.has(c.id):String(c.title||'').toLowerCase().includes(q));
   $('#conversations').innerHTML=state.conversations.filter(c=>c.projectId===projectId&&matches(c)).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)).map(c=>`<button class="conversation-link ${c.id===conversationId?'active':''}" data-conversation="${c.id}"><span>◷</span><span>${esc(c.title)}</span></button>`).join('')||(q?'<p class="muted" style="padding:8px 12px;font-size:13px">Nada coincide.</p>':'');
   renderAgents();renderMemory();renderMessages();renderRun();renderManual();
   const run=activeRun();
@@ -354,6 +426,7 @@ function render(){
   $('#github-state').hidden=!state.github?.connected;
   if(state.update?.available&&!updateNoticed){updateNoticed=true;toast(`Hay una versión nueva de Mixto (${state.update.latest}). Actualiza desde Agentes y ajustes.`);}
   renderTerminal();checkNotifications();
+  if(following&&conversationId)scrollMessagesToBottom();
   updateOrchestrator();remember();
 }
 // Terminal del proyecto: la salida se actualiza en sitio para no perder el foco del cuadro de comando.
@@ -422,11 +495,16 @@ function updateOrchestrator(){
   $('#prompt').placeholder=running?.mode==='directo'&&running.status==='running'?`Redirigir a ${names[running.orchestrator.provider]}: escribe y envía; se detiene y sigue con lo nuevo`:mode==='manual'?'Objetivo de la tarea: qué hay que conseguir en conjunto':mode==='directo'?`Habla con ${names[orchestrator]}`:'¿Qué vamos a hacer?';
 }
 async function load(){
-  try{state=await api('state');$('#connection-error').hidden=true;render();}catch(e){$('#connection-error').hidden=false;}
+  try{state=await api('state?conversation='+encodeURIComponent(conversationId||''));$('#connection-error').hidden=true;render();}catch(e){$('#connection-error').hidden=false;}
 }
+function focusConversation(id){conversationId=id||null;lastMessages='';lastRun='';newBelow=false;connectEvents();}
 $('#reload').onclick=()=>location.reload();
-$('#project-select').onchange=e=>{projectId=e.target.value;conversationId=null;lastMessages='';render();void api('changes/refresh',{projectId}).catch(()=>{});};
-$('#conversation-search').oninput=e=>{conversationQuery=e.target.value;render();};
+$('#project-select').onchange=e=>{projectId=e.target.value;focusConversation(null);lastMessages='';render();void api('changes/refresh',{projectId}).catch(()=>{});};
+$('#conversation-search').oninput=e=>{
+  conversationQuery=e.target.value;searchHits=null;render();
+  clearTimeout(searchTimer);const q=conversationQuery.trim();if(!q)return;
+  searchTimer=setTimeout(async()=>{try{const r=await api(`search?projectId=${encodeURIComponent(projectId||'')}&q=${encodeURIComponent(q)}`);if(conversationQuery.trim()===q){searchHits=new Set(r.ids);render();}}catch{}},250);
+};
 $('#terminal-toggle').onclick=()=>{terminalOpen=!terminalOpen;lastTerminal='';remember();render();if(terminalOpen)$('#terminal-command')?.focus();};
 $('#notify-toggle').onclick=async()=>{
   if(!('Notification' in window)){toast('Este navegador no admite notificaciones.');return;}
@@ -442,7 +520,7 @@ $('#opinion-button').onclick=async()=>{
   if(!selections[other]){toast(`Conecta ${names[other]} desde Agentes antes de pedirle una opinión.`);return;}
   busy=true;
   try{
-    if(!conversationId){const c=await api('conversations',{projectId});conversationId=c.id;}
+    if(!conversationId){const c=await api('conversations',{projectId});focusConversation(c.id);}
     await api('run',{conversationId,prompt:$('#prompt').value.trim(),mode:'opinion',orchestrator:{provider:other,model:selections[other],effort:efforts[other]||null}});
     $('#prompt').value='';lastMessages='';await load();
   }catch(error){toast(error.message);}finally{busy=false;}
@@ -463,8 +541,8 @@ $('#attach-input').onchange=e=>{addFiles([...e.target.files]);e.target.value='';
 $('#prompt').addEventListener('paste',e=>{const files=[...(e.clipboardData?.files||[])];if(files.length){e.preventDefault();addFiles(files);}});
 $('#composer').addEventListener('dragover',e=>{e.preventDefault();});
 $('#composer').addEventListener('drop',e=>{e.preventDefault();addFiles([...(e.dataTransfer?.files||[])]);});
-$('#conversations').onclick=e=>{const b=e.target.closest('[data-conversation]');if(b){conversationId=b.dataset.conversation;lastMessages='';render();}};
-$('#new-conversation').onclick=()=>{conversationId=null;lastMessages='';render();$('#prompt').focus();};
+$('#conversations').onclick=e=>{const b=e.target.closest('[data-conversation]');if(b){focusConversation(b.dataset.conversation);render();}};
+$('#new-conversation').onclick=()=>{focusConversation(null);lastMessages='';render();$('#prompt').focus();};
 $('#orchestrator').onchange=e=>{orchestrator=e.target.value;lastAgents='';renderAgents();updateOrchestrator();lastManual='';renderManual();remember();};
 $('#mode').onchange=e=>{mode=e.target.value;if(mode==='manual'&&!manualRows.length)seedManualRows();updateOrchestrator();lastManual='';renderManual();remember();};
 
@@ -529,7 +607,7 @@ $('#composer').onsubmit=async e=>{
   if((mode!=='manual'||manualOptions.review!==false)&&!selections[orchestrator]){toast(`Conecta ${names[orchestrator]} desde Agentes antes de empezar.`);return;}
   busy=true;$('#send').disabled=true;
   try{
-    if(!conversationId){const c=await api('conversations',{projectId});conversationId=c.id;}
+    if(!conversationId){const c=await api('conversations',{projectId});focusConversation(c.id);}
     planChoices={};initRepo=false;lastRun='';
     body.conversationId=conversationId;
     await api('run',body);
@@ -542,7 +620,12 @@ $('#prompt').onkeydown=e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.prevent
 $('#prompt').oninput=e=>{e.target.style.height='auto';e.target.style.height=Math.min(e.target.scrollHeight,220)+'px';};
 $('#cancel-run').onclick=async()=>{try{await api('cancel',{id:activeRun().id});await load();}catch(e){toast(e.message);}};
 $('#messages').onclick=async e=>{
-  const suggestion=e.target.closest('[data-suggestion]');if(suggestion){$('#prompt').value=suggestion.dataset.suggestion;$('#prompt').focus();return;}
+  const suggestion=e.target.closest('[data-suggestion]');
+  if(suggestion){
+    if(suggestion.dataset.mode&&suggestion.dataset.mode!==mode){$('#mode').value=suggestion.dataset.mode;$('#mode').dispatchEvent(new Event('change'));}
+    if(suggestion.dataset.readonly!==undefined)$('#read-only').checked=suggestion.dataset.readonly==='1';
+    $('#prompt').value=suggestion.dataset.suggestion;$('#prompt').focus();$('#prompt').dispatchEvent(new Event('input'));return;
+  }
   const copy=e.target.closest('[data-copy]');if(copy){try{await navigator.clipboard.writeText(state.messages.find(m=>m.id===copy.dataset.copy).content);toast('Respuesta copiada.');}catch{toast('No se pudo copiar. Selecciona el texto y cópialo.');}return;}
   const save=e.target.closest('[data-remember]');if(save){const m=state.messages.find(m=>m.id===save.dataset.remember);memoryForm({title:'Nota de '+names[m.provider],content:m.content.slice(0,12000)});return;}
   const diff=e.target.closest('[data-diff]');if(diff){const [runId,subtaskId]=diff.dataset.diff.split('/');diffModal(runId,subtaskId);return;}
@@ -568,7 +651,7 @@ $('#new-project').onclick=()=>{
   const gh=state.github?.connected;
   openModal(gh?'Añadir proyecto':'Crear proyecto',`${gh?`${repoPickerHtml()}<details class="diff-file"><summary>O crea una carpeta vacía</summary>`:'<p class="modal-note">Conecta tu cuenta con el botón GitHub de la barra lateral para clonar tus repositorios desde aquí.</p>'}<form id="project-form"><label class="form-field"><span>Nombre</span><input name="name" required maxlength="80" placeholder="Paper shop POS" autofocus></label><label class="form-field"><span>Nombre de carpeta</span><input name="directoryName" required maxlength="80" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="tpv-papeleria"><small>Se creará dentro de ${esc(managed.path)}. Las carpetas que ya existan ahí se detectan automáticamente.</small></label><label class="form-field"><span>Descripción (opcional)</span><textarea name="description" rows="2" maxlength="2000"></textarea></label><div class="form-footer"><button class="primary-button">Crear proyecto</button></div></form>${gh?'</details>':''}`);
   if(gh)bindRepoPicker();
-  $('#project-form').onsubmit=async e=>{e.preventDefault();try{const p=await api('projects',Object.fromEntries(new FormData(e.target)));projectId=p.id;conversationId=null;closeModal();await load();toast('Proyecto añadido.');}catch(error){toast(error.message);}};
+  $('#project-form').onsubmit=async e=>{e.preventDefault();try{const p=await api('projects',Object.fromEntries(new FormData(e.target)));projectId=p.id;focusConversation(null);closeModal();await load();toast('Proyecto añadido.');}catch(error){toast(error.message);}};
 };
 
 function memoryForm(existing={}){
@@ -594,7 +677,7 @@ function memoryList(){
   $('#memory-records').onclick=async e=>{
     const b=e.target.closest('button');if(!b)return;
     if(b.dataset.memoryEdit)memoryForm(state.memories.find(m=>m.id===b.dataset.memoryEdit));
-    if(b.dataset.memoryOpen){conversationId=b.dataset.memoryOpen;closeModal();render();}
+    if(b.dataset.memoryOpen){focusConversation(b.dataset.memoryOpen);closeModal();render();}
     if(b.dataset.memoryDelete){try{await api('memories/'+b.dataset.memoryDelete,{},'DELETE');await load();draw();toast('Recuerdo eliminado.');}catch(error){toast(error.message);}}
   };
 }
@@ -691,7 +774,7 @@ function teamModal(){
     const b=e.target.closest('button');if(!b)return;
     if(b.dataset.personEdit){const person=personFor(b.dataset.personEdit);if(!person)return;form.elements.id.value=person.id;form.elements.name.value=person.name;form.elements.role.value=person.role||'';form.elements.email.value=person.email||'';form.elements.notes.value=person.notes||'';$('#person-form-title').textContent=`Editar a ${person.name}`;$('#person-save').textContent='Guardar';$('#person-cancel').hidden=false;form.elements.name.focus();return;}
     if(b.dataset.personRemove){try{await api('members',{projectId,personId:b.dataset.personRemove,remove:true});await load();teamModal();toast('Persona quitada del proyecto; sus encargos se conservan.');}catch(error){toast(error.message);}return;}
-    if(b.dataset.openConversation){conversationId=b.dataset.openConversation;closeModal();lastMessages='';lastRun='';render();return;}
+    if(b.dataset.openConversation){focusConversation(b.dataset.openConversation);closeModal();render();return;}
     if(b.dataset.briefCopy){const person=personFor(b.dataset.briefCopy);await copyText(briefFromItems(person,boardItems(person.id).filter(i=>i.status!=='hecha')),`Encargo de ${person.name} copiado.`);return;}
     if(b.dataset.briefDownload){const person=personFor(b.dataset.briefDownload);downloadText(`encargo-${person.name.replace(/[^\w.-]+/g,'-').toLowerCase()}.md`,briefFromItems(person,boardItems(person.id).filter(i=>i.status!=='hecha')));return;}
     if(b.dataset.briefMail){const person=personFor(b.dataset.briefMail);const brief=briefFromItems(person,boardItems(person.id).filter(i=>i.status!=='hecha'));location.href=`mailto:${encodeURIComponent(person.email)}?subject=${encodeURIComponent(`Encargo · ${project()?.name||'Mixto'}`)}&body=${encodeURIComponent(brief.slice(0,1800))}`;return;}
@@ -728,7 +811,7 @@ function repoPickerHtml(){
 }
 function bindRepoPicker(){
   renderRepoPicker();$('#repo-refresh').onclick=()=>renderRepoPicker(true);
-  $('#repo-url-form').onsubmit=async e=>{e.preventDefault();const b=e.target.querySelector('button');b.disabled=true;b.textContent='Clonando…';try{const p=await api('github/clone',{url:e.target.elements.url.value});projectId=p.id;conversationId=null;lastMessages='';closeModal();await load();toast(`${p.name} clonado y listo.`);}catch(error){toast(error.message);b.disabled=false;b.textContent='Clonar';}};
+  $('#repo-url-form').onsubmit=async e=>{e.preventDefault();const b=e.target.querySelector('button');b.disabled=true;b.textContent='Clonando…';try{const p=await api('github/clone',{url:e.target.elements.url.value});projectId=p.id;focusConversation(null);lastMessages='';closeModal();await load();toast(`${p.name} clonado y listo.`);}catch(error){toast(error.message);b.disabled=false;b.textContent='Clonar';}};
 }
 // El botón GitHub de la barra lateral: conectar, ver los repositorios y clonarlos, todo en un sitio.
 function githubModal(){
@@ -751,10 +834,10 @@ async function renderRepoPicker(refresh=false){
   draw();
   const search=$('#repo-search');if(search)search.oninput=draw;
   box.onclick=async e=>{
-    const open=e.target.closest('[data-open-project]');if(open){projectId=open.dataset.openProject;conversationId=null;lastMessages='';closeModal();render();return;}
+    const open=e.target.closest('[data-open-project]');if(open){projectId=open.dataset.openProject;focusConversation(null);lastMessages='';closeModal();render();return;}
     const clone=e.target.closest('[data-clone]');if(!clone)return;
     clone.disabled=true;clone.textContent='Clonando…';
-    try{const p=await api('github/clone',{fullName:clone.dataset.clone});projectId=p.id;conversationId=null;lastMessages='';closeModal();await load();toast(`${p.name} clonado y listo.`);}
+    try{const p=await api('github/clone',{fullName:clone.dataset.clone});projectId=p.id;focusConversation(null);lastMessages='';closeModal();await load();toast(`${p.name} clonado y listo.`);}
     catch(error){toast(error.message);clone.disabled=false;clone.textContent='Clonar';}
   };
 }
@@ -815,7 +898,8 @@ if(webContext?.registerTool){
 // cuando la conexión de eventos no está abierta, y para detectar que la app se ha cerrado.
 let events=null;
 function connectEvents(){
-  try{events=new EventSource('/api/events');}catch{events=null;return;}
+  if(events){try{events.close();}catch{}events=null;}
+  try{events=new EventSource('/api/events?conversation='+encodeURIComponent(conversationId||''));}catch{events=null;return;}
   events.addEventListener('state',e=>{try{state=JSON.parse(e.data);$('#connection-error').hidden=true;render();}catch{}});
   events.onerror=()=>{setTimeout(()=>{if(events?.readyState!==1)load();},1500);};
 }

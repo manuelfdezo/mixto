@@ -16,3 +16,46 @@ a.secondary-button{text-decoration:none;display:inline-flex;align-items:center}
 .repo-row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 10px;border:1px solid #2c2d32;border-radius:8px}
 .repo-row>div{min-width:0}
 .repo-row .muted{font-size:12px}
+
+/* Conversación más legible y con más sitio: cuadro compacto, texto más grande, plan como tarjeta, actividad en vivo. */
+.messages-wrap{position:relative;flex:1;min-height:0;display:flex;flex-direction:column}
+.messages-wrap .messages{flex:1}
+.scroll-down{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);background:#b7a3ff;color:#18151f;border:0;border-radius:20px;padding:7px 14px;font-size:13px;font-weight:600;box-shadow:0 6px 20px #0006;cursor:pointer;z-index:2}
+.scroll-down:hover{background:#c9baff}
+.composer textarea{min-height:44px}
+.composer{padding:10px 14px 8px}
+.composer-area{padding:10px clamp(22px,4vw,64px) 14px}
+.composer-controls{margin-top:6px}
+.composer-hint{margin-top:6px}
+.messages{padding-top:22px}
+.message{margin-bottom:22px}
+.message.assistant{padding:14px 18px 12px;background:#1b1c21;border:1px solid #2a2b31;border-radius:12px}
+.message.user{background:#2a2734;border-color:#3d3950}
+.message-content{font-size:16px;line-height:1.7;color:#f0f0f3}
+.message-content p{margin:0 0 10px}
+.message-content p:last-child{margin-bottom:0}
+.message-header{margin-bottom:8px}
+.message-header strong{font-size:15px}
+.message-activity{display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px;color:#c5b5e7}
+.message-activity::before{content:'⟳';display:inline-block;animation:spin 1.2s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.plan-summary{font-size:16px;margin:0 0 12px}
+.plan-list{margin:0;padding-left:22px;display:grid;gap:12px}
+.plan-list li{padding-left:4px}
+.plan-item-head{display:flex;gap:10px;flex-wrap:wrap;align-items:baseline}
+.plan-item-head strong{font-size:15px}
+.plan-role{font-size:13px;color:#b5b7c3;margin-top:2px}
+.plan-item-body{margin-top:6px;font-size:14px;color:#d6d7de}
+.plan-item-body p{margin:0 0 6px}
+.plan-why{font-size:12px;color:#8f919b;margin-top:4px}
+.plan-context{margin:12px 0 0;font-size:14px;color:#c9cad2}
+.plan-context summary{cursor:pointer;color:#c5b5e7}
+.plan-context>div{margin-top:8px}
+.verdict{display:inline-block;padding:4px 10px;border-radius:6px;font-size:13px;font-weight:600;margin:0 0 10px}
+.verdict.ok{background:#213426;color:#a9e3b0}
+.verdict.no{background:#3a2626;color:#efb7b1}
+.run-status{font-size:13px}
+.welcome-symbol{margin-bottom:22px}
+.welcome{margin-top:clamp(16px,6vh,60px)}
+.suggestions{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+.messages{scroll-behavior:auto}

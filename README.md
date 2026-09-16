@@ -24,9 +24,9 @@ También puedes ejecutar `npm start` desde esta carpeta. Cierra esa terminal par
 
 ## Trabajar
 
-Junto al cuadro de escritura eliges el **agente principal** y el **modo**:
+Junto al cuadro de escritura eliges el **agente principal** y el **modo**. El modo predeterminado es **Directo**, el que más se parece a usar Claude Code o Codex en la terminal; la bienvenida ofrece tres formas de empezar y cambia el modo por ti.
 
-- **Orquesta**: el agente principal estudia la carpeta, responde o propone un plan, y revisa el resultado. Es el modo que se describe a continuación.
+- **Orquesta**: el agente principal estudia la carpeta, responde o propone un plan, y revisa el resultado. Es el modo que se describe a continuación. El plan se muestra como una tarjeta legible (resumen, partes y lo que descubrió del proyecto), nunca como JSON.
 - **Directo**: hablas con un solo agente, con sesión continua, sin plan ni revisión. Es el modo para el trabajo iterativo del día a día: cada mensaje cuesta un turno. La sesión se conserva por conversación y agente aunque cambies de modelo; cambiar entre consulta y trabajo la reinicia. Cada turno con escritura se puede ver y deshacer, y se puede redirigir mientras trabaja.
 - **Reparto a mano**: tú planteas la tarea y decides las sub-tareas, quién hace cada una (Codex o Claude Code), con qué modelo, alcance y permisos. No hay turno de planificación; las sub-tareas arrancan directamente y el agente principal revisa el conjunto al final si lo marcas. Sin revisión, los cambios de varias sub-tareas quedan a la espera de que los apliques o descartes tú.
 
@@ -138,7 +138,7 @@ No usa `--dangerously-skip-permissions` ni un modo sin aislamiento de Codex. Cla
 
 ## Desarrollo
 
-La interfaz recibe el estado por eventos del servidor (`/api/events`, SSE) en cuanto cambia, sin sondeo; solo si esa conexión no está abierta vuelve a consultar `/api/state` cada pocos segundos.
+La interfaz recibe el estado por eventos del servidor (`/api/events?conversation=…`, SSE) en cuanto cambia, sin sondeo; solo si esa conexión no está abierta vuelve a consultar `/api/state` cada pocos segundos. Cada pestaña recibe solo los mensajes y la tarea completa de su conversación (las demás tareas viajan resumidas), y la conversación se pinta de forma incremental: solo cambia en pantalla el mensaje que cambia. La búsqueda de conversaciones se hace en el servidor (`/api/search`). `GET /api/state` sin parámetros sigue devolviendo todo, para pruebas y copias.
 
 `npm test` ejecuta las pruebas locales sin consumir modelos, incluida una base Engram temporal aislada. Requiere el binario Engram instalado; `MIXTO_TEST_ENGRAM_PATH` permite indicar su ubicación. `npm run check` comprueba la sintaxis. Para una instancia de prueba aislada usa **las tres variables** `MIXTO_PORT`, `MIXTO_DATA_DIR` y `ENGRAM_DATA_DIR`; cambiar solo los datos de Mixto no aísla Engram.
 
