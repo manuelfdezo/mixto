@@ -131,13 +131,22 @@ function messageBodyHtml(m){
   if(m.kind==='review')return reviewHtml(m.content);
   return markdown(m.content);
 }
+// Por qué Auto eligió ese agente: la tarea, o la parte del reparto, guardan la razón.
+function autoReasonOf(m){
+  if(m.role!=='assistant')return '';
+  const run=state.runs.find(r=>r.id===m.runId);if(!run)return '';
+  const sub=run.subtasks?.find(s=>s.id===m.subtaskId);
+  if(sub?.auto&&sub.justification)return sub.justification;
+  if(run.orchestrator?.auto&&run.orchestrator.reason&&(!sub||sub.self||m.kind==='plan'||m.kind==='direct'||m.kind==='review'))return run.orchestrator.reason;
+  return '';
+}
 function messageInnerHtml(m){
-  const activity=activityOf(m);
-  return `<div class="message-header">${m.role==='assistant'?`<span class="agent-avatar ${m.provider}">${symbols[m.provider]}</span><strong>${names[m.provider]}</strong>${m.stage?`<span class="message-stage">${esc(m.stage)}</span>`:''}`:'<strong>Tú</strong>'}<time>${new Date(m.createdAt).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'})}</time>${usageBadges(m)}</div><div class="message-content">${messageBodyHtml(m)}</div>${activity?`<div class="message-activity">${esc(activity)}</div>`:''}${m.attachments?.length?`<div class="message-attachments">${m.attachments.map(a=>`<span class="chip">${a.mime?.startsWith('image/')?'🖼':'📄'} ${esc(a.name)}</span>`).join('')}</div>`:''}${m.error?`<div class="message-error">${esc(m.error)}</div>`:''}${m.content?`<div class="message-actions"><button data-copy="${m.id}">Copiar</button>${m.role==='assistant'?`<button data-remember="${m.id}">◇ Guardar recuerdo</button>`:''}${changeActions(m)}</div>`:''}`;
+  const activity=activityOf(m),autoReason=autoReasonOf(m);
+  return `<div class="message-header">${m.role==='assistant'?`<span class="agent-avatar ${m.provider}">${symbols[m.provider]}</span><strong>${names[m.provider]}</strong>${m.stage?`<span class="message-stage">${esc(m.stage)}</span>`:''}`:'<strong>Tú</strong>'}<time>${new Date(m.createdAt).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'})}</time>${usageBadges(m)}</div>${autoReason?`<div class="message-auto" title="Elección automática de agente, modelo y nivel">◈ ${esc(autoReason)}</div>`:''}<div class="message-content">${messageBodyHtml(m)}</div>${activity?`<div class="message-activity">${esc(activity)}</div>`:''}${m.attachments?.length?`<div class="message-attachments">${m.attachments.map(a=>`<span class="chip">${a.mime?.startsWith('image/')?'🖼':'📄'} ${esc(a.name)}</span>`).join('')}</div>`:''}${m.error?`<div class="message-error">${esc(m.error)}</div>`:''}${m.content?`<div class="message-actions"><button data-copy="${m.id}">Copiar</button>${m.role==='assistant'?`<button data-remember="${m.id}">◇ Guardar recuerdo</button>`:''}${changeActions(m)}</div>`:''}`;
 }
 function messageSignature(m){
   const run=state.runs.find(r=>r.id===m.runId);const sub=run?.subtasks?.find(s=>s.id===m.subtaskId);
-  return JSON.stringify([m.content,m.status,m.stage,m.error,m.usage,m.attachments,m.kind,run?.usage,run?.phase,run?.review?.integration?.applied,sub&&[!!sub.patch,!!sub.diff,sub.reverted,sub.revertedFiles,sub.patchExcludes],activityOf(m)]);
+  return JSON.stringify([m.content,m.status,m.stage,m.error,m.usage,m.attachments,m.kind,run?.usage,run?.phase,run?.review?.integration?.applied,sub&&[!!sub.patch,!!sub.diff,sub.reverted,sub.revertedFiles,sub.patchExcludes],activityOf(m),autoReasonOf(m)]);
 }
 // La vista sigue a lo último mientras no te alejes tú; si subes a leer, aparece el botón para volver.
 const pageScrolls=()=>getComputedStyle($('#messages')).overflowY==='visible';
