@@ -134,8 +134,14 @@ function messageSignature(m){
   return JSON.stringify([m.content,m.status,m.stage,m.error,m.usage,m.attachments,m.kind,run?.usage,run?.phase,run?.review?.integration?.applied,sub&&[!!sub.patch,!!sub.diff,sub.reverted,sub.revertedFiles,sub.patchExcludes],activityOf(m)]);
 }
 // La vista sigue a lo último mientras no te alejes tú; si subes a leer, aparece el botón para volver.
-function scrollMessagesToBottom(){const area=$('#messages');area.scrollTo({top:area.scrollHeight,behavior:'instant'});following=true;newBelow=false;$('#scroll-down').hidden=true;}
-const atBottom=area=>area.scrollHeight-area.scrollTop-area.clientHeight<48;
+const pageScrolls=()=>getComputedStyle($('#messages')).overflowY==='visible';
+function scrollMessagesToBottom(){
+  const area=$('#messages');
+  if(pageScrolls())window.scrollTo({top:document.documentElement.scrollHeight,behavior:'instant'});
+  else area.scrollTo({top:area.scrollHeight,behavior:'instant'});
+  following=true;newBelow=false;$('#scroll-down').hidden=true;
+}
+const atBottom=area=>pageScrolls()?(document.documentElement.scrollHeight-window.scrollY-window.innerHeight<48):(area.scrollHeight-area.scrollTop-area.clientHeight<48);
 // Solo se vuelve a pintar el mensaje que cambia; el resto de la conversación se queda como está.
 function renderMessages(){
   const area=$('#messages'),key=conversationId||'';
@@ -161,14 +167,17 @@ function renderMessages(){
     if(node.sig!==sig){node.el.className=`message ${m.role}`;node.el.innerHTML=messageInnerHtml(m);node.sig=sig;changed=true;}
   });
   for(const [id,node] of messageNodes)if(!seen.has(id)){node.el.remove();messageNodes.delete(id);}
-  const approvalsHtml=approvals.map(approvalHtml).join('');
+  const last=lastRunOf();
+  const noteHtml=last&&!ACTIVE.includes(last.status)&&last.error?`<div class="system-note">${esc(last.error)}</div>`:'';
+  const approvalsHtml=noteHtml+approvals.map(approvalHtml).join('');
   const box=area.querySelector('.approvals');
   if(approvalsHtml!==lastApprovalsHtml){box.innerHTML=approvalsHtml;lastApprovalsHtml=approvalsHtml;if(approvalsHtml)added=true;}
   if(fresh||following||(added&&messages.at(-1)?.role==='user'))scrollMessagesToBottom();
   else if(added||changed){newBelow=true;$('#scroll-down').hidden=false;}
 }
 $('#scroll-down').onclick=scrollMessagesToBottom;
-$('#messages').addEventListener('scroll',()=>{const area=$('#messages');following=atBottom(area);if(following){newBelow=false;$('#scroll-down').hidden=true;}});
+const onScroll=()=>{following=atBottom($('#messages'));if(following){newBelow=false;$('#scroll-down').hidden=true;}};
+$('#messages').addEventListener('scroll',onScroll);window.addEventListener('scroll',()=>{if(pageScrolls())onScroll();},{passive:true});
 // Si el cuadro de escritura o la tarjeta de estado cambian de tamaño, la conversación no pierde el final.
 if(typeof ResizeObserver!=='undefined'){new ResizeObserver(()=>{if(following)scrollMessagesToBottom();}).observe($('#messages'));}
 // Un mensaje de trabajo con cambios en archivos ofrece verlos y, si están en tu carpeta, deshacerlos.
@@ -343,8 +352,8 @@ function renderRun(){
   if(!run){status.hidden=true;status.innerHTML='';return;}
   if(run.status==='awaiting-plan'){status.hidden=false;status.innerHTML=planHtml(run);return;}
   if(ACTIVE.includes(run.status)){status.hidden=false;status.innerHTML=teamHtml(run);return;}
-  const html=(run.error?`<div class="run-error">${esc(run.error)}</div>`:'')+afterRunHtml(run);
-  status.hidden=!html;status.innerHTML=html;
+  const html=afterRunHtml(run); // el error de una tarea terminada se lee dentro de la conversación
+  status.hidden=!html.trim();status.innerHTML=html;
 }
 function renderMemory(){
   const sync=state.memorySync||{state:'pending'};
@@ -416,11 +425,11 @@ function render(){
   const steerable=!!run&&run.mode==='directo'&&run.status==='running';
   $('#send').hidden=!!run&&!steerable;$('#cancel-run').hidden=!run;$('#send').disabled=busy;
   const other=orchestrator==='codex'?'claude':'codex';
-  $('#opinion-button').textContent=`Segunda opinión de ${names[other]}`;
+  $('#opinion-button').textContent=`Opinión de ${names[other]}`;$('#opinion-button').title=`${names[other]} revisa en solo lectura los cambios sin confirmar`;
   const pending=state.changes?.[projectId];
   $('#commit-button').hidden=!(pending?.git&&pending.files>0);
   $('#pull-button').hidden=!(pending?.git&&pending.remote);
-  if(pending?.files)$('#commit-button').textContent=`Confirmar cambios (${pending.files})`;
+  if(pending?.files){$('#commit-button').textContent=`✓ Confirmar (${pending.files})`;$('#commit-button').title=`${pending.files} archivo(s) con cambios sin confirmar: ver el diff y crear un commit`;}
   $('#notify-toggle').classList.toggle('on',notifyEnabled);$('#terminal-toggle').classList.toggle('on',terminalOpen);
   $('#update-count').hidden=!state.update?.available;
   $('#github-state').hidden=!state.github?.connected;

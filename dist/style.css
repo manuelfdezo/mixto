@@ -59,3 +59,26 @@ a.secondary-button{text-decoration:none;display:inline-flex;align-items:center}
 .welcome{margin-top:clamp(16px,6vh,60px)}
 .suggestions{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
 .messages{scroll-behavior:auto}
+
+/* Pie compacto: el cuadro, sus controles y una sola fila de pista y botones. */
+.composer textarea{min-height:40px}
+.composer-area{padding:8px clamp(22px,4vw,64px) 10px}
+.composer-hint{margin-top:5px;align-items:center;flex-wrap:nowrap;min-width:0}
+.composer-hint #mode-hint{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.composer-hint .quota-hint{white-space:nowrap;flex-shrink:0}
+.hint-actions{flex-wrap:nowrap;flex-shrink:0}
+.hint-button{white-space:nowrap}
+.run-status{margin-bottom:8px}
+.system-note{margin:0 auto 18px;max-width:820px;padding:8px 14px;border-radius:8px;font-size:13px;color:#efb7b1;background:#2a1d1d;border:1px solid #4a2f2f}
+.system-note.info{color:#c5b5e7;background:#231f2b;border-color:#3a3350}
+@media(max-width:1150px){.composer-hint .quota-hint{display:none}}
+/* Ventana baja: la página entera se desplaza, la barra lateral se queda fija y el pie queda pegado abajo. */
+@media(max-height:700px) and (min-width:621px){
+  #app{height:auto;min-height:100dvh;align-items:start}
+  .sidebar{position:sticky;top:0;height:100dvh;box-sizing:border-box;overflow:auto}
+  main{min-height:100dvh}
+  .messages-wrap{flex:none;min-height:0}
+  .messages{overflow:visible;flex:none;padding-bottom:0}
+  .dock{position:sticky;bottom:0;background:#141518;z-index:3;padding-top:4px;box-shadow:0 -10px 24px #141518}
+  .scroll-down{position:fixed;bottom:150px}
+}
