@@ -995,7 +995,7 @@ async function execute(run,controller){
 async function directPhase(run,controller){
   const project=projectOf(run);
   const opinion=run.mode==='opinion';
-  run.phase='work';run.plan={status:'direct-mode',summary:'',warnings:[],context:''};
+  run.phase='work';run.stage='Trabajando';run.plan={status:'direct-mode',summary:'',warnings:[],context:''};
   const subtask=toSubtask({title:opinion?'Segunda opinión':'Directo',role:opinion?'Revisar los cambios sin confirmar':'Responder o resolver la petición',instructions:run.prompt,justification:'',
     provider:run.orchestrator.provider,model:run.orchestrator.model,effort:run.orchestrator.effort,scope:[],readOnly:opinion||run.readOnly===true,order:1},0);
   subtask.cwd=project.path;run.subtasks=[subtask];run.waves=[[subtask.id]];rollup(run);

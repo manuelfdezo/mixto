@@ -92,3 +92,28 @@ a.secondary-button{text-decoration:none;display:inline-flex;align-items:center}
 .quota-hint.warn{color:#f0b7a8;font-weight:600}
 @media(max-height:700px) and (min-width:621px){.run-status{max-height:26vh}}
 .message-auto{font-size:12px;color:#aba0cb;margin:-2px 0 8px}
+
+/* Revisión estética: desplegables oscuros, foco coherente, pista completa, filas del reparto alineadas. */
+select{color-scheme:dark;background-color:#222328;color:#ededef}
+option,optgroup{background:#1f2025;color:#ededef}
+option:checked,option:hover{background:#3a3350;color:#fff}
+input:focus,textarea:focus,select:focus{outline:none;border-color:#9b85d7;box-shadow:0 0 0 3px #9b85d733}
+input:focus-visible,textarea:focus-visible,select:focus-visible{outline:none}
+button:focus-visible,a:focus-visible,.hint-button:focus-visible{outline:2px solid #b7a3ff;outline-offset:2px}
+.composer-hint{flex-wrap:wrap;row-gap:4px}
+.composer-hint #mode-hint{flex:1 1 100%;white-space:normal;overflow:visible;text-overflow:clip;order:2;color:#8f929e}
+.composer-hint .quota-hint{order:0;margin:0 auto 0 0}
+.composer-hint .hint-actions{order:1;margin-left:auto}
+.run-status .approval-actions{border-top:1px solid #2c2d32;box-shadow:0 -10px 14px #141518}
+.manual-row-grid input[type=checkbox]{flex:none;min-width:0;width:auto;margin:0}
+.readonly-control{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;font-size:13px;margin:0}
+.manual-row textarea{background:#1f2025;border:1px solid #33343b;border-radius:7px;padding:8px 10px;min-height:56px}
+.manual-row-grid select{background-color:#1f2025}
+.terminal-form input:focus{box-shadow:0 0 0 3px #9b85d733}
+@media(max-height:700px) and (min-width:621px){
+  .composer-hint{flex-wrap:nowrap}
+  .composer-hint #mode-hint{flex:1 1 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;order:0}
+  .composer-hint .quota-hint{order:1;margin:0}
+  .composer-hint .hint-actions{order:2}
+}
+.run-status .approval-actions.static{position:static;box-shadow:none;border-top:0;padding:4px 0 10px;margin-top:4px}

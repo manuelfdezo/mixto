@@ -277,11 +277,9 @@ function planHtml(run){
   const writers=run.subtasks.filter(s=>!s.readOnly).length;
   // Una sola sub-tarea que escribe trabaja en la carpeta real: solo dos o más necesitan copias aisladas.
   const needsGit=writers>1&&run.isolation?.kind!=='worktree';
-  return `<div class="plan-card"><div class="plan-head"><strong>Plan propuesto</strong><span class="pill">${run.subtasks.length} sub-tarea${run.subtasks.length===1?'':'s'}</span></div>
-  ${run.plan.summary?`<p class="muted">${esc(run.plan.summary)}</p>`:''}
+  return `<div class="plan-card"><div class="plan-head"><strong>Plan propuesto: revisa el reparto y empieza</strong><span class="pill">${run.subtasks.length} sub-tarea${run.subtasks.length===1?'':'s'}</span></div>
   ${run.plan.status==='fallback'?'<div class="message-error">El orquestador no devolvió un plan legible; se ejecutará tu petición con un solo agente.</div>':''}
   ${(run.plan.warnings||[]).map(w=>`<div class="metadata">⚠ ${esc(w)}</div>`).join('')}
-  ${run.plan.context?`<details class="plan-context"><summary>Contexto que recibirán todas las sub-tareas</summary><p class="muted">${esc(run.plan.context)}</p></details>`:''}
   ${run.subtasks.map(s=>planRowHtml(s,run)).join('')}
   ${needsGit?`<div class="plan-git"><div class="metadata">Esta carpeta no es un repositorio git: sin eso, varias sub-tareas no pueden escribir a la vez sobre copias aisladas.</div>
     <label><input type="radio" name="plan-git" value="serial" ${initRepo?'':'checked'}> Ejecutar las escrituras de una en una (no cambia tu carpeta)</label>
@@ -353,10 +351,10 @@ function afterRunHtml(run){
   const fixable=run.subtasks.some(s=>s.fixable),humansBlock=humansBlockHtml(run);
   if(!pending&&!rejected)return humansBlock+(fixable?`<div class="after-run">${run.usage?.total?`<span class="pill" title="Consumo total de la tarea">${usageText(run.usage)} · ${run.usage.turns} turnos</span>`:''}${fixFormHtml(run,false)}</div>`:'');
   return humansBlock+`<div class="plan-card"><div class="plan-head"><strong>${pending?'Cambios sin integrar':'El revisor no autorizó la integración'}</strong>${run.usage?.total?`<span class="pill" title="Consumo total de la tarea">${usageText(run.usage)} · ${run.usage.turns} turnos</span>`:''}</div>
-  ${conflicts.map(c=>`<div class="metadata">${esc(c.file)}: ${esc(c.reason)}</div>`).join('')}
+  ${conflicts.map(c=>`<div class="metadata">${c.file&&c.file!=='—'?esc(c.file)+': ':''}${esc(c.reason)}</div>`).join('')}
   ${pending?'<p class="muted">El trabajo de los agentes está guardado aparte; tu carpeta no se tocó.</p>':'<p class="muted">Los cambios ya están en tu carpeta; lee la revisión antes de darlos por buenos.</p>'}
-  ${fixFormHtml(run,true)}
-  ${pending?`<div class="approval-actions"><button class="primary-button" id="integrate-apply">Aplicar cambios</button><button class="secondary-button" id="integrate-discard">Descartar</button></div>`:''}</div>`;
+  ${pending?`<div class="approval-actions static"><button class="primary-button" id="integrate-apply">Aplicar cambios</button><button class="secondary-button" id="integrate-discard">Descartar</button></div>`:''}
+  ${fixFormHtml(run,true)}</div>`;
 }
 
 // Una línea con lo esencial de la tarea cuando la tarjeta está plegada.
@@ -838,10 +836,11 @@ function teamModal(){
 }
 $('#open-team').onclick=teamModal;
 // GitHub: un token de acceso guardado en local para listar y clonar tus repositorios y para que git no pida credenciales.
-function githubSectionHtml({picker=false}={}){
+function githubSectionHtml({picker=false,title=true}={}){
   const g=state.github||{};
-  if(g.connected)return `<section class="connection-card" id="github-section"><h3>GitHub</h3><p>Conectado como <strong>${esc(g.login)}</strong>${g.name?' · '+esc(g.name):''}. Git ya puede traer y enviar cambios de tus repositorios, también desde los agentes y el terminal.</p><div class="approval-actions">${picker?'':'<button type="button" class="primary-button" id="github-add">Añadir un repositorio</button>'}<button type="button" class="secondary-button" id="github-disconnect">Desconectar</button></div></section>`;
-  return `<section class="connection-card" id="github-section"><h3>GitHub</h3><p>Conecta tu cuenta con un token de acceso personal para clonar tus repositorios en la carpeta de proyectos y trabajar sobre ellos.</p><form id="github-form" class="terminal-form"><input name="token" placeholder="github_pat_… o ghp_…" autocomplete="off" spellcheck="false" required><button class="primary-button">Conectar</button></form><small>Crea el token en <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>: elige los repositorios a los que quieras acceder y dale permiso de <em>Contents: Read and write</em> (o un token clásico con el ámbito <em>repo</em>). Se guarda solo en este ordenador, en la carpeta data.</small></section>`;
+  const heading=title?'<h3>GitHub</h3>':'';
+  if(g.connected)return `<section class="connection-card" id="github-section">${heading}<p>Conectado como <strong>${esc(g.login)}</strong>${g.name?' · '+esc(g.name):''}. Git ya puede traer y enviar cambios de tus repositorios, también desde los agentes y el terminal.</p><div class="approval-actions">${picker?'':'<button type="button" class="primary-button" id="github-add">Añadir un repositorio</button>'}<button type="button" class="secondary-button" id="github-disconnect">Desconectar</button></div></section>`;
+  return `<section class="connection-card" id="github-section">${heading}<p>Conecta tu cuenta con un token de acceso personal para clonar tus repositorios en la carpeta de proyectos y trabajar sobre ellos.</p><form id="github-form" class="terminal-form"><input name="token" placeholder="github_pat_… o ghp_…" autocomplete="off" spellcheck="false" required><button class="primary-button">Conectar</button></form><small>Crea el token en <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>: elige los repositorios a los que quieras acceder y dale permiso de <em>Contents: Read and write</em> (o un token clásico con el ámbito <em>repo</em>). Se guarda solo en este ordenador, en la carpeta data.</small></section>`;
 }
 function bindGithubSection(refresh=connectionsModal){
   const form=$('#github-form');
@@ -862,7 +861,7 @@ function bindRepoPicker(){
 // El botón GitHub de la barra lateral: conectar, ver los repositorios y clonarlos, todo en un sitio.
 function githubModal(){
   const connected=!!state.github?.connected;
-  openModal('GitHub',`${githubSectionHtml({picker:connected})}${connected?repoPickerHtml():''}`,'github');
+  openModal('GitHub',`${githubSectionHtml({picker:connected,title:false})}${connected?repoPickerHtml():''}`,'github');
   bindGithubSection(githubModal);
   if(connected)bindRepoPicker();
 }
