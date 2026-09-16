@@ -1,7 +1,8 @@
 const $=s=>document.querySelector(s);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const names={codex:'Codex',claude:'Claude Code'};
-const symbols={codex:'✳',claude:'✺'};
+const DEFAULT_MODEL_NOTES='Modelos rápidos (haiku, mini, nano): cambios mecánicos, preguntas concretas, renombrados, textos. Baratos y casi instantáneos.\nModelos equilibrados (sonnet, gpt-5-codex y similares): la mayoría del trabajo diario: funciones nuevas, arreglos con contexto, tests.\nModelos potentes (opus, max, pro): diseño y arquitectura, refactors que tocan muchas partes, depuración difícil, revisiones exigentes.\nClaude Code: explicar y razonar sobre código, cambios cuidadosos en varios archivos, revisión. Codex: trabajo autónomo largo con terminal y tests, iterar hasta que pase la suite.';
+const names={codex:'Codex',claude:'Claude Code',auto:'Auto'};
+const symbols={codex:'✳',claude:'✺',auto:'◈'};
 const effortNames={low:'Ligero',medium:'Equilibrado',high:'Alto',xhigh:'Muy alto',max:'Máximo',ultra:'Ultra'};
 const stageNames={queued:'En espera',running:'Trabajando',waiting:'Esperando tu respuesta',completed:'Completado',error:'Sin completar',cancelled:'Detenido',stopped:'Detenida por el arquitecto',interrupted:'Interrumpido',pendiente:'Pendiente','en-curso':'En curso',hecha:'Hecha'};
 // Personas reales del equipo: se les asignan sub-tareas que Mixto no ejecuta; tú anotas su estado.
@@ -9,13 +10,18 @@ const HUMAN='persona';
 const humanStatuses=[['pendiente','Pendiente'],['en-curso','En curso'],['hecha','Hecha']];
 const peopleOf=p=>state?state.people.filter(person=>(p?.members||[]).includes(person.id)):[];
 const personName=s=>state?.people.find(p=>p.id===s.personId)?.name||s.personName||'persona';
-const assigneeLabel=s=>s.human?`${personName(s)} · persona`:`${names[s.provider]} ${s.model}`;
+const assigneeLabel=s=>s.human?`${personName(s)} · persona`:s.provider==='auto'?'Auto: Mixto elige':`${names[s.provider]} ${s.model}${s.auto?' · auto':''}`;
 const avatar=s=>s.human?'<span class="agent-avatar human" title="Persona del equipo">👤</span>':`<span class="agent-avatar ${s.provider}">${symbols[s.provider]}</span>`;
 const fmtTokens=n=>n>=1e6?(n/1e6).toFixed(1).replace('.',',')+' M':n>=1000?(n/1000).toFixed(1).replace('.',',')+' k':String(n);
 const fmtCost=c=>c?(Math.round(c*1000)/1000).toString().replace('.',',')+' $':'';
 const usageText=u=>u?.total?`${fmtTokens(u.total)} tokens${u.costUsd?' · '+fmtCost(u.costUsd):''}`:'';
 const windowLabel=m=>m==null?'ventana':m<60?`${m} min`:m<1440?`${Math.round(m/60)} h`:`${Math.round(m/1440)} días`;
 function quotaText(provider){const w=state?.connections[provider]?.limits?.windows;if(!w?.length)return '';return w.map(x=>`${Math.round(x.usedPercent)} % de ${windowLabel(x.minutes)}`).join(' · ');}
+function claudeQuotaText(){
+  const q=state?.quota?.claude;if(!q||!state.connections?.claude?.connected)return '';
+  const limit=Number(state.settings?.claudeSoftLimit)||0;
+  return limit?`Claude: ${Math.min(100,Math.round(q.tokens5h/limit*100))} % de 5 h (orientativo)`:`Claude: ${fmtTokens(q.tokens5h)} tokens en 5 h`;
+}
 // Cada turno lleva su consumo; la respuesta directa y la revisión llevan además el total de la tarea.
 function usageBadges(m){
   const own=usageText(m.usage);
@@ -26,10 +32,10 @@ function usageBadges(m){
 function limitsHtml(p,c){
   const w=c.limits?.windows;
   if(w?.length)return `<div class="metadata">Cuota usada: ${w.map(x=>`${Math.round(x.usedPercent)} % de ${windowLabel(x.minutes)}${x.resetsAt?` (se reinicia ${new Date(x.resetsAt).toLocaleString('es',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})})`:''}`).join(' · ')}</div>`;
-  if(p==='claude'&&c.connected)return '<div class="metadata">Claude Code no publica su cuota; el consumo se muestra por turno y por tarea en la conversación.</div>';
+  if(p==='claude'&&c.connected)return `<div class="metadata">Claude Code no publica su cuota. Consumido: ${fmtTokens(state.quota?.claude?.tokens5h||0)} tokens y ${state.quota?.claude?.turns5h||0} turnos en 5 h; ${fmtTokens(state.quota?.claude?.tokens7d||0)} tokens en 7 días.</div>`;
   return '';
 }
-let state,projectId,conversationId,orchestrator='claude',busy=false,lastMessages='',lastAgents='',lastMemory='',lastRun='',toastTimer;
+let state,projectId,conversationId,orchestrator='auto',busy=false,lastMessages='',lastAgents='',lastMemory='',lastRun='',toastTimer;
 let planChoices={},initRepo=false;
 let mode='directo',manualRows=[],manualOptions={review:true,initRepo:false},manualVersion=0,lastManual='';
 let updateNoticed=false,runCardCollapsed=false,quotaWarned=false,searchHits=null,searchTimer=null,newBelow=false,following=true,lastApprovalsHtml='';const messageNodes=new Map();
@@ -241,7 +247,7 @@ function renderAgents(){
 function assigneeOptions(selectedProvider,selectedPersonId,keepProvider){
   const providers=['codex','claude'].filter(p=>p===keepProvider||state.connections[p]?.connected);
   const people=peopleOf(project());
-  return providers.map(p=>`<option value="${p}" ${p===selectedProvider?'selected':''}>${names[p]}</option>`).join('')
+  return `<option value="auto" ${selectedProvider==='auto'?'selected':''}>Auto: Mixto elige</option>`+providers.map(p=>`<option value="${p}" ${p===selectedProvider?'selected':''}>${names[p]}</option>`).join('')
     +(people.length?`<optgroup label="Personas del equipo">${people.map(person=>`<option value="persona:${esc(person.id)}" ${selectedProvider===HUMAN&&person.id===selectedPersonId?'selected':''}>${esc(person.name)}${person.role?` · ${esc(person.role)}`:''}</option>`).join('')}</optgroup>`:'')
     +(selectedProvider===HUMAN&&!people.some(person=>person.id===selectedPersonId)?`<option value="persona:${esc(selectedPersonId||'')}" selected>${esc(selectedPersonId?'persona fuera del equipo':'persona')}</option>`:'');
 }
@@ -382,10 +388,10 @@ function defaultModel(provider){return (catalogOf(provider).find(m=>m.default)||
 function newManualRow(provider){const model=defaultModel(provider);return {title:'',provider,model,effort:defaultEffort(provider,model)||'',instructions:'',scope:'',readOnly:false};}
 function seedManualRows(){manualRows=[newManualRow('codex'),newManualRow('claude')];manualVersion++;}
 function manualRowHtml(row,i){
-  const human=row.provider===HUMAN,levels=effortLevels(row.provider,row.model);
+  const human=row.provider===HUMAN,auto=row.provider==='auto',levels=auto?[]:effortLevels(row.provider,row.model);
   const shown=human?{human:true,personId:row.personId,personName:''}:{provider:row.provider};
   return `<div class="manual-row" data-row="${i}"><div class="manual-row-head">${avatar(shown)}<input data-field="title" placeholder="Sub-tarea ${i+1}: título" maxlength="120" value="${esc(row.title||'')}" aria-label="Título de la sub-tarea ${i+1}"><button type="button" class="icon-button" data-remove="${i}" aria-label="Quitar sub-tarea ${i+1}">×</button></div>
-  <div class="manual-row-grid"><select data-field="provider" aria-label="Asignar a">${assigneeOptions(row.provider,row.personId,row.provider)}</select>${human?'<span class="human-note">Persona del equipo: Mixto no ejecuta esta parte; tú anotas su estado.</span>':`<select data-field="model" aria-label="Modelo">${modelOptions(row.provider,row.model)}</select>${levels.length?`<select data-field="effort" aria-label="Razonamiento">${effortOptions(row.provider,row.model,row.effort)}</select>`:''}`}<input data-field="scope" placeholder="Alcance: rutas separadas por comas (opcional)" value="${esc(row.scope||'')}" aria-label="Alcance">${human?'':`<label class="readonly-control"><input type="checkbox" data-field="readOnly" ${row.readOnly?'checked':''}> Solo lectura</label>`}</div>
+  <div class="manual-row-grid"><select data-field="provider" aria-label="Asignar a">${assigneeOptions(row.provider,row.personId,row.provider)}</select>${human?'<span class="human-note">Persona del equipo: Mixto no ejecuta esta parte; tú anotas su estado.</span>':auto?'<span class="human-note">Mixto elegirá agente, modelo y nivel al enviar, según la cuota y el tamaño de esta parte.</span>':`<select data-field="model" aria-label="Modelo">${modelOptions(row.provider,row.model)}</select>${levels.length?`<select data-field="effort" aria-label="Razonamiento">${effortOptions(row.provider,row.model,row.effort)}</select>`:''}`}<input data-field="scope" placeholder="Alcance: rutas separadas por comas (opcional)" value="${esc(row.scope||'')}" aria-label="Alcance">${human?'':`<label class="readonly-control"><input type="checkbox" data-field="readOnly" ${row.readOnly?'checked':''}> Solo lectura</label>`}</div>
   <textarea data-field="instructions" rows="2" maxlength="12000" placeholder="Qué debe hacer, con detalle suficiente para trabajar sin verte" aria-label="Instrucciones de la sub-tarea ${i+1}">${esc(row.instructions||'')}</textarea></div>`;
 }
 function renderManual(){
@@ -409,6 +415,7 @@ $('#manual-panel').onchange=e=>{
   if(field==='provider'){
     const value=e.target.value;
     if(value.startsWith('persona:')){row.provider=HUMAN;row.personId=value.slice(8);row.model='';row.effort='';row.readOnly=false;}
+    else if(value==='auto'){row.provider='auto';row.personId=null;row.model='';row.effort='';}
     else{row.provider=value;row.personId=null;row.model=defaultModel(row.provider);row.effort=defaultEffort(row.provider,row.model)||'';}
   }
   else if(field==='model'){row.model=e.target.value;row.effort=defaultEffort(row.provider,row.model)||'';}
@@ -424,7 +431,7 @@ function render(){
   if(conversationId&&!state.conversations.some(c=>c.id===conversationId&&c.projectId===projectId))focusConversation(null);
   const select=$('#project-select');if(document.activeElement!==select)select.innerHTML=state.projects.map(p=>`<option value="${p.id}" ${p.id===projectId?'selected':''}>${esc(p.name)}</option>`).join('');
   $('#project-folder').textContent=project()?.path||'';$('#project-folder').title=project()?.path||'';
-  const quota=quotaText('codex');$('#quota-hint').textContent=quota?`Codex: ${quota}`:'';
+  const quota=quotaText('codex'),claudeQuota=claudeQuotaText();$('#quota-hint').textContent=[quota?`Codex: ${quota}`:'',claudeQuota].filter(Boolean).join(' · ');
   $('#team-count').textContent=peopleOf(project()).length;
   refreshTeamModal();
   $('#project-name').textContent=project()?.name||'';$('#conversation-title').textContent=conversation()?.title||'Nueva conversación';
@@ -435,7 +442,7 @@ function render(){
   const run=activeRun();
   const steerable=!!run&&run.mode==='directo'&&run.status==='running';
   $('#send').hidden=!!run&&!steerable;$('#cancel-run').hidden=!run;$('#send').disabled=busy;
-  const other=orchestrator==='codex'?'claude':'codex';
+  const other=otherAgent();
   $('#opinion-button').textContent=`Opinión de ${names[other]}`;$('#opinion-button').title=`${names[other]} revisa en solo lectura los cambios sin confirmar`;
   const pending=state.changes?.[projectId];
   $('#commit-button').hidden=!(pending?.git&&pending.files>0);
@@ -502,10 +509,11 @@ async function commitModal(){
 }
 function updateOrchestrator(){
   const auto=state?.settings?.autoApproveSingle||state?.settings?.autoApproveReadOnly;
+  const who=orchestrator==='auto'?'Mixto elige agente, modelo y nivel según tu cuota y el tamaño de la tarea':names[orchestrator];
   const hints={
-    orquestar:`${names[orchestrator]} orquesta: ${auto?'los planes sencillos empiezan solos según tus ajustes':'verás el plan antes de que empiece nadie'}. Las preguntas se responden sin plan.`,
-    directo:`${names[orchestrator]} en directo: un solo agente con sesión continua, sin plan ni revisión. Para trabajo iterativo.`,
-    manual:`Reparto a mano: tú decides las sub-tareas y quién hace cada una. ${names[orchestrator]} revisa al final si lo marcas.`
+    orquestar:orchestrator==='auto'?`Auto orquesta: ${who}; el plan pondera cuota, tamaño y fortalezas de cada modelo.`:`${names[orchestrator]} orquesta: ${auto?'los planes sencillos empiezan solos según tus ajustes':'verás el plan antes de que empiece nadie'}. Las preguntas se responden sin plan.`,
+    directo:orchestrator==='auto'?`Auto en directo: ${who}, sin gastar un turno en decidirlo.`:`${names[orchestrator]} en directo: un solo agente con sesión continua, sin plan ni revisión. Para trabajo iterativo.`,
+    manual:`Reparto a mano: tú decides las sub-tareas y quién hace cada una. ${orchestrator==='auto'?'Mixto elige quién revisa':names[orchestrator]+' revisa'} al final si lo marcas.`
   };
   $('#mode-hint').textContent=hints[mode]||hints.orquestar;
   const codexUse=Math.max(0,...((state?.connections?.codex?.limits?.windows||[]).map(w=>w.usedPercent)));
@@ -536,9 +544,15 @@ $('#notify-toggle').onclick=async()=>{
 };
 $('#commit-button').onclick=commitModal;
 $('#pull-button').onclick=async()=>{const b=$('#pull-button');b.disabled=true;try{const r=await api('pull',{projectId});toast(r.output||'Proyecto al día con el remoto.');await load();}catch(error){toast(error.message);}finally{b.disabled=false;}};
+function otherAgent(){
+  if(orchestrator==='codex')return 'claude';
+  if(orchestrator==='claude')return 'codex';
+  const last=state?.messages?.filter(m=>m.conversationId===conversationId&&m.role==='assistant'&&(m.provider==='claude'||m.provider==='codex')).at(-1);
+  return last?.provider==='claude'?'codex':'claude';
+}
 $('#opinion-button').onclick=async()=>{
   if(busy||activeRun())return;
-  const other=orchestrator==='codex'?'claude':'codex';
+  const other=otherAgent();
   if(!projectId){toast('Crea o añade un proyecto antes de empezar.');return;}
   if(!selections[other]){toast(`Conecta ${names[other]} desde Agentes antes de pedirle una opinión.`);return;}
   busy=true;
@@ -621,7 +635,7 @@ $('#composer').onsubmit=async e=>{
     return;
   }
   if(!projectId){toast('Crea o añade un proyecto antes de empezar.');return;}
-  const body={prompt,readOnly:$('#read-only').checked,mode,attachments:attachments.map(a=>a.id),orchestrator:{provider:orchestrator,model:selections[orchestrator],effort:efforts[orchestrator]||null}};
+  const body={prompt,readOnly:$('#read-only').checked,mode,attachments:attachments.map(a=>a.id),orchestrator:orchestrator==='auto'?{provider:'auto'}:{provider:orchestrator,model:selections[orchestrator],effort:efforts[orchestrator]||null}};
   if(mode==='manual'){
     const rows=manualRows.map(r=>({title:(r.title||'').trim(),provider:r.provider,personId:r.personId||null,model:r.model,effort:r.effort||null,instructions:(r.instructions||'').trim(),scope:r.scope||'',readOnly:!!r.readOnly}));
     if(!rows.length||rows.some(r=>!r.title||!r.instructions)){toast('Cada sub-tarea necesita título e instrucciones.');return;}
@@ -894,7 +908,7 @@ function bindAppSection(){
   };
 }
 function connectionsModal(){
-  openModal('Agentes y ajustes',`<p class="modal-note">Mixto usa las sesiones de las herramientas instaladas. Aquí solo configuras lo necesario para orquestar.</p>${['codex','claude'].map(p=>{const c=state.connections[p],levels=effortLevels(p,selections[p]);return `<section class="connection-card"><h3><span class="agent-avatar ${p}">${symbols[p]}</span> ${names[p]}</h3><p>${c.loading?'Consultando conexión…':c.connected?'Conectado · '+esc(c.plan||c.authType):'Sin conexión'}</p>${limitsHtml(p,c)}${c.error?`<div class="message-error">${esc(c.error)}</div>`:''}${!c.connected?`<p>Inicia sesión con <code>${p==='codex'?'codex login':'claude auth login'}</code> y pulsa Actualizar.</p>`:''}${c.models.length?`<label class="form-field compact-field"><span>Modelo predeterminado</span><select data-agent-model="${p}">${modelOptions(p,selections[p])}</select><small>Cuando ${names[p]} orquesta, este modelo planifica y revisa: uno rápido abarata cada tarea. Los modelos potentes se eligen por sub-tarea en el plan.</small></label>${levels.length?`<label class="form-field compact-field"><span>Razonamiento</span><select data-agent-effort="${p}">${effortOptions(p,selections[p],efforts[p])}</select></label>`:''}`:''}</section>`;}).join('')}${githubSectionHtml()}${appSectionHtml()}<form id="agent-settings"><label class="form-field"><span>Persona del arquitecto</span><select name="orchestratorPersona"><option value="">Sin persona</option>${state.personas.map(p=>`<option value="${esc(p.id)}" ${p.id===state.settings.orchestratorPersona?'selected':''}>${esc(p.name)}</option>`).join('')}</select><small>Añade unos 7.000 tokens de texto genérico a cada plan. Déjala en «Sin persona» salvo que la necesites.</small></label><label class="check-field"><input type="checkbox" name="autoApproveSingle" ${state.settings.autoApproveSingle?'checked':''}> Empezar sin pedir aprobación cuando el plan tiene una sola sub-tarea</label><label class="check-field"><input type="checkbox" name="autoApproveReadOnly" ${state.settings.autoApproveReadOnly?'checked':''}> Empezar sin pedir aprobación cuando todas las sub-tareas son de solo lectura</label><label class="form-field"><span>Comandos permitidos en ${esc(project()?.name||'este proyecto')} (uno por línea; «npm test» permite «npm test» y «npm test -- x»)</span><textarea name="allowedCommands" rows="3" placeholder="npm test&#10;npm run check&#10;git status">${esc((project()?.allowedCommands||[]).join('\n'))}</textarea><small>Los agentes ejecutan estos comandos sin preguntar, también el revisor. El botón «Permitir siempre» de cada petición los añade aquí.</small></label><label class="form-field"><span>Reparto del trabajo entre agentes</span><select name="balance"><option value="auto" ${state.settings.balance==='auto'||!state.settings.balance?'selected':''}>Equilibrado: decide el arquitecto</option><option value="claude" ${state.settings.balance==='claude'?'selected':''}>Prefiere Claude Code; Codex solo si aporta algo</option><option value="codex" ${state.settings.balance==='codex'?'selected':''}>Prefiere Codex; Claude Code solo si aporta algo</option></select><small>El plan sigue esta preferencia y, además, evita Codex cuando su cuota pasa del 70 %. La segunda opinión siempre usa el otro agente.</small></label><label class="form-field"><span>Revisión al terminar una tarea orquestada</span><select name="reviewPolicy"><option value="multi" ${state.settings.reviewPolicy==='multi'||!state.settings.reviewPolicy?'selected':''}>Solo con dos o más partes (menos turnos)</option><option value="always" ${state.settings.reviewPolicy==='always'?'selected':''}>Siempre</option><option value="never" ${state.settings.reviewPolicy==='never'?'selected':''}>Nunca: los cambios esperan a que los apliques tú</option></select><small>La revisión es un turno más del agente principal. Con una sola parte, «Ver cambios» y la segunda opinión suelen bastar.</small></label><label class="form-field"><span>Tope de tokens por tarea (0 = sin tope)</span><input type="number" name="tokenBudget" min="0" step="1000" value="${Number(state.settings.tokenBudget)||0}"><small>Se comprueba al cerrar cada turno, así que puede excederse por un turno. Al superarlo la tarea se detiene y te lo dice; una corrección la reanuda.</small></label>${['codex','claude'].map(p=>`<label class="form-field"><span>Preferencias para ${names[p]}</span><textarea name="${p}Instructions" rows="3" maxlength="8000" placeholder="Cómo quieres que trabaje este agente…">${esc(state.settings[p+'Instructions'])}</textarea></label>`).join('')}<div class="form-footer"><button type="button" class="secondary-button" id="refresh-connections">Actualizar</button><button class="primary-button">Guardar</button></div></form>`,'connections');
+  openModal('Agentes y ajustes',`<p class="modal-note">Mixto usa las sesiones de las herramientas instaladas. Aquí solo configuras lo necesario para orquestar.</p>${['codex','claude'].map(p=>{const c=state.connections[p],levels=effortLevels(p,selections[p]);return `<section class="connection-card"><h3><span class="agent-avatar ${p}">${symbols[p]}</span> ${names[p]}</h3><p>${c.loading?'Consultando conexión…':c.connected?'Conectado · '+esc(c.plan||c.authType):'Sin conexión'}</p>${limitsHtml(p,c)}${c.error?`<div class="message-error">${esc(c.error)}</div>`:''}${!c.connected?`<p>Inicia sesión con <code>${p==='codex'?'codex login':'claude auth login'}</code> y pulsa Actualizar.</p>`:''}${c.models.length?`<label class="form-field compact-field"><span>Modelo predeterminado</span><select data-agent-model="${p}">${modelOptions(p,selections[p])}</select><small>Cuando ${names[p]} orquesta, este modelo planifica y revisa: uno rápido abarata cada tarea. Los modelos potentes se eligen por sub-tarea en el plan.</small></label>${levels.length?`<label class="form-field compact-field"><span>Razonamiento</span><select data-agent-effort="${p}">${effortOptions(p,selections[p],efforts[p])}</select></label>`:''}`:''}</section>`;}).join('')}${githubSectionHtml()}${appSectionHtml()}<form id="agent-settings"><label class="form-field"><span>Persona del arquitecto</span><select name="orchestratorPersona"><option value="">Sin persona</option>${state.personas.map(p=>`<option value="${esc(p.id)}" ${p.id===state.settings.orchestratorPersona?'selected':''}>${esc(p.name)}</option>`).join('')}</select><small>Añade unos 7.000 tokens de texto genérico a cada plan. Déjala en «Sin persona» salvo que la necesites.</small></label><label class="check-field"><input type="checkbox" name="autoApproveSingle" ${state.settings.autoApproveSingle?'checked':''}> Empezar sin pedir aprobación cuando el plan tiene una sola sub-tarea</label><label class="check-field"><input type="checkbox" name="autoApproveReadOnly" ${state.settings.autoApproveReadOnly?'checked':''}> Empezar sin pedir aprobación cuando todas las sub-tareas son de solo lectura</label><label class="form-field"><span>Comandos permitidos en ${esc(project()?.name||'este proyecto')} (uno por línea; «npm test» permite «npm test» y «npm test -- x»)</span><textarea name="allowedCommands" rows="3" placeholder="npm test&#10;npm run check&#10;git status">${esc((project()?.allowedCommands||[]).join('\n'))}</textarea><small>Los agentes ejecutan estos comandos sin preguntar, también el revisor. El botón «Permitir siempre» de cada petición los añade aquí.</small></label><label class="form-field"><span>Reparto del trabajo entre agentes</span><select name="balance"><option value="auto" ${state.settings.balance==='auto'||!state.settings.balance?'selected':''}>Equilibrado: decide el arquitecto</option><option value="claude" ${state.settings.balance==='claude'?'selected':''}>Prefiere Claude Code; Codex solo si aporta algo</option><option value="codex" ${state.settings.balance==='codex'?'selected':''}>Prefiere Codex; Claude Code solo si aporta algo</option></select><small>El plan sigue esta preferencia y, además, evita Codex cuando su cuota pasa del 70 %. La segunda opinión siempre usa el otro agente.</small></label><label class="form-field"><span>Revisión al terminar una tarea orquestada</span><select name="reviewPolicy"><option value="multi" ${state.settings.reviewPolicy==='multi'||!state.settings.reviewPolicy?'selected':''}>Solo con dos o más partes (menos turnos)</option><option value="always" ${state.settings.reviewPolicy==='always'?'selected':''}>Siempre</option><option value="never" ${state.settings.reviewPolicy==='never'?'selected':''}>Nunca: los cambios esperan a que los apliques tú</option></select><small>La revisión es un turno más del agente principal. Con una sola parte, «Ver cambios» y la segunda opinión suelen bastar.</small></label><label class="form-field"><span>Para qué es mejor cada modelo (el arquitecto y Auto lo tienen en cuenta)</span><textarea name="modelNotes" rows="4" maxlength="4000" placeholder="${esc(DEFAULT_MODEL_NOTES)}">${esc(state.settings.modelNotes||'')}</textarea><small>Vacío usa las notas de ejemplo que ves de fondo. Escribe aquí lo que hayas aprendido de cada modelo con tus proyectos.</small></label><label class="form-field"><span>Tope orientativo de Claude Code por 5 h (tokens; 0 = sin tope)</span><input type="number" name="claudeSoftLimit" min="0" step="10000" value="${Number(state.settings.claudeSoftLimit)||0}"><small>Claude Code no publica su cuota. Si fijas un tope, Mixto calcula un porcentaje con lo consumido en las últimas 5 h y Auto y el plan evitan Claude cuando se acerca. Consumido ahora: ${fmtTokens(state.quota?.claude?.tokens5h||0)} tokens en 5 h, ${fmtTokens(state.quota?.claude?.tokens7d||0)} en 7 días.</small></label><label class="form-field"><span>Tope de tokens por tarea (0 = sin tope)</span><input type="number" name="tokenBudget" min="0" step="1000" value="${Number(state.settings.tokenBudget)||0}"><small>Se comprueba al cerrar cada turno, así que puede excederse por un turno. Al superarlo la tarea se detiene y te lo dice; una corrección la reanuda.</small></label>${['codex','claude'].map(p=>`<label class="form-field"><span>Preferencias para ${names[p]}</span><textarea name="${p}Instructions" rows="3" maxlength="8000" placeholder="Cómo quieres que trabaje este agente…">${esc(state.settings[p+'Instructions'])}</textarea></label>`).join('')}<div class="form-footer"><button type="button" class="secondary-button" id="refresh-connections">Actualizar</button><button class="primary-button">Guardar</button></div></form>`,'connections');
   $('#modal-content').onchange=e=>{
     const model=e.target.dataset.agentModel,effort=e.target.dataset.agentEffort;
     if(model){selections[model]=e.target.value;efforts[model]=defaultEffort(model,e.target.value)||'';lastAgents='';renderAgents();connectionsModal();}

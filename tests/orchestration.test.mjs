@@ -1011,3 +1011,37 @@ test('la preferencia de reparto y la cuota de Codex llegan al plan',async()=>{
   assert.equal(balanceNote('auto',{codex:{limits:null}}),'');
   assert.doesNotMatch(buildPlanPrompt({request:'x',connections:{claude:{connected:true,models:[]}},balance:'auto'}),/PREFERENCIA DE REPARTO/);
 });
+
+test('Auto: Mixto elige agente, modelo y nivel en directo y en el reparto a mano, y lo explica; los ajustes de reparto se guardan',async t=>{
+  const {call,until,project}=await boot(t,{delay:50});
+  const conversation=await call('conversations',{projectId:project.id});
+  // Sin tope de Claude, con Codex al 34 %: gana Claude; la petición corta es «pequeña».
+  await call('run',{conversationId:conversation.id,prompt:'¿Qué hace base.txt?',readOnly:true,mode:'directo',orchestrator:{provider:'auto'}});
+  let state=await until(s=>['completed','error'].includes(runOf(s).status));
+  let run=runOf(state);
+  assert.equal(run.status,'completed',run.error);
+  assert.equal(run.orchestrator.provider,'claude');assert.equal(run.orchestrator.model,'claude-fake');assert.equal(run.orchestrator.auto,true);
+  assert.match(run.orchestrator.reason,/^Auto: Claude Code · claude-fake.*tarea pequeña; Codex con ~66 % de cuota/);
+  assert.match(run.events.map(e=>e.text).join('\n'),/^Auto: Claude Code/m);
+  assert.ok(state.quota.claude.tokens5h>=150,'el consumo de Claude se acumula: '+state.quota.claude.tokens5h);
+  // Con un tope orientativo ya superado, Auto pasa a Codex aunque se prefiera Claude.
+  await call('settings',{claudeSoftLimit:100,balance:'claude',modelNotes:'Codex para tests.'});
+  state=await call('state');
+  assert.equal(state.settings.claudeSoftLimit,100);assert.equal(state.settings.modelNotes,'Codex para tests.');
+  await call('run',{conversationId:conversation.id,prompt:'Arregla el bug del login',readOnly:true,mode:'directo',orchestrator:{provider:'auto'}});
+  state=await until(s=>s.runs.length===2&&['completed','error'].includes(runOf(s).status));
+  run=runOf(state);
+  assert.equal(run.orchestrator.provider,'codex');assert.match(run.orchestrator.reason,/Claude Code casi sin cuota/);
+  // Reparto a mano con una parte en Auto: se resuelve al enviar con sus propias instrucciones.
+  await call('settings',{claudeSoftLimit:0,balance:'auto'});
+  await call('run',{conversationId:conversation.id,prompt:'Dos partes',readOnly:false,mode:'manual',orchestrator:{provider:'auto'},
+    plan:{review:false,subtasks:[{title:'Parte auto',provider:'auto',instructions:'ARCHIVO:auto.txt'},{title:'Parte fija',provider:'codex',model:'codex-fake',instructions:'ARCHIVO:fija.txt'}]}});
+  state=await until(s=>s.runs.length===3&&['completed','error'].includes(runOf(s).status));
+  run=runOf(state);
+  assert.equal(run.status,'completed',run.error);
+  assert.equal(run.subtasks[0].provider,'claude');assert.equal(run.subtasks[0].auto,true);assert.equal(run.subtasks[0].magnitude,'pequeña');
+  assert.equal(run.subtasks[1].provider,'codex');assert.equal(run.subtasks[1].auto,undefined);
+  assert.match(run.events.map(e=>e.text).join('\n'),/#1 Parte auto: Auto: Claude Code/);
+  await call('settings',{claudeSoftLimit:-5});
+  assert.equal((await call('state')).settings.claudeSoftLimit,0,'un tope negativo se descarta');
+});

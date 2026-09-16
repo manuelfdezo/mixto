@@ -90,7 +90,17 @@ Sin remoto, el libro queda confirmado solo en tu repositorio. Si dos Mixto usan 
 
 ### Consumo y cuota
 
-En **Agentes y ajustes → Reparto del trabajo** eliges si el arquitecto reparte como quiera, si prefiere Claude Code o si prefiere Codex; el plan sigue esa preferencia y, además, evita Codex cuando su cuota supera el 70 %. Cuando Codex pasa del 80 % la cuota se marca en rojo junto al cuadro y Mixto te sugiere cambiar de agente principal.
+### Reparto ponderado: cuota, tamaño y fortalezas
+
+El agente principal puede ser **Auto: Mixto elige**. Sin gastar ningún turno, Mixto pondera tres cosas y decide agente, modelo y nivel de razonamiento para cada mensaje directo, para el arquitecto de una tarea orquestada y para cada parte del reparto a mano que dejes en Auto:
+
+1. **Cuota restante.** Codex la publica por su API. Claude Code no, así que Mixto suma lo que has consumido en las últimas 5 horas y 7 días con sus turnos; si fijas en Ajustes un **tope orientativo de Claude por 5 h**, lo convierte en porcentaje. Un agente con 10 % o menos no se usa; entre los dos que sirven, gana el que más cuota tiene.
+2. **Tamaño de la tarea.** Se estima del texto (longitud, archivos que nombra, verbos): pequeña → modelo rápido y nivel bajo; mediana → el modelo equilibrado; grande → el modelo potente con nivel alto. Los modelos se reconocen por familia (haiku, mini, nano; sonnet, gpt-5-codex; opus, max, pro).
+3. **Fortalezas.** Unas notas editables en Ajustes, **Para qué es mejor cada modelo**, que también recibe el arquitecto.
+
+La elección se anota como evento de la tarea («Auto: Claude Code · sonnet · medium (tarea mediana; Codex con ~34 % de cuota)»). En una tarea orquestada, el arquitecto recibe la cuota y el consumo de los dos agentes, las notas sobre modelos y la regla de ponderación, estima la magnitud de cada parte (campo *magnitud* del plan) y la justifica en una frase.
+
+En **Reparto del trabajo** puedes además fijar una preferencia: equilibrado, Claude Code o Codex; Auto y el plan la respetan mientras a ese agente le quede cuota. Cuando Codex pasa del 80 % la cuota se marca en rojo junto al cuadro, donde también ves el consumo de Claude, y Mixto te sugiere cambiar de agente principal.
 
 Los procesos de Claude Code y Codex se mantienen abiertos entre turnos de una misma sesión (hasta cuatro, diez minutos sin uso), así que en modo directo cada mensaje solo paga el tiempo del modelo, no el arranque de la herramienta. `MIXTO_NO_POOL=1` lo desactiva.
 

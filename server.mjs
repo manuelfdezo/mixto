@@ -16,6 +16,7 @@ import {Watcher} from './lib/supervisor.mjs';
 import {openLedger,syncLedger,publishLedger,writeLedger,gitIdentity,STATUSES as LEDGER_STATUSES} from './lib/team.mjs';
 import {updateSources,checkUpdate,downloadUpdate,applyUpdate,compareVersions} from './lib/update.mjs';
 import {githubSources,applyAuth,clearAuth,parseRepoInput,fetchViewer,fetchRepos,cloneRepo,pullProject,hasRemote} from './lib/github.mjs';
+import {chooseAgent,routingSummary,claudeUsage} from './lib/routing.mjs';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
 const VERSION=(()=>{try{return JSON.parse(fs.readFileSync(path.join(root,'package.json'),'utf8')).version||'0.0.0';}catch{return '0.0.0';}})();
@@ -415,7 +416,7 @@ function snapshot(conversationId=null,{all=conversationId===null}={}){
   const runs=all?data.runs:data.runs.map(run=>run.conversationId===conversationId?run:briefRun(run));
   return {...data,messages,runs,focus:all?undefined:conversationId,memories:sharedMemories(store.data),memorySync:memoryBridge.status,connections,personas:listPersonas(),
     approvals:[...approvals.values()].map(a=>a.public),execs:Object.fromEntries([...execs].map(([projectId,record])=>[projectId,execView(record)])),
-    changes:Object.fromEntries(changesCache),update,github:githubView(),app:{version:VERSION,workspace:root,
+    changes:Object.fromEntries(changesCache),update,github:githubView(),quota:{claude:claudeUsage(store.data.messages)},app:{version:VERSION,workspace:root,
       projectsRoot:{path:managed.root,available:managed.available}}};
 }
 // GitHub: con un token guardado, git (el de Mixto, el de los agentes y el del terminal) lleva la autorización por entorno.
@@ -604,7 +605,8 @@ async function planPhase(run,controller){
   const resumed=!!run.orchestrator.sessionId;
   if(resumed)pushEvent(run,'El arquitecto reanuda su sesión de esta conversación.');
   let prompt=buildPlanPrompt({request:run.prompt,connections,memory,history:resumed?'':history,
-    instructions,maxSubtasks:MAX_SUBTASKS,maxParallel:maxParallel(),readOnly:run.readOnly,people,balance:store.data.settings.balance||'auto'});
+    instructions,maxSubtasks:MAX_SUBTASKS,maxParallel:maxParallel(),readOnly:run.readOnly,people,balance:store.data.settings.balance||'auto',
+    routing:routingSummary({connections,messages:store.data.messages,settings:store.data.settings})});
   let parsed=null,sessionId,lastError;
   for(let attempt=0;attempt<2&&!parsed;attempt++){
     const result=await orchestratorRun(run,{prompt,sessionId,controller,attachments:attempt===0?run.attachments:undefined,onText:text=>{current.content=text;touch();}});
@@ -1056,8 +1058,13 @@ function assertFolderFree(project){
 function startRun(body){
   const conv=store.conversation(body.conversationId),project=store.project(conv.projectId);
   const mode=['orquestar','directo','manual','opinion'].includes(body.mode)?body.mode:'orquestar';
-  const provider=PROVIDERS.includes(body.orchestrator?.provider)?body.orchestrator.provider:'codex';
   let prompt=mode==='opinion'?str(body.prompt||'','Mensaje',50000,true):str(body.prompt,'Mensaje',50000);
+  let autoChoice=null,orchestratorBody=body.orchestrator||{};
+  if(orchestratorBody.provider==='auto'){
+    autoChoice=chooseAgent({request:prompt,connections,messages:store.data.messages,settings:store.data.settings});
+    orchestratorBody={provider:autoChoice.provider,model:autoChoice.model,effort:autoChoice.effort};
+  }
+  const provider=PROVIDERS.includes(orchestratorBody.provider)?orchestratorBody.provider:'claude';
   const display=typeof body.display==='string'&&body.display.trim()?str(body.display,'Mensaje',50000):null;
   const attachments=(Array.isArray(body.attachments)?body.attachments:[]).map(ref=>store.data.uploads.find(upload=>upload.id===ref)).filter(Boolean).slice(0,8)
     .map(upload=>({id:upload.id,name:upload.name,mime:upload.mime,path:upload.path}));
@@ -1087,8 +1094,15 @@ function startRun(body){
   // El agente principal orquesta, responde en directo o revisa el reparto manual; solo hace falta si actúa.
   const needsPrincipal=mode!=='manual'||run.reviewWanted;
   if(needsPrincipal&&!connections[provider].connected)throw new Error(`${agentName(provider)} no está conectado. Abre Conexiones para comprobarlo.`);
-  if(needsPrincipal)Object.assign(run.orchestrator,modelChoice(provider,body.orchestrator?.model,body.orchestrator?.effort));
-  else run.orchestrator.model=typeof body.orchestrator?.model==='string'?body.orchestrator.model.slice(0,200):'';
+  if(needsPrincipal)Object.assign(run.orchestrator,modelChoice(provider,orchestratorBody.model,orchestratorBody.effort));
+  else run.orchestrator.model=typeof orchestratorBody.model==='string'?orchestratorBody.model.slice(0,200):'';
+  if(autoChoice){run.orchestrator.auto=true;run.orchestrator.reason=autoChoice.reason;pushEvent(run,autoChoice.reason);}
+  // Sub-tareas del reparto a mano asignadas a «Auto»: se resuelven una a una con sus propias instrucciones.
+  for(const subtask of run.subtasks)if(subtask.provider==='auto'){
+    const choice=chooseAgent({request:subtask.instructions,connections,messages:store.data.messages,settings:store.data.settings});
+    Object.assign(subtask,{provider:choice.provider,model:choice.model,effort:choice.effort,auto:true,magnitude:choice.magnitude,justification:choice.reason});
+    pushEvent(run,`#${subtask.index+1} ${subtask.title}: ${choice.reason}`);
+  }
   if(conv.title==='Nueva conversación')conv.title=prompt.slice(0,70);
   conv.updatedAt=now();
   message(conv.id,'user',(display||prompt)+manualNote,{runId:run.id,...(mode==='manual'?{kind:'manual'}:{}),
@@ -1231,6 +1245,8 @@ const server=http.createServer(async(req,res)=>{
         }
         for(const key of ['autoApproveSingle','autoApproveReadOnly'])if(b[key]!==undefined)store.data.settings[key]=b[key]===true;
         if(b.balance!==undefined)store.data.settings.balance=['auto','claude','codex'].includes(b.balance)?b.balance:'auto';
+        if(b.modelNotes!==undefined)store.data.settings.modelNotes=str(b.modelNotes,'Notas sobre modelos',4000,true);
+        if(b.claudeSoftLimit!==undefined){const limit=Number(b.claudeSoftLimit);store.data.settings.claudeSoftLimit=Number.isFinite(limit)&&limit>0?Math.round(limit):0;}
         if(b.reviewPolicy!==undefined)store.data.settings.reviewPolicy=['multi','always','never'].includes(b.reviewPolicy)?b.reviewPolicy:'multi';
         if(b.tokenBudget!==undefined){
           const budget=Number(b.tokenBudget);
